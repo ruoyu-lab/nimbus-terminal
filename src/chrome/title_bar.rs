@@ -269,20 +269,35 @@ fn tab_view(
             0.0
         }
     };
-    // 框架拖标签是跟着指针上下左右走的，没有「只许横向」的选项，而且它每帧都把被拖的元素放到指针下面，
-    // 元素自己的平移抵消不了。所以分两层：外层是被拖的（框架拖它，它负责接拖动、点击），
-    // 里面一层是看得见的标签，用反方向的平移把纵向的位移抵消掉。
-    // 松手后框架用 280 毫秒的弹簧把外层的额外位移落回 0，这里用同样的弹簧把抵消的量也落回 0，两边始终互相抵消
-    let cancel_y = signal(0.0f32);
-    let visible = row()
+    row()
         .name(format!("tab-{id}"))
         .style_with(&tab_style(), &States::new().selected(selected))
         .width(TAB_WIDTH)
         .shrink(0)
         .align(Align::Center)
         .gap(4)
-        .translation_y(move || cancel_y.get())
-        .transition(Property::TranslationY, Spring::new(ms(280), 1.0))
+        .translation_x(shift)
+        .transition(Property::TranslationX, Spring::snappy())
+        .on_click(move || select.select(id))
+        .draggable(move || id)
+        // 被拖的标签由框架在合成层上跟着指针走：只沿横向、不出标签条
+        .drag_preview(DragPreview::Lift)
+        .drag_preview_axis(Direction::Row)
+        .drag_preview_contained(true)
+        .on_drag(move |event: &DragEvent| match event.phase {
+            GesturePhase::Start => {
+                grab.set(event.position[0] - event.translation[0]);
+                let from = reorder.bar_index(id).unwrap_or(0);
+                drag.set(Some(Drag { id, from, to: from }));
+            }
+            // 放下（被标签条接住）时顺序已经换好、状态已经清掉；取消（Esc、放在别处）时落回原来的格子
+            GesturePhase::End | GesturePhase::Cancel => {
+                if drag.get_untracked().is_some() {
+                    drag.set(None);
+                }
+            }
+            GesturePhase::Move => {}
+        })
         // 左边留 4 + 4，关闭按钮上、右、下都是 4：标签高 28、按钮 20
         .child(
             row()
@@ -313,39 +328,7 @@ fn tab_view(
                     event.stop_propagation();
                     close.request_close(id);
                 }),
-        );
-    column()
-        .width(TAB_WIDTH)
-        .height(TAB_HEIGHT)
-        .shrink(0)
-        .translation_x(shift)
-        .transition(Property::TranslationX, Spring::snappy())
-        .on_click(move || select.select(id))
-        .draggable(move || id)
-        .drag_preview(DragPreview::Lift)
-        .on_drag(move |event: &DragEvent| match event.phase {
-            GesturePhase::Start => {
-                grab.set(event.position[0] - event.translation[0]);
-                let from = reorder.bar_index(id).unwrap_or(0);
-                drag.set(Some(Drag { id, from, to: from }));
-            }
-            // 放下（被标签条接住）时顺序已经换好、状态已经清掉；取消（Esc、放在别处）时落回原来的格子
-            GesturePhase::End | GesturePhase::Cancel => {
-                if drag.get_untracked().is_some() {
-                    drag.set(None);
-                }
-                // 带动画落回 0（和框架落回额外位移同步）
-                cancel_y.set(0.0);
-            }
-            GesturePhase::Move => {
-                // 指针每动一下都要立刻抵消，不能让弹簧在后面追；变化不到半个像素不重算
-                let target = -event.translation[1];
-                if (cancel_y.get_untracked() - target).abs() >= 0.5 {
-                    aureole::without_animation(|| cancel_y.set(target));
-                }
-            }
-        })
-        .child(visible)
+        )
 }
 
 fn tab_style() -> Style {

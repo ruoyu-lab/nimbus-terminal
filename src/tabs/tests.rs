@@ -568,6 +568,13 @@ fn dragging_past_the_ends_drops_there_and_dragging_out_cancels() {
     let before = harness.window_bounds("tab-2").expect("在");
     drag_to(&harness, "tab-2", 600.0);
     harness.advance(secs(1.0));
+    // 拖着的时候标签不出标签条（框架的 drag_preview_contained），停在最右边那一格里
+    let held = harness.window_bounds("tab-2").expect("拖着的标签还看得见");
+    let last = harness.window_bounds("tab-3").expect("在");
+    assert!(
+        held.x + held.width <= last.x + last.width + 1.0,
+        "拖着的标签没有出标签条：{held:?} {last:?}"
+    );
     harness.mouse_up(MouseButton::Left);
     harness.advance(secs(1.0));
     assert_eq!(bar_ids(&workspace), [1, 2, 3], "拖出去松手不换顺序");
