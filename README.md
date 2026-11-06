@@ -9,7 +9,6 @@
 用 [Aureole](https://github.com/ruoyu-lab/aureole-framework) 界面框架从零写成：自研 pty 和 xterm 仿真，没有 WebView，没有 Electron。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f6fed.svg)](LICENSE)
-[![CI](https://github.com/ruoyu-lab/nimbus-terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/ruoyu-lab/nimbus-terminal/actions/workflows/ci.yml)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange.svg)
 [![Built with Aureole](https://img.shields.io/badge/built%20with-Aureole-7aa2ff.svg)](https://github.com/ruoyu-lab/aureole-framework)
@@ -77,6 +76,8 @@ scripts/bundle-macos.sh
 ```
 
 界面框架 Aureole 是 Git 依赖，`cargo` 会自己拉取，不需要另外装。
+
+> **注意**：Aureole 目前还是私有仓库，没有访问权限的话 `cargo` 拉不下来、编译不了。框架公开之前，这个项目只有能访问它的人才能构建。
 
 ## 快捷键
 

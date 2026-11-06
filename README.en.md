@@ -9,7 +9,6 @@
 Built from scratch on the [Aureole](https://github.com/ruoyu-lab/aureole-framework) UI framework, with its own pty and xterm emulation. No WebView, no Electron.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f6fed.svg)](LICENSE)
-[![CI](https://github.com/ruoyu-lab/nimbus-terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/ruoyu-lab/nimbus-terminal/actions/workflows/ci.yml)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
 [中文](README.md)
@@ -38,6 +37,8 @@ cd nimbus-terminal
 cargo run --release            # run it
 scripts/bundle-macos.sh        # or build target/bundle/Nimbus.app
 ```
+
+> **Note**: the Aureole framework is still a private repository, so the project can only be built by people who have access to it until the framework is made public.
 
 Configuration lives in `~/Library/Application Support/Nimbus/` (override with `NIMBUS_HOME`).
 

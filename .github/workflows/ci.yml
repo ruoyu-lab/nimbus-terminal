@@ -1,9 +1,14 @@
 name: CI
 
+# 界面框架 Aureole 现在是私有仓库，GitHub 的机器拉不下来，所以先只能手动触发：
+# 在仓库的 Secrets 里放一个能读 aureole-framework 的令牌（FRAMEWORK_TOKEN）再手动跑。
+# 框架公开以后，把下面的 `on` 换成：
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +18,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: 让 cargo 能拉私有的框架（框架公开后可以删掉这一步）
+        if: ${{ env.FRAMEWORK_TOKEN != '' }}
+        env:
+          FRAMEWORK_TOKEN: ${{ secrets.FRAMEWORK_TOKEN }}
+        run: git config --global url."https://x-access-token:${FRAMEWORK_TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
