@@ -15,11 +15,11 @@ use aureole::prelude::*;
 /// 浅色的墨色：文字、投影、悬停和选中的底色都从它来
 pub const LIGHT_INK: Color = Color::hex(0x1f2328);
 /// 深色的「墨色」：浅灰的字
-pub const DARK_INK: Color = Color::hex(0xe8eaed);
+pub const DARK_INK: Color = Color::hex(0xdde0e6);
 /// 浅色的主卡片（终端所在的那块）：白
 pub const LIGHT_CARD: Color = Color::hex(0xffffff);
 /// 深色的主卡片
-pub const DARK_CARD: Color = Color::hex(0x16181d);
+pub const DARK_CARD: Color = Color::hex(0x1a1d23);
 
 thread_local! {
     static DARK: Cell<Option<Signal<bool>>> = const { Cell::new(None) };
@@ -89,17 +89,23 @@ pub fn line() -> Color {
     pick(Color::hex(0xe3e4e6), Color::hex(0x2d3037))
 }
 
+/// 选中的标签的底：浅色里和下面的卡片一样是白的，深色里比标签条和卡片都亮一档，
+/// 不然选中的标签比标签条还暗，像开了个洞，分不出哪个是当前的
+pub fn tab_selected_bg() -> Color {
+    pick(LIGHT_CARD, Color::hex(0x394049))
+}
+
 /// 正文
 pub fn fg() -> Color {
     ink()
 }
 
 pub fn text_2() -> Color {
-    pick(Color::hex(0x555b62), Color::hex(0xa3a9b1))
+    pick(Color::hex(0x555b62), Color::hex(0xb3b9c1))
 }
 
 pub fn text_3() -> Color {
-    pick(Color::hex(0x838990), Color::hex(0x757b84))
+    pick(Color::hex(0x838990), Color::hex(0x8a9099))
 }
 
 /// 小标记（后台有新输出的圆点、角标）：不抢眼但看得清
@@ -157,4 +163,79 @@ pub fn hover() -> Color {
 /// 选中项的底：比悬停再深一档，悬停和选中能分得开
 pub fn selected() -> Color {
     ink().with_alpha(if is_dark() { 0.12 } else { 0.16 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG 的对比度：两个颜色亮度之比，越大越清楚（正文至少 4.5，好读的 7 以上）
+    fn contrast(a: Color, b: Color) -> f32 {
+        let luminance = |color: Color| {
+            let channel = |value: u8| {
+                let value = f32::from(value) / 255.0;
+                if value <= 0.03928 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.0[0])
+                + 0.7152 * channel(color.0[1])
+                + 0.0722 * channel(color.0[2])
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// 深色里字、标签、终端的颜色都读得清：这是个下限，防止以后调色调回难读的
+    #[test]
+    fn the_dark_theme_is_readable() {
+        set_dark(true);
+        let (card, bar) = (card_bg(), sidebar_bg());
+        assert!(
+            contrast(fg(), card) >= 11.0,
+            "正文和终端：{}",
+            contrast(fg(), card)
+        );
+        assert!(
+            contrast(text_2(), bar) >= 7.0,
+            "标签条上没选中的标签：{}",
+            contrast(text_2(), bar)
+        );
+        assert!(
+            contrast(text_3(), bar) >= 4.5,
+            "标签条上的次要文字：{}",
+            contrast(text_3(), bar)
+        );
+        assert!(
+            contrast(text_3(), card) >= 4.5,
+            "卡片里的次要文字：{}",
+            contrast(text_3(), card)
+        );
+        assert!(contrast(fg(), tab_selected_bg()) >= 7.0, "选中的标签上的字");
+        assert!(
+            contrast(tab_selected_bg(), bar) >= 1.4,
+            "选中的标签要和标签条分得开：{}",
+            contrast(tab_selected_bg(), bar)
+        );
+        // 终端的 16 色：除了黑（本来就是深色），都能读
+        let colors = crate::view::colors(true);
+        for index in 1..16 {
+            let ratio = contrast(colors.ansi(index), colors.background);
+            let needed = if index == 8 { 4.5 } else { 6.0 };
+            assert!(ratio >= needed, "ANSI {index}：{ratio}");
+        }
+        assert!(
+            contrast(colors.ansi(0), colors.background) >= 2.0,
+            "黑也要看得见"
+        );
+        set_dark(false);
+        assert!(
+            contrast(fg(), card_bg()) >= 12.0,
+            "浅色：{}",
+            contrast(fg(), card_bg())
+        );
+        assert!(contrast(text_3(), card_bg()) >= 3.0);
+    }
 }

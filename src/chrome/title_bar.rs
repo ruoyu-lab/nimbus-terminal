@@ -13,7 +13,7 @@ use crate::chrome::widgets::{fade_in, icon_button, soft};
 use crate::icons::Icon;
 use crate::pane::Axis;
 use crate::tabs::Workspace;
-use crate::theme::{card_bg, fg, hover, mark, text_2};
+use crate::theme::{fg, hover, mark, tab_selected_bg, text_2};
 
 /// 标签：定宽，高 28，之间 2px；右边关闭按钮 20，所以上、右、下都留 4
 const TAB_WIDTH: f32 = 140.0;
@@ -358,7 +358,7 @@ fn tab_style() -> Style {
             .background(Color::TRANSPARENT)
             .color(text_2())
             .hovered(|s| s.background(hover()))
-            .selected(|s| s.background(card_bg()).color(fg())),
+            .selected(|s| s.background(tab_selected_bg()).color(fg())),
     )
 }
 
