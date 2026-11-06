@@ -8,7 +8,6 @@ description = "Aureole 上的终端模拟器：自研 pty 和 xterm 仿真，屏
 [dependencies]
 # 只用公开 API，不改框架
 aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "adc0c77" }
-libc = "0.2"
 # 字宽（汉字、emoji 两格）：和框架用同一版
 unicode-width = "0.2"
 
@@ -32,7 +31,9 @@ opt-level = 3
 codegen-units = 1
 lto = "thin"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSResponder", "NSWindow", "NSApplication", "NSEvent", "NSGraphics"] }
-objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSResponder", "NSWindow", "NSApplication"] }

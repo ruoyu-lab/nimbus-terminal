@@ -25,16 +25,9 @@ const ESTIMATED_CELL: (f32, f32) = (FONT_SIZE * 0.6, FONT_SIZE * LINE_HEIGHT);
 const MINIMUM: (usize, usize) = (20, 4);
 const MAXIMUM: (usize, usize) = (400, 200);
 
-/// 配色：一个深色主题，先写死。配置文件和跟随系统外观留给后面
-pub struct Theme {
-    pub background: Color,
-    pub foreground: Color,
-    pub selection: Color,
-    /// 256 色表，前 16 个是 ANSI 16 色
-    pub palette: [Color; 256],
-}
-
-/// 白底上看得清的 16 色：普通色偏深，亮色是同色相更鲜的一档（不是更浅：更浅在白底上就看不见了）
+/// 白底上看得清的 16 色：普通色偏深，亮色是同色相更鲜的一档（不是更浅：更浅在白底上就看不见了）。
+/// 配色先写死成浅色这一套，配置文件和跟随系统外观留给后面；窗口底色和默认文字颜色由 `chrome` 给，
+/// `pty` 里的 `COLORFGBG` 也是照白底写的，换底色时要一起改
 const ANSI16: [u32; 16] = [
     0x2b3036, 0xd1383d, 0x2a8a5c, 0xa8740a, 0x2f6fd0, 0xa23fbf, 0x1b8a9a, 0x6b7279, //
     0x565c63, 0xe5484d, 0x30a46c, 0xc28a12, 0x3e63dd, 0xb84fd6, 0x12a0b3, 0x1f2328,
@@ -44,7 +37,7 @@ fn rgb(value: u32) -> Color {
     Color::rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
 }
 
-/// 16..240 是 6×6×6 的色块，240..256 是灰阶：xterm 的算法
+/// 256 色表，前 16 个是 ANSI 16 色；16..232 是 6×6×6 的色块，232..256 是灰阶：xterm 的算法
 fn build_palette() -> [Color; 256] {
     let mut palette = [Color::BLACK; 256];
     for (index, value) in ANSI16.iter().enumerate() {
@@ -64,16 +57,7 @@ fn build_palette() -> [Color; 256] {
     palette
 }
 
-static THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
-    background: rgb(0xffffff),
-    foreground: rgb(0x1f2328),
-    selection: rgb(0xd5d9e0),
-    palette: build_palette(),
-});
-
-pub fn theme() -> &'static Theme {
-    &THEME
-}
+static PALETTE: LazyLock<[Color; 256]> = LazyLock::new(build_palette);
 
 /// 窗口这么大的话放得下几列几行。`cell` 是一格的逻辑像素大小，没量到之前用估计值
 pub fn fit(width: f32, height: f32, cell: (f32, f32)) -> (usize, usize) {
@@ -159,7 +143,6 @@ fn paint_row(grid: &CharGrid, row: usize, line: Option<&[Cell]>) {
 
 /// 一格的样式：仿真层的写法 → 网格的写法
 fn style(attrs: Attributes) -> CharCellStyle {
-    let theme = theme();
     let mut style = CharCellStyle::default()
         .bold(attrs.bold)
         .italic(attrs.italic)
@@ -167,20 +150,20 @@ fn style(attrs: Attributes) -> CharCellStyle {
         .strikethrough(attrs.strikethrough)
         .inverse(attrs.inverse);
     if let Some(color) = attrs.foreground {
-        style = style.foreground(color_of(theme, color, attrs.bold));
+        style = style.foreground(color_of(color, attrs.bold));
     }
     if let Some(color) = attrs.background {
         // 背景色不吃「粗体变亮色」那条规则
-        style = style.background(color_of(theme, color, false));
+        style = style.background(color_of(color, false));
     }
     style
 }
 
-fn color_of(theme: &Theme, color: ColorSpec, bold: bool) -> Color {
+fn color_of(color: ColorSpec, bold: bool) -> Color {
     match color {
         // 粗体把前 8 色提亮到后 8 色（xterm 的 `boldAsBright`，多数 shell 的高亮文件列表靠它）
-        ColorSpec::Indexed(index) if bold && index < 8 => theme.palette[index as usize + 8],
-        ColorSpec::Indexed(index) => theme.palette[index as usize],
+        ColorSpec::Indexed(index) if bold && index < 8 => PALETTE[index as usize + 8],
+        ColorSpec::Indexed(index) => PALETTE[index as usize],
         ColorSpec::Rgb(value) => rgb(value),
     }
 }

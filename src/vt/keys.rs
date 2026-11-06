@@ -26,10 +26,11 @@ pub fn encode(event: &KeyEvent, keymap: Keymap) -> Option<Vec<u8>> {
     match &event.key {
         Key::Named(named) => named_key(*named, keymap, modifiers, ctrl, shift),
         Key::Character(text) => {
-            if ctrl && !alt {
-                if let Some(byte) = control_code(text.as_str()) {
-                    return Some(vec![byte]);
-                }
+            if ctrl
+                && !alt
+                && let Some(byte) = control_code(text.as_str())
+            {
+                return Some(vec![byte]);
             }
             // 组字过程中（输入法正选字）按键归输入法，不发任何东西
             if event.composing {
@@ -178,7 +179,7 @@ fn modified_final(final_char: u8, modifiers: Modifiers) -> Vec<u8> {
 fn ascii_of(key: &Key) -> Option<u8> {
     let Key::Character(text) = key else { return None };
     let ch = text.chars().next()?;
-    ch.is_ascii().then(|| ch as u8)
+    ch.is_ascii().then_some(ch as u8)
 }
 
 /// 粘进去的文字：开了括号粘贴时前后加标记。

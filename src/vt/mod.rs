@@ -252,7 +252,7 @@ impl Terminal {
             0x08 => self.screen_mut().backspace(1),
             0x09 => self.screen_mut().tab(),
             // LF、VT、FF：往下走一行（FF 有的终端当清屏，这里跟 LF 一样）
-            0x0a | 0x0b | 0x0c => {
+            0x0a..=0x0c => {
                 let newline = self.modes.line_feed_newline;
                 if newline {
                     self.screen_mut().carriage_return();
@@ -691,7 +691,7 @@ mod tests {
         term.feed(b"\x1b[38;2;255;0;128m\x1b[38;5;42m");
         assert_eq!(term.pen.foreground, Some(ColorSpec::Indexed(42)));
         term.feed(b"\x1b[38;2;1;2;3mx");
-        assert_eq!(term.pen.foreground, Some(ColorSpec::Rgb(0x0102_03)));
+        assert_eq!(term.pen.foreground, Some(ColorSpec::Rgb(0x01_02_03)));
     }
 
     /// 不认识的序列必须整条吃掉：这是「跑 htop 不乱屏」的前提

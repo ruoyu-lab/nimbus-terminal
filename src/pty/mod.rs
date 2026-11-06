@@ -7,6 +7,7 @@
 //! - **读**：后台线程堵住 pty 的读端，读到多少就塞进 [`ByteQueue`]，主线程 `await` 它
 //! - **写**：主线程只管把字节交给写线程，永不因为 shell 没在吃输入而卡住界面
 
+#[cfg(unix)]
 mod posix;
 mod queue;
 
@@ -22,8 +23,6 @@ pub trait PtyBackend: Send + Sync {
     fn write(&self, bytes: &[u8]) -> io::Result<()>;
     /// 改窗口大小（`TIOCSWINSZ`，子进程会收到 `SIGWINCH`）
     fn resize(&self, columns: u16, rows: u16);
-    /// 子进程的 pid
-    fn process_id(&self) -> i32;
 }
 
 /// 应用手里的那份句柄：可以克隆，随便带到哪个闭包里
@@ -45,10 +44,6 @@ impl Pty {
 
     pub fn resize(&self, columns: u16, rows: u16) {
         self.backend.resize(columns, rows)
-    }
-
-    pub fn process_id(&self) -> i32 {
-        self.backend.process_id()
     }
 }
 
@@ -74,8 +69,14 @@ impl Config {
             Some("zsh") | Some("bash") | Some("sh") | Some("fish") => vec!["-l".to_string()],
             _ => Vec::new(),
         };
-        Self { program, arguments, columns, rows, working_directory: std::env::current_dir().ok() }
+        Self { program, arguments, columns, rows, working_directory: home_directory() }
     }
+}
+
+/// 新会话的起始目录：用户的主目录。从 Finder、Dock 启动的应用当前目录是 `/`，不能拿来当起点；
+/// 没有 `HOME` 时返回 `None`，由子进程沿用当前目录
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME").filter(|home| !home.is_empty()).map(PathBuf::from)
 }
 
 /// 起一个 pty，返回句柄和读到的字节
@@ -101,9 +102,6 @@ impl PtyBackend for Recorder {
         Ok(())
     }
     fn resize(&self, _: u16, _: u16) {}
-    fn process_id(&self) -> i32 {
-        0
-    }
 }
 
 #[cfg(test)]
@@ -111,5 +109,17 @@ impl Recorder {
     /// 取走到现在为止写进去的字节
     pub(crate) fn take(&self) -> String {
         String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock().expect("锁"))).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试进程的当前目录是项目目录，不是主目录：起始目录要是主目录，说明没有拿当前目录凑合
+    #[test]
+    fn a_login_shell_starts_in_the_home_directory() {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        assert_eq!(Config::login_shell(80, 24).working_directory, home);
     }
 }

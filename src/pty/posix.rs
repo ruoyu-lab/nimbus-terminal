@@ -20,6 +20,9 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     ("TERM", "xterm-256color"),
     ("COLORTERM", "truecolor"),
     ("TERM_PROGRAM", "aureole-terminal"),
+    // 白底黑字（`前景;背景` 的色号）。vim、bat 这类程序靠它猜背景深浅，不给就当深色背景，
+    // 配出浅色的字落在白底上。主题的底色在 `view` 里，换底色时这里要跟着改
+    ("COLORFGBG", "0;15"),
 ];
 
 /// 从 Finder / Dock 启动的应用没有 `LANG`，shell 会退回 C 语言环境：中文显示成问号、
@@ -88,10 +91,6 @@ impl PtyBackend for Session {
         // SAFETY: `fd` 是还开着的 pty 主端，`size` 是栈上的 `winsize`，请求号 `TIOCSWINSZ` 说明带的就是它。
         // 改不动就算了（子进程可能正好退出）：行列对不上比崩掉好，这里也没有能报告给它的地方
         let _failed = unsafe { libc::ioctl(self.master.fd, libc::TIOCSWINSZ, &size) };
-    }
-
-    fn process_id(&self) -> i32 {
-        self.process_id
     }
 }
 
@@ -243,5 +242,107 @@ fn wait(process_id: c_int) -> i32 {
         128 + (status & 0x7f)
     } else {
         (status >> 8) & 0xff
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// 起 `/bin/sh -c 脚本`，80 × 24
+    fn sh(script: &str) -> Config {
+        Config { program: "/bin/sh".to_string(), arguments: vec!["-c".to_string(), script.to_string()], columns: 80, rows: 24, working_directory: None }
+    }
+
+    /// 读队列，直到子进程退出（带退出码），或者读到的文字里出现了 `until`（退出码是 `None`）。
+    /// 读线程在后台跑，这里轮询；10 秒没等到就当失败，免得测试挂住
+    fn collect(queue: &ByteQueue, until: Option<&str>) -> (String, Option<i32>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        loop {
+            match queue.try_next() {
+                Some(Chunk::Bytes(bytes)) => {
+                    output.extend_from_slice(&bytes);
+                    let text = String::from_utf8_lossy(&output);
+                    if until.is_some_and(|needle| text.contains(needle)) {
+                        return (text.into_owned(), None);
+                    }
+                }
+                Some(Chunk::Closed(code)) => return (String::from_utf8_lossy(&output).into_owned(), Some(code)),
+                None => {
+                    assert!(Instant::now() < deadline, "等了 10 秒，到现在读到的是 {:?}", String::from_utf8_lossy(&output));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    /// 读到子进程退出：全部输出和退出码
+    fn drain(queue: &ByteQueue) -> (String, i32) {
+        let (output, code) = collect(queue, None);
+        (output, code.expect("没有等待的内容时，只会因为子进程退出而返回"))
+    }
+
+    #[test]
+    fn output_and_exit_code_come_back() {
+        let (_pty, queue) = spawn(sh("echo hi; exit 3")).expect("起得来");
+        let (output, code) = drain(&queue);
+        assert!(output.contains("hi"), "{output:?}");
+        assert_eq!(code, 3);
+    }
+
+    /// 被信号打死按 shell 的惯例报 `128 + 信号`
+    #[test]
+    fn a_child_killed_by_a_signal_reports_128_plus_the_signal() {
+        let (_pty, queue) = spawn(sh("kill -9 $$")).expect("起得来");
+        assert_eq!(drain(&queue).1, 128 + 9);
+    }
+
+    /// `exec` 失败（程序不存在）：子进程用 127 退出，不能带着父进程的状态继续跑
+    #[test]
+    fn a_missing_program_exits_with_127() {
+        let config = Config { program: "/nonexistent/shell".to_string(), arguments: Vec::new(), columns: 80, rows: 24, working_directory: None };
+        let (_pty, queue) = spawn(config).expect("fork 本身是成功的");
+        assert_eq!(drain(&queue).1, 127);
+    }
+
+    /// 起的时候就是给定的行列数，之后 `resize` 改了子进程也看得到；同时走通了写线程
+    #[test]
+    fn the_child_sees_the_initial_size_and_later_resizes() {
+        let (pty, queue) = spawn(sh("stty size; read line; stty size")).expect("起得来");
+        // 等第一次 `stty size` 打出来再改，不然改得比 shell 启动还早，第一行就不是起始大小了
+        collect(&queue, Some("24 80"));
+        pty.resize(100, 30);
+        pty.write(b"go\n").expect("写得进去");
+        let (output, code) = drain(&queue);
+        assert!(output.contains("30 100"), "{output:?}");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn the_child_gets_the_terminal_environment() {
+        let (_pty, queue) = spawn(sh("echo \"$TERM|$COLORTERM|$COLORFGBG|$TERM_PROGRAM\"")).expect("起得来");
+        let (output, _) = drain(&queue);
+        assert!(output.contains("xterm-256color|truecolor|0;15|aureole-terminal"), "{output:?}");
+    }
+
+    /// 测试进程自己在项目目录里，所以子进程报出 `/` 就说明 `chdir` 生效了
+    #[test]
+    fn the_child_starts_in_the_requested_directory() {
+        let mut config = sh("pwd");
+        config.working_directory = Some(PathBuf::from("/"));
+        let (_pty, queue) = spawn(config).expect("起得来");
+        assert_eq!(drain(&queue).0.trim(), "/");
+    }
+
+    /// 句柄丢了（标签关了）：子进程要收到 SIGHUP，不能留在后台
+    #[test]
+    fn dropping_the_handle_hangs_up_the_child() {
+        let (pty, queue) = spawn(sh("exec sleep 30")).expect("起得来");
+        drop(pty);
+        assert_eq!(drain(&queue).1, 128 + 1);
     }
 }

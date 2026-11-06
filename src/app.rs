@@ -41,6 +41,7 @@ pub struct Hooks {
 
 impl Hooks {
     /// 什么都不管（测试里）
+    #[cfg(test)]
     pub fn none() -> Self {
         Self { title: Rc::new(|_| {}), resized: Rc::new(|_, _| {}), exited: Rc::new(|_| {}), activity: Rc::new(|| {}) }
     }
@@ -133,11 +134,6 @@ impl Session {
             task.cancel();
         }
         self.pty.borrow_mut().take();
-    }
-
-    /// 屏幕现在的行列数
-    pub fn size(&self) -> (usize, usize) {
-        self.terminal.borrow().size()
     }
 
     fn write(&self, bytes: &[u8]) {
@@ -475,10 +471,7 @@ pub fn view(session: Rc<Session>) -> Element {
         .clip(true)
         .padding(PADDING)
         .report_bounds(viewport)
-        .on_mount({
-            let focus = focus.clone();
-            move || focus.focus()
-        })
+        .on_mount(move || focus.focus())
         .child(
             char_grid(&grid)
                 .name("grid")
@@ -505,7 +498,6 @@ pub fn view(session: Rc<Session>) -> Element {
                 // 输入法：预编辑画在插入点处，提交的字原样写给 shell
                 .on_text_insert(move |text: String| ime_session.commit_text(&text)),
         )
-        .into()
 }
 
 #[cfg(test)]

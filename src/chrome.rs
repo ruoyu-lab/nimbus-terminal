@@ -99,7 +99,6 @@ pub fn build(workspace: Rc<Workspace>) -> Element {
                 .backdrop_transition(Tween::new(ms(160)).ease_out())
                 .on_dismiss(move |_| palette_open.set(false)),
         )
-        .into()
 }
 
 // ───────────────────────── 标题栏 ─────────────────────────

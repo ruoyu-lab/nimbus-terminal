@@ -82,10 +82,6 @@ impl Cell {
     pub const fn blank(attrs: Attributes) -> Cell {
         Cell { ch: ' ', width: 1, attrs }
     }
-
-    pub fn is_blank(&self) -> bool {
-        self.ch == ' ' && self.width == 1
-    }
 }
 
 /// 一行。屏幕上的行总是满列宽；滚进历史的行会去掉行尾的默认空格（省内存），
@@ -660,6 +656,7 @@ impl Screen {
         self.archived_total
     }
 
+    #[cfg(test)]
     pub fn line_text(&self, row: usize) -> String {
         let Some(line) = self.lines.get(row) else { return String::new() };
         let text: String = line.iter().filter(|cell| cell.width != 0).map(|cell| cell.ch).collect();
