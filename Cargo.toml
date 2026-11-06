@@ -1,0 +1,38 @@
+[package]
+name = "aureole-terminal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Aureole 上的终端模拟器：自研 pty 和 xterm 仿真，屏幕用框架的字符网格画"
+
+[dependencies]
+# 只用公开 API，不改框架
+aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "adc0c77" }
+libc = "0.2"
+# 字宽（汉字、emoji 两格）：和框架用同一版
+unicode-width = "0.2"
+
+[dev-dependencies]
+# 离屏测试：`Harness` 挂视图、模拟点击和移动，不用 GPU 和窗口
+aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "adc0c77", features = ["testing"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+
+# 和框架一样：wgpu 在未优化的依赖下非常慢，开发时也把依赖编成 release
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSResponder", "NSWindow", "NSApplication", "NSEvent", "NSGraphics"] }
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSGeometry"] }
