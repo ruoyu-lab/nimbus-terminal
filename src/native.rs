@@ -52,6 +52,29 @@ pub fn keep_window_still_unless_asked() {
 #[cfg(not(target_os = "macos"))]
 pub fn keep_window_still_unless_asked() {}
 
+/// 把 Dock 里的图标换成软件自己的（没打包成 .app、`cargo run` 起来时系统给的是一个通用的图标；
+/// 打包后系统用 `.icns`，这里再设一次也一样）
+#[cfg(target_os = "macos")]
+pub fn set_application_icon() {
+    use objc2::AnyThread;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../assets/icon.png"));
+    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        // SAFETY: 在主线程上，图像是刚建好的、不会再被改动
+        unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+    }
+}
+
+/// 别的平台的图标由窗口系统管
+#[cfg(not(target_os = "macos"))]
+pub fn set_application_icon() {}
+
 /// 系统提示音（程序输出 BEL、设置里选了「系统提示音」时）
 #[cfg(target_os = "macos")]
 pub fn beep() {

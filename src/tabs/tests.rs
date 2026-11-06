@@ -2768,3 +2768,67 @@ fn the_focused_pane_has_a_marker_that_follows_the_focus() {
         "线跟着走"
     );
 }
+
+/// README 里的截图：`README_SHOTS=docs/screenshots cargo test screenshots_for_readme -- --ignored`
+/// （离屏渲染，没有系统的窗口材质，和真机上半透明的侧栏略有不同）
+#[test]
+#[ignore = "出图用，不是检查"]
+fn screenshots_for_readme() {
+    let Ok(directory) = std::env::var("README_SHOTS") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    std::fs::create_dir_all(&directory).expect("建得了目录");
+    let save = |harness: &Harness, name: &str| {
+        harness.advance(secs(1.0));
+        harness
+            .screenshot()
+            .save_png(directory.join(name))
+            .expect("存得下 PNG");
+    };
+    const BUILD: &str = "\x1b[1;32m➜\x1b[0m \x1b[36mnimbus-terminal\x1b[0m \x1b[1;34mgit:(\x1b[31mmain\x1b[34m)\x1b[0m cargo test\r\n   \x1b[1;32mCompiling\x1b[0m nimbus-terminal v0.1.0\r\n    \x1b[1;32mFinished\x1b[0m `test` profile [unoptimized + debuginfo] target(s) in 4.21s\r\n     \x1b[1;32mRunning\x1b[0m unittests src/main.rs\r\n\r\nrunning 170 tests\r\ntest vt::tests::mouse_modes_switch_on_and_off_independently ... \x1b[32mok\x1b[0m\r\ntest tabs::tests::split_layouts_survive_a_restart ... \x1b[32mok\x1b[0m\r\ntest tabs::tests::folders_and_tabs_survive_a_restart ... \x1b[32mok\x1b[0m\r\n\r\ntest result: \x1b[32mok\x1b[0m. 170 passed; 0 failed\r\n\x1b[1;32m➜\x1b[0m \x1b[36mnimbus-terminal\x1b[0m \x1b[1;34mgit:(\x1b[31mmain\x1b[34m)\x1b[0m ";
+    const LISTING: &str = "\x1b[1;32m➜\x1b[0m \x1b[36m~/项目\x1b[0m ls -la\r\ndrwxr-xr-x   9 licha  staff   288 Nov  6 22:30 \x1b[1;34m.\x1b[0m\r\ndrwxr-xr-x  14 licha  staff   448 Nov  6 22:30 \x1b[1;34mnimbus-terminal\x1b[0m\r\ndrwxr-xr-x   6 licha  staff   192 Nov  6 21:02 \x1b[1;34maureole-framework\x1b[0m\r\n-rw-r--r--   1 licha  staff  1179 Nov  6 22:12 Cargo.toml\r\n\x1b[1;32m➜\x1b[0m \x1b[36m~/项目\x1b[0m ";
+    const LOG: &str = "\x1b[1;32m➜\x1b[0m \x1b[36mnimbus-terminal\x1b[0m tail -f server.log\r\n\x1b[90m22:31:07\x1b[0m \x1b[32mINFO\x1b[0m  listening on 127.0.0.1:3000\r\n\x1b[90m22:31:12\x1b[0m \x1b[32mINFO\x1b[0m  GET /api/tabs 200 3ms\r\n\x1b[90m22:31:14\x1b[0m \x1b[33mWARN\x1b[0m  slow query 412ms\r\n\x1b[90m22:31:19\x1b[0m \x1b[32mINFO\x1b[0m  GET /api/panes 200 5ms\r\n";
+    let project = directory.join("项目");
+    let scene = |dark: bool| {
+        let (harness, workspace, _fake) = blank(Store::none());
+        harness.set_scale_factor(1.5);
+        workspace.form.appearance.set(if dark {
+            ThemeChoice::Dark
+        } else {
+            ThemeChoice::Light
+        });
+        std::fs::create_dir_all(&project).expect("建得了目录");
+        let folder = workspace.add_directory(&project).expect("是目录");
+        workspace.create_folder("实验");
+        workspace.new_tab_in(folder);
+        workspace.new_tab_in(folder);
+        workspace.new_tab();
+        let tabs = workspace.tabs.get_untracked();
+        tabs[0].session().feed_for_test(LISTING);
+        tabs[1].session().feed_for_test(BUILD);
+        tabs[2].session().feed_for_test(LOG);
+        workspace.select(2);
+        (harness, workspace)
+    };
+    let (harness, _workspace) = scene(false);
+    save(&harness, "light.png");
+    let (harness, workspace) = scene(true);
+    save(&harness, "dark.png");
+    // 分屏
+    workspace.select(2);
+    workspace.split(Axis::Columns);
+    workspace.tabs.get_untracked()[1]
+        .session()
+        .feed_for_test(LISTING);
+    workspace.split(Axis::Rows);
+    workspace.tabs.get_untracked()[1]
+        .session()
+        .feed_for_test(LOG);
+    save(&harness, "split.png");
+    // 设置
+    workspace.open_settings();
+    workspace.settings_page.set(SettingsPage::Appearance);
+    save(&harness, "settings.png");
+    let _ = std::fs::remove_dir_all(&project);
+}

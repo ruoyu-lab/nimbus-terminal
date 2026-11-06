@@ -1322,6 +1322,7 @@ pub fn save_on_exit() {
 /// 窗口的根视图
 pub fn root() -> Element {
     crate::native::keep_window_still_unless_asked();
+    crate::native::set_application_icon();
     let store = Store::system();
     let window = current_window();
     let workspace = Workspace::new(Rc::new(crate::app::spawn), window, store.clone());
