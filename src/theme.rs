@@ -15,11 +15,11 @@ use aureole::prelude::*;
 /// 浅色的墨色：文字、投影、悬停和选中的底色都从它来
 pub const LIGHT_INK: Color = Color::hex(0x1f2328);
 /// 深色的「墨色」：浅灰的字
-pub const DARK_INK: Color = Color::hex(0xdde0e6);
+pub const DARK_INK: Color = Color::hex(0xe2e2e2);
 /// 浅色的主卡片（终端所在的那块）：白
 pub const LIGHT_CARD: Color = Color::hex(0xffffff);
 /// 深色的主卡片
-pub const DARK_CARD: Color = Color::hex(0x1a1d23);
+pub const DARK_CARD: Color = Color::hex(0x1e1e1e);
 
 thread_local! {
     static DARK: Cell<Option<Signal<bool>>> = const { Cell::new(None) };
@@ -76,7 +76,7 @@ pub fn ink() -> Color {
 
 /// 侧栏和标题栏的底：比卡片稍深（浅色）或稍浅（深色）的一档
 pub fn sidebar_bg() -> Color {
-    pick(Color::hex(0xf3f3f4), Color::hex(0x1e2025))
+    pick(Color::hex(0xf3f3f4), Color::hex(0x272727))
 }
 
 /// 主卡片（终端所在的那块）
@@ -86,13 +86,13 @@ pub fn card_bg() -> Color {
 
 /// 细线、卡片边框
 pub fn line() -> Color {
-    pick(Color::hex(0xe3e4e6), Color::hex(0x2d3037))
+    pick(Color::hex(0xe3e4e6), Color::hex(0x353535))
 }
 
-/// 选中的标签的底：浅色里和下面的卡片一样是白的，深色里比标签条和卡片都亮一档，
+/// 选中的标签的底：浅色里和下面的卡片一样是白的，深色里比标签条和卡片都亮一档（中性的灰，不带蓝），
 /// 不然选中的标签比标签条还暗，像开了个洞，分不出哪个是当前的
 pub fn tab_selected_bg() -> Color {
-    pick(LIGHT_CARD, Color::hex(0x394049))
+    pick(LIGHT_CARD, Color::hex(0x404040))
 }
 
 /// 正文
@@ -101,11 +101,11 @@ pub fn fg() -> Color {
 }
 
 pub fn text_2() -> Color {
-    pick(Color::hex(0x555b62), Color::hex(0xb3b9c1))
+    pick(Color::hex(0x555b62), Color::hex(0xb8b8b8))
 }
 
 pub fn text_3() -> Color {
-    pick(Color::hex(0x838990), Color::hex(0x8a9099))
+    pick(Color::hex(0x838990), Color::hex(0x909090))
 }
 
 /// 小标记（后台有新输出的圆点、角标）：不抢眼但看得清
@@ -115,12 +115,12 @@ pub fn mark() -> Color {
 
 /// 开关打开时、主按钮的底：浅色里是墨色，深色里是一档中灰（浅灰底配白色的滑块看不清）
 pub fn accent() -> Color {
-    pick(LIGHT_INK, Color::hex(0x7c8696))
+    pick(LIGHT_INK, Color::hex(0x8c8c8c))
 }
 
 /// 开关关着时的槽：深色里是一档深灰（框架默认的浅灰槽配白色滑块在深底上整个发白，看不出是开是关）
 pub fn toggle_off() -> Color {
-    pick(Color::hex(0xd5dae0), Color::hex(0x3a3f48))
+    pick(Color::hex(0xd5dae0), Color::hex(0x404040))
 }
 
 /// 模态框后面压暗的一层
@@ -157,12 +157,12 @@ pub fn popup_shadow() -> Shadows {
 
 /// 悬停时的一层灰：要看得出来，所以比「淡淡一层」深
 pub fn hover() -> Color {
-    ink().with_alpha(if is_dark() { 0.07 } else { 0.10 })
+    ink().with_alpha(if is_dark() { 0.045 } else { 0.10 })
 }
 
 /// 选中项的底：比悬停再深一档，悬停和选中能分得开
 pub fn selected() -> Color {
-    ink().with_alpha(if is_dark() { 0.12 } else { 0.16 })
+    ink().with_alpha(if is_dark() { 0.09 } else { 0.16 })
 }
 
 #[cfg(test)]
@@ -186,6 +186,34 @@ mod tests {
         };
         let (a, b) = (luminance(a), luminance(b));
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// 深色的底、线、灰字都是中性的灰，不带蓝（红绿蓝三个分量最多差几个数）
+    #[test]
+    fn the_dark_greys_are_neutral() {
+        set_dark(true);
+        let colors = crate::view::colors(true);
+        for (name, color) in [
+            ("卡片", card_bg()),
+            ("标签条、侧栏", sidebar_bg()),
+            ("线", line()),
+            ("选中的标签", tab_selected_bg()),
+            ("正文", fg()),
+            ("次要文字", text_2()),
+            ("更淡的文字", text_3()),
+            ("开关的槽", toggle_off()),
+            ("强调色", accent()),
+            ("终端的底", colors.background),
+            ("终端的字", colors.foreground),
+            ("终端的黑", colors.ansi(0)),
+            ("终端的亮黑", colors.ansi(8)),
+            ("终端的白", colors.ansi(7)),
+        ] {
+            let [r, g, b, _] = color.0;
+            let spread = r.max(g).max(b) - r.min(g).min(b);
+            assert!(spread <= 4, "{name} 偏色了：{color:?}");
+        }
+        set_dark(false);
     }
 
     /// 深色里字、标签、终端的颜色都读得清：这是个下限，防止以后调色调回难读的

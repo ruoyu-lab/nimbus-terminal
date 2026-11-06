@@ -33,10 +33,10 @@ const LIGHT16: [u32; 16] = [
     0x565c63, 0xe5484d, 0x30a46c, 0xc28a12, 0x3e63dd, 0xb84fd6, 0x12a0b3, 0x1f2328,
 ];
 
-/// 深色：深底上看得清，亮色更浅更鲜
+/// 深色：深底上看得清，亮色更浅更鲜；黑和灰是中性的，不带蓝
 const DARK16: [u32; 16] = [
-    0x4b5260, 0xf2777a, 0x7ccf8f, 0xe5c07b, 0x7aa7ff, 0xc792ea, 0x56c8d8, 0xd0d4db, //
-    0x7f8797, 0xff8f92, 0x98e3a8, 0xf0d28f, 0x8dbcff, 0xdba5f5, 0x7ee0ed, 0xffffff,
+    0x555555, 0xf2777a, 0x7ccf8f, 0xe5c07b, 0x7aa7ff, 0xc792ea, 0x56c8d8, 0xd0d0d0, //
+    0x888888, 0xff8f92, 0x98e3a8, 0xf0d28f, 0x8dbcff, 0xdba5f5, 0x7ee0ed, 0xffffff,
 ];
 
 fn rgb(value: u32) -> Color {
@@ -89,7 +89,7 @@ static LIGHT: LazyLock<Colors> = LazyLock::new(|| Colors {
 static DARK: LazyLock<Colors> = LazyLock::new(|| Colors {
     background: DARK_CARD,
     foreground: DARK_INK,
-    flash: Color::hex(0x2a2f38),
+    flash: Color::hex(0x2e2e2e),
     table: build_table(&DARK16),
 });
 
