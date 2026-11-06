@@ -39,7 +39,9 @@ opt-level = 3
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+lto = "fat"
+# 发布的版本去掉符号表：体积小一半以上。崩溃时的调用栈看不到函数名了，原因（panic 信息）还是会写进 crash.log
+strip = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

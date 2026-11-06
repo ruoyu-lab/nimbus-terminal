@@ -21,6 +21,10 @@ name="Nimbus"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 binary="nimbus-terminal"
 
+# 最低支持的系统版本：编译时就按它来（不然二进制要求和本机一样新的系统），Info.plist 里写的也是它
+minimum_macos="12.0"
+export MACOSX_DEPLOYMENT_TARGET="$minimum_macos"
+
 cargo build $flags
 target_dir="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 
@@ -43,7 +47,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${version}</string>
   <key>CFBundleVersion</key><string>${version}</string>
-  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>LSMinimumSystemVersion</key><string>${minimum_macos}</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
 </dict>

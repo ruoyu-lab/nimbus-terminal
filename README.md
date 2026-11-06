@@ -62,6 +62,15 @@
 
 目前只支持 **macOS**（pty 用的是 `forkpty`，Linux 同一套接口但没有在桌面上测过，Windows 的 ConPTY 还没写）。
 
+### 下载
+
+到 [Releases](https://github.com/ruoyu-lab/nimbus-terminal/releases) 下载 `Nimbus-<版本>-macos-arm64.zip`，解压后把 `Nimbus.app` 拖进「应用程序」。
+
+- 只有 Apple 芯片（arm64）的包，最低 macOS 12
+- 没有开发者签名和公证，第一次打开会被系统拦下：右键 `Nimbus.app` → 打开；或者在终端里执行 `xattr -dr com.apple.quarantine /Applications/Nimbus.app`
+
+### 从源码构建
+
 需要 Rust 1.90 或更新（edition 2024）。
 
 ```bash
@@ -73,6 +82,9 @@ cargo run --release
 
 # 或者打包成 .app（target/bundle/Nimbus.app，带图标，用临时签名）
 scripts/bundle-macos.sh
+
+# 再压成发布用的 zip（target/release-assets/）
+scripts/release-macos.sh
 ```
 
 界面框架 Aureole 是 Git 依赖，`cargo` 会自己拉取，不需要另外装。
