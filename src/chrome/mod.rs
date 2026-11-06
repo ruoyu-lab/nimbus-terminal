@@ -73,7 +73,7 @@ pub fn build(workspace: Rc<Workspace>) -> Element {
         });
     }
     let dark = crate::theme::dark();
-    let shortcuts = workspace.clone();
+    let (shortcuts, dropper) = (workspace.clone(), workspace.clone());
     column()
         .grow(1)
         .min_width(0)
@@ -84,6 +84,10 @@ pub fn build(workspace: Rc<Workspace>) -> Element {
                 event.stop_propagation();
             }
         })
+        // 拖着标签放在窗口里的哪儿都算放下（换顺序按被拖的标签自己的位置算，不看指针在哪），
+        // 手稍微偏出标签条也不会变成取消
+        .accepts_drop(|_: &u64| true)
+        .on_drop(move |id: u64, _: &DropEvent| dropper.drop_tab(id))
         .each(
             move || vec![dark.get()],
             |dark| *dark,

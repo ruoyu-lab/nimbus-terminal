@@ -12,7 +12,7 @@ use crate::chrome::menu::with_context_menu;
 use crate::chrome::widgets::{fade_in, icon_button, soft};
 use crate::icons::Icon;
 use crate::pane::Axis;
-use crate::tabs::Workspace;
+use crate::tabs::{TabDrag, Workspace};
 use crate::theme::{fg, hover, mark, tab_selected_bg, text_2};
 
 /// 标签：定宽，高 28，之间 2px；右边关闭按钮 20，所以上、右、下都留 4
@@ -26,16 +26,6 @@ const TAB_STRIDE: f32 = TAB_WIDTH + TAB_GAP;
 
 /// 标签再多，右边也至少留这么宽的空白给拖动窗口
 const DRAG_AREA_MIN: f32 = 64.0;
-
-/// 拖动标签时的状态：被拖的是谁、从第几格起、现在指针停在第几格上。
-/// 被拖的标签用框架的拖放（`DragPreview::Lift`，它自己在合成层上跟着指针走，框架每帧管着）；
-/// 拖的过程中标签条的顺序不变（不重新布局），别的标签只靠平移让出位置；松手才真的换顺序
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Drag {
-    id: u64,
-    from: usize,
-    to: usize,
-}
 
 pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
     let me = workspace.window;
@@ -115,10 +105,6 @@ fn tab_strip(workspace: &Rc<Workspace>) -> Element {
     let (bar, active) = (workspace.bar, workspace.active);
     let (new_tab, owner) = (workspace.clone(), workspace.clone());
     let scroller = ScrollHandle::new();
-    let drag = signal(None::<Drag>);
-    // 按下处离被拖的标签左边多远：算被拖的标签现在占哪一格
-    let grab = Rc::new(Cell::new(0.0f32));
-    let (over_grab, drop_owner) = (grab.clone(), workspace.clone());
     // 切到的标签（新开的、点侧栏选的、快捷键切的、刚从设置页回来）在视口外面时，滚到看得见为止。
     // 等一帧再滚：新标签刚挂上，视口还没量到它，现在滚会被夹回旧的末尾
     Effect::new(move || {
@@ -149,62 +135,18 @@ fn tab_strip(workspace: &Rc<Workspace>) -> Element {
         .gap(2)
         .min_width(0)
         .child(
-            scroll_x(
-                row()
-                    .gap(TAB_GAP)
-                    .align(Align::Center)
-                    .each(
-                        move || bar.get(),
-                        |id| *id,
-                        move |id| {
-                            fade_in(with_context_menu(
-                                tab_view(&owner, id, drag, grab.clone()),
-                                &owner,
-                                "tab",
-                                id,
-                            ))
-                        },
-                    )
-                    // 标签条是放置目标：拖着标签经过时算它该落在哪一格，别的标签让位；放下时才真的换顺序
-                    .accepts_drop(move |id: &u64| bar.get_untracked().contains(id))
-                    .on_drag_over(move |event: &DropEvent| {
-                        let Some(&id) = event.data::<u64>() else {
-                            return;
-                        };
-                        let last = bar.get_untracked().len().saturating_sub(1) as f32;
-                        let left = event.position[0] - over_grab.get();
-                        let to = (left / TAB_STRIDE).round().clamp(0.0, last) as usize;
-                        if let Some(dragged) = drag.get_untracked()
-                            && dragged.id == id
-                            && dragged.to != to
-                        {
-                            drag.set(Some(Drag { to, ..dragged }));
-                        }
-                    })
-                    .on_drop(move |id: u64, _: &DropEvent| {
-                        let Some(dragged) = drag.get_untracked().filter(|dragged| dragged.id == id)
-                        else {
-                            return;
-                        };
-                        // 先把被拖的设成当前标签，再清拖动状态：标签的选中样式在拖动中看的是「谁被拖」，
-                        // 清掉以后看的是「谁是当前」，反过来做的话，原来的当前标签会在中间闪回选中再淡出
-                        drop_owner.select(id);
-                        // 换完顺序，别的标签的格子各挪了一格，让位的平移要同时归零，不然画面会跳
-                        aureole::without_animation(|| {
-                            drag.set(None);
-                            drop_owner.move_tab(id, dragged.to);
-                        });
-                    })
-                    // 拖出标签条：回到原来的格子，别的标签不再让位
-                    .on_drag_leave(move || {
-                        if let Some(dragged) = drag.get_untracked() {
-                            drag.set(Some(Drag {
-                                to: dragged.from,
-                                ..dragged
-                            }));
-                        }
-                    }),
-            )
+            scroll_x(row().gap(TAB_GAP).align(Align::Center).each(
+                move || bar.get(),
+                |id| *id,
+                move |id| {
+                    fade_in(with_context_menu(
+                        tab_view(&owner, id, scroller),
+                        &owner,
+                        "tab",
+                        id,
+                    ))
+                },
+            ))
             .scroll_handle(scroller)
             .scrollbar_color(Color::TRANSPARENT)
             .margin_left(6)
@@ -230,12 +172,8 @@ fn tab_strip(workspace: &Rc<Workspace>) -> Element {
 }
 
 /// 一个标签：名字加关闭按钮。选中的是一块白色的小圆角，和下面的卡片同色
-fn tab_view(
-    workspace: &Rc<Workspace>,
-    id: u64,
-    drag: Signal<Option<Drag>>,
-    grab: Rc<Cell<f32>>,
-) -> Element {
+fn tab_view(workspace: &Rc<Workspace>, id: u64, scroller: ScrollHandle) -> Element {
+    let drag = workspace.tab_drag;
     let (active, titles, unseen, bar) = (
         workspace.active,
         workspace.titles,
@@ -243,6 +181,8 @@ fn tab_view(
         workspace.bar,
     );
     let (select, close, reorder) = (workspace.clone(), workspace.clone(), workspace.clone());
+    // 开始拖的时候标签条滚到哪了
+    let start_scroll = Rc::new(Cell::new(0.0f32));
     // 拖着别的标签时，只有被拖的这个是白底（松手后它就是当前标签）
     let selected = move || match drag.get() {
         Some(dragged) => dragged.id == id,
@@ -286,17 +226,34 @@ fn tab_view(
         .drag_preview_contained(true)
         .on_drag(move |event: &DragEvent| match event.phase {
             GesturePhase::Start => {
-                grab.set(event.position[0] - event.translation[0]);
                 let from = reorder.bar_index(id).unwrap_or(0);
-                drag.set(Some(Drag { id, from, to: from }));
+                start_scroll.set(scroller.offset_x());
+                drag.set(Some(TabDrag { id, from, to: from }));
             }
-            // 放下（被标签条接住）时顺序已经换好、状态已经清掉；取消（Esc、放在别处）时落回原来的格子
+            // 放下（落在窗口里的哪儿都算）时顺序已经换好、状态已经清掉；
+            // 取消（Esc、拖出了窗口）时落回原来的格子
             GesturePhase::End | GesturePhase::Cancel => {
                 if drag.get_untracked().is_some() {
                     drag.set(None);
                 }
             }
-            GesturePhase::Move => {}
+            GesturePhase::Move => {
+                let Some(dragged) = drag.get_untracked() else {
+                    return;
+                };
+                // 被拖的标签现在的左边：起点的格子加上指针走过的横向距离（拖到边上标签条自己滚动了也算进去），
+                // 夹在第一格和最后一格之间（它不出标签条）。左边每过半格就换一格——也就是
+                // 它的边越过相邻标签的一半时换，和指针在哪、从标签的哪里抓起来都没有关系
+                let last = reorder.bar.get_untracked().len().saturating_sub(1) as f32;
+                let left =
+                    (dragged.from as f32 * TAB_STRIDE + event.translation[0] + scroller.offset_x()
+                        - start_scroll.get())
+                    .clamp(0.0, last * TAB_STRIDE);
+                let to = (left / TAB_STRIDE).round() as usize;
+                if dragged.to != to {
+                    drag.set(Some(TabDrag { to, ..dragged }));
+                }
+            }
         })
         // 左边留 4 + 4，关闭按钮上、右、下都是 4：标签高 28、按钮 20
         .child(

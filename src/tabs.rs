@@ -117,6 +117,16 @@ impl Tab {
     }
 }
 
+/// 拖动标签时的状态：被拖的是谁、从标签条的第几格起、现在落在第几格。
+/// 「现在落在第几格」按被拖的标签自己的位置算（它的边越过相邻标签的一半就换格），不看指针在哪；
+/// 拖的过程中标签条的顺序不变，别的标签只靠平移让位，松手才真的换顺序
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabDrag {
+    pub id: u64,
+    pub from: usize,
+    pub to: usize,
+}
+
 /// 侧栏「目标」里的一个文件夹
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Folder {
@@ -227,6 +237,8 @@ pub struct Workspace {
     pub folder_prompt: Signal<Option<FolderPrompt>>,
     /// 顶部标签条里的顺序（会话的 id）：拖动只改它，和侧栏的顺序无关
     pub bar: Signal<Vec<u64>>,
+    /// 正在拖着的标签；没拖时是 `None`
+    pub tab_drag: Signal<Option<TabDrag>>,
     /// 每个标签现在显示的名字
     pub titles: Signal<HashMap<u64, String>>,
     /// 当前会话；一个会话都没有时是 0。设置页开着时它还是进设置之前的那个
@@ -312,6 +324,7 @@ impl Workspace {
             folders: signal(folders),
             folder_prompt: signal(None),
             bar: signal(Vec::new()),
+            tab_drag: signal(None),
             titles: signal(HashMap::new()),
             active: signal(0),
             unseen: signal(HashSet::new()),
@@ -1207,6 +1220,25 @@ impl Workspace {
             .get_untracked()
             .iter()
             .position(|&shown| shown == id)
+    }
+
+    /// 拖着的标签放下了：按拖动时算好的格子换顺序，并选中它。
+    /// 先选中、再清拖动状态：标签的选中样式在拖动中看的是「谁被拖」，清掉以后看的是「谁是当前」，
+    /// 反过来做的话，原来的当前标签会在中间闪回选中再淡出；换顺序时别的标签的格子各挪了一格，
+    /// 让位的平移要同时归零，不然画面会跳
+    pub fn drop_tab(&self, id: u64) {
+        let Some(dragged) = self
+            .tab_drag
+            .get_untracked()
+            .filter(|dragged| dragged.id == id)
+        else {
+            return;
+        };
+        self.select(id);
+        aureole::without_animation(|| {
+            self.tab_drag.set(None);
+            self.move_tab(id, dragged.to);
+        });
     }
 
     /// 把标签挪到标签条上第 `to` 个位置（拖动换位置）；只动顶部的顺序，侧栏不变。已经在那里就什么也不做

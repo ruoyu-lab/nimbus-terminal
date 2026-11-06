@@ -564,25 +564,97 @@ fn dragging_past_the_ends_drops_there_and_dragging_out_cancels() {
     harness.mouse_up(MouseButton::Left);
     harness.advance(secs(1.0));
     assert_eq!(bar_ids(&workspace), [1, 2, 3]);
-    // 一直拖到窗口中间（标签条外面）再松手：取消
+    // 一直拖到窗口中间（标签条外面）：标签不出标签条，停在最右边那一格；按 Esc 取消，顺序不变、落回原处
     let before = harness.window_bounds("tab-2").expect("在");
     drag_to(&harness, "tab-2", 600.0);
     harness.advance(secs(1.0));
-    // 拖着的时候标签不出标签条（框架的 drag_preview_contained），停在最右边那一格里
     let held = harness.window_bounds("tab-2").expect("拖着的标签还看得见");
-    let last = harness.window_bounds("tab-3").expect("在");
+    let strip_right = before.x + 2.0 * 142.0 + 140.0 - 142.0;
     assert!(
-        held.x + held.width <= last.x + last.width + 1.0,
-        "拖着的标签没有出标签条：{held:?} {last:?}"
+        held.x + held.width <= strip_right + 1.0 && held.x >= before.x + 100.0,
+        "拖着的标签没有出标签条、停在最右边：{held:?}"
     );
+    harness.key_down(NamedKey::Escape);
+    harness.advance(secs(1.0));
     harness.mouse_up(MouseButton::Left);
     harness.advance(secs(1.0));
-    assert_eq!(bar_ids(&workspace), [1, 2, 3], "拖出去松手不换顺序");
+    assert_eq!(bar_ids(&workspace), [1, 2, 3], "Esc 取消不换顺序");
     let after = harness.window_bounds("tab-2").expect("在");
     assert!(
         (after.x - before.x).abs() < 1.0,
         "标签落回原来的格子：{before:?} → {after:?}"
     );
+    // 同样拖到窗口中间松手：算放下，换到最右边那一格（手偏出标签条也不会变成取消）
+    drag_to(&harness, "tab-2", 600.0);
+    harness.advance(secs(1.0));
+    harness.mouse_up(MouseButton::Left);
+    harness.advance(secs(1.0));
+    assert_eq!(bar_ids(&workspace), [1, 3, 2]);
+}
+
+/// 换格按被拖的标签自己的位置算：它的边越过相邻标签的一半才换，和指针在标签的哪里无关
+/// （抓在左边、中间、右边，标签走了差不多半格都是同一个时刻换）；手上下偏出标签条也一样
+#[test]
+fn the_swap_follows_the_dragged_tab_not_the_pointer() {
+    let swapped_after = |grab: f32, direction: f32, wander_y: f32| -> f32 {
+        let (harness, workspace) = mounted();
+        workspace.new_tab();
+        workspace.new_tab();
+        harness.frame();
+        harness.advance(secs(1.0));
+        let name = if direction > 0.0 { "tab-1" } else { "tab-3" };
+        let neighbour_before = harness.window_bounds("tab-2").expect("在").x;
+        let tab = harness.window_bounds(name).expect("在");
+        let (x, y) = (tab.x + grab, tab.y + 14.0);
+        harness.mouse_down(x, y, MouseButton::Left);
+        let mut at = f32::NAN;
+        for step in 1..=160 {
+            let dx = direction * step as f32;
+            harness.mouse_move(x + dx, y + wander_y * (step as f32 / 160.0));
+            harness.advance(ms(40));
+            let neighbour = harness.window_bounds("tab-2").expect("在").x;
+            if (neighbour - neighbour_before).abs() > 70.0 {
+                at = dx.abs();
+                break;
+            }
+        }
+        harness.mouse_up(MouseButton::Left);
+        at
+    };
+    for grab in [10.0, 70.0, 130.0] {
+        for direction in [1.0, -1.0] {
+            let at = swapped_after(grab, direction, 0.0);
+            assert!(
+                (at - 72.0).abs() <= 3.0,
+                "抓在 {grab} 处往{}拖：标签走了 {at} 才换，应该是半格（71）上下",
+                if direction > 0.0 { "右" } else { "左" }
+            );
+        }
+    }
+    // 手一边拖一边往下偏出标签条 60 像素，换格的时机不变
+    let at = swapped_after(70.0, 1.0, 60.0);
+    assert!((at - 72.0).abs() <= 3.0, "手偏出标签条也一样：{at}");
+}
+
+/// 拖标签时手偏出了标签条（往下掉到终端里）再松手：照样换顺序，不会变成取消
+#[test]
+fn releasing_below_the_tab_strip_still_drops_the_tab() {
+    let (harness, workspace) = mounted();
+    workspace.new_tab();
+    harness.frame();
+    harness.advance(secs(1.0));
+    let tab = harness.window_bounds("tab-1").expect("在");
+    let [x, y] = tab.center();
+    harness.mouse_down(x, y, MouseButton::Left);
+    for step in 1..=30 {
+        harness.mouse_move(x + 6.0 * step as f32, y + 8.0 * step as f32);
+        harness.advance(ms(16));
+    }
+    harness.advance(ms(300));
+    harness.mouse_up(MouseButton::Left);
+    harness.advance(secs(1.0));
+    assert_eq!(bar_ids(&workspace), [2, 1], "在终端上方松手也换了");
+    assert_eq!(workspace.active.get_untracked(), 1);
 }
 
 /// 标签多到放不下：标签保持 140 宽、滚动着看，竖向滚轮翻成横向；最右边仍留着空白可以拖窗口
