@@ -2639,6 +2639,51 @@ fn the_about_page_links_to_the_framework_and_the_source() {
     );
 }
 
+/// 深色里的控件看得清：关着的开关是深色的槽（不是一条白的）、数字框的加减按钮悬停不发白；
+/// 浅色里关着的开关还是浅灰的槽
+#[test]
+fn switches_and_steppers_are_readable_in_dark() {
+    let (harness, workspace) = mounted();
+    workspace.open_settings();
+    workspace.settings_page.set(SettingsPage::Terminal);
+    harness.advance(secs(1.0));
+    let brightness = |harness: &Harness, x: f32, y: f32| {
+        let pixel = harness.screenshot().pixel(x as u32, y as u32).0;
+        pixel[..3].iter().map(|&c| c as u32).sum::<u32>() / 3
+    };
+    let track = |harness: &Harness| {
+        let bounds = harness.window_bounds("set-copy-on-select").expect("开关在");
+        brightness(
+            harness,
+            bounds.x + bounds.width - 5.0,
+            bounds.y + bounds.height / 2.0,
+        )
+    };
+    let light_off = track(&harness);
+    assert!(light_off > 190, "浅色里关着的槽是浅灰：{light_off}");
+    workspace.form.appearance.set(ThemeChoice::Dark);
+    harness.advance(secs(1.0));
+    let dark_off = track(&harness);
+    assert!(dark_off < 90, "深色里关着的槽是深的：{dark_off}");
+    workspace.form.copy_on_select.set(true);
+    harness.advance(secs(1.0));
+    let dark_on = track(&harness);
+    assert!(
+        dark_on > dark_off + 30,
+        "开着的比关着的亮得多：{dark_off} → {dark_on}"
+    );
+    // 数字框的加号：鼠标放上去是一层淡灰，不是白的
+    let stepper = harness.window_bounds("set-scrollback").expect("数字框在");
+    let (x, y) = (
+        stepper.x + stepper.width - 12.0,
+        stepper.y + stepper.height / 2.0,
+    );
+    harness.mouse_move(x, y);
+    harness.advance(secs(1.0));
+    let hovered = brightness(&harness, x + 6.0, y + 8.0);
+    assert!(hovered < 110, "悬停在加号上不发白：{hovered}");
+}
+
 /// 评审界面用：把几种状态存成 PNG。平时不跑；
 /// `UI_SHOTS=目录 cargo test screenshots_for_review -- --ignored` 出图（离屏渲染，没有系统材质）
 #[test]

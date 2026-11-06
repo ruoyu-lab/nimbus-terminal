@@ -109,7 +109,12 @@ pub fn mark() -> Color {
 
 /// 开关打开时、主按钮的底：浅色里是墨色，深色里是一档中灰（浅灰底配白色的滑块看不清）
 pub fn accent() -> Color {
-    pick(LIGHT_INK, Color::hex(0x5d6673))
+    pick(LIGHT_INK, Color::hex(0x7c8696))
+}
+
+/// 开关关着时的槽：深色里是一档深灰（框架默认的浅灰槽配白色滑块在深底上整个发白，看不出是开是关）
+pub fn toggle_off() -> Color {
+    pick(Color::hex(0xd5dae0), Color::hex(0x3a3f48))
 }
 
 /// 模态框后面压暗的一层

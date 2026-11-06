@@ -13,7 +13,9 @@ use crate::settings::{
     WHEEL,
 };
 use crate::tabs::{SettingsPage, Workspace};
-use crate::theme::{accent, card_bg, fg, hover, ink, line, popup_shadow, text_2, text_3};
+use crate::theme::{
+    accent, card_bg, fg, hover, ink, line, popup_shadow, selected, text_2, text_3, toggle_off,
+};
 use crate::view;
 
 pub(super) fn page_glyph(page: SettingsPage) -> Icon {
@@ -451,12 +453,17 @@ fn toggle(on: Signal<bool>, name: &'static str, label: &'static str) -> Element 
         .name(name)
         .accessibility_name(label)
         .focus_ring(FocusRing::new(ink()))
-        .track_style(&Style::new().checked(|style| {
-            style
-                .background(accent())
-                .hovered(|style| style.background(accent()))
-                .pressed(|style| style.background(accent()))
-        }))
+        .track_style(
+            &Style::new()
+                .background(toggle_off())
+                .hovered(|style| style.background(toggle_off()))
+                .checked(|style| {
+                    style
+                        .background(accent())
+                        .hovered(|style| style.background(accent()))
+                        .pressed(|style| style.background(accent()))
+                }),
+        )
         .thumb_style(&Style::new().transition(Property::TranslationX, Spring::snappy()))
         .build()
 }
@@ -580,6 +587,7 @@ fn menu<V: Clone + PartialEq + 'static>(
             &Style::new()
                 .radius(5)
                 .font_size(12)
+                .color(fg())
                 .focused(|style| style.background(hover()))
                 .pressed(|style| style.background(hover()))
                 .selected(|style| style.color(fg())),
@@ -634,10 +642,14 @@ fn stepper(
                 .background(Color::TRANSPARENT)
                 .color(fg()),
         )
+        // 加减按钮：平时透明，悬停、按下是一层淡灰（框架默认的悬停底是浅色的，在深色里一片白）
         .button_style(
             &Style::new()
                 .color(text_2())
-                .hovered(|style| style.color(fg())),
+                .background(Color::TRANSPARENT)
+                .hovered(|style| style.background(hover()).color(fg()))
+                .pressed(|style| style.background(selected()).color(fg()))
+                .disabled(|style| style.color(text_3()).background(Color::TRANSPARENT)),
         )
 }
 
@@ -735,7 +747,7 @@ fn about_page(form: Form, location: &str) -> Element {
         setting("版本", value(env!("CARGO_PKG_VERSION").to_string())),
         setting(
             "界面框架",
-            outline_button(None, crate::product::FRAMEWORK)
+            outline_button(Some(Icon::Github), crate::product::FRAMEWORK)
                 .name("about-framework")
                 .tooltip(crate::product::FRAMEWORK_URL)
                 .on_click(|| {
