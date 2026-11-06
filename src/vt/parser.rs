@@ -15,11 +15,20 @@ pub enum Event {
     /// C0 控制字符（`0x00..=0x1f`、`0x7f`）
     Control(u8),
     /// `ESC` + 中间字节 + 终结字节，比如 `ESC M`（反向换行）
-    Escape { intermediates: Vec<u8>, final_byte: u8 },
+    Escape {
+        intermediates: Vec<u8>,
+        final_byte: u8,
+    },
     /// `CSI`：`private` 是 `?` `>` `<` `=` `!` 这类打头的私有标记，参数缺省时是 `-1`。
     /// `subparams` 的第 `i` 位为 1，表示 `params[i]` 前面的分隔符是 `:` 而不是 `;`，
     /// 它是前一个参数的子参数（`4:3` 是弯曲下划线，`38:2::255:0:0` 是直接色）
-    Csi { private: Option<u8>, intermediates: Vec<u8>, params: Vec<i32>, subparams: u32, final_byte: u8 },
+    Csi {
+        private: Option<u8>,
+        intermediates: Vec<u8>,
+        params: Vec<i32>,
+        subparams: u32,
+        final_byte: u8,
+    },
     /// `OSC`：编号和数据，比如 `OSC 0 ; 标题 BEL`
     Osc { code: i32, text: String },
 }
@@ -100,7 +109,10 @@ impl Parser {
                 if (0x20..=0x2f).contains(&byte) {
                     self.push_intermediate(byte);
                 } else if (0x30..=0x7e).contains(&byte) {
-                    out.push(Event::Escape { intermediates: std::mem::take(&mut self.intermediates), final_byte: byte });
+                    out.push(Event::Escape {
+                        intermediates: std::mem::take(&mut self.intermediates),
+                        final_byte: byte,
+                    });
                     self.state = State::Ground;
                 } else {
                     self.control_or_escape(byte, out);
@@ -125,18 +137,16 @@ impl Parser {
                     self.control_or_escape(byte, out);
                 }
             }
-            State::Osc => {
-                match byte {
-                    0x07 => self.finish_osc(out),
-                    0x1b => self.state = State::OscEscape,
-                    0x08 => {}
-                    _ => {
-                        if self.string.len() < MAX_STRING {
-                            self.string.push(byte);
-                        }
+            State::Osc => match byte {
+                0x07 => self.finish_osc(out),
+                0x1b => self.state = State::OscEscape,
+                0x08 => {}
+                _ => {
+                    if self.string.len() < MAX_STRING {
+                        self.string.push(byte);
                     }
                 }
-            }
+            },
             State::OscEscape => {
                 self.finish_osc(out);
                 if byte == b'\\' {
@@ -259,7 +269,10 @@ impl Parser {
             }
             0x1b => self.begin_escape(),
             0x30..=0x7e => {
-                out.push(Event::Escape { intermediates: std::mem::take(&mut self.intermediates), final_byte: byte });
+                out.push(Event::Escape {
+                    intermediates: std::mem::take(&mut self.intermediates),
+                    final_byte: byte,
+                });
                 self.state = State::Ground;
             }
             _ => self.control_or_escape(byte, out),
@@ -281,7 +294,9 @@ impl Parser {
                 }
             }
             // `CSI ? ...` 这类私有前缀，以及只在开头有意义的 `>` `<` `=` `!`
-            b'?' | b'>' | b'<' | b'=' | b'!' if self.params.is_empty() && !self.has_param => self.private = Some(byte),
+            b'?' | b'>' | b'<' | b'=' | b'!' if self.params.is_empty() && !self.has_param => {
+                self.private = Some(byte)
+            }
             0x20..=0x2f => {
                 self.push_param();
                 self.push_intermediate(byte);
@@ -296,7 +311,8 @@ impl Parser {
 
     fn push_param(&mut self) {
         if self.params.len() < MAX_PARAMS {
-            self.params.push(if self.has_param { self.param } else { -1 });
+            self.params
+                .push(if self.has_param { self.param } else { -1 });
         }
         self.param = 0;
         self.has_param = false;
@@ -373,7 +389,13 @@ mod tests {
     fn csi_with_parameters_and_private_flag() {
         assert_eq!(
             events(&["\x1b[?1049h".as_bytes()]),
-            vec![Event::Csi { private: Some(b'?'), intermediates: vec![], params: vec![1049], subparams: 0, final_byte: b'h' }]
+            vec![Event::Csi {
+                private: Some(b'?'),
+                intermediates: vec![],
+                params: vec![1049],
+                subparams: 0,
+                final_byte: b'h'
+            }]
         );
     }
 
@@ -382,15 +404,27 @@ mod tests {
         // `CSI ;H`：第一个参数缺省，语义上是 1，交给上层补
         assert_eq!(
             events(&["\x1b[;3H".as_bytes()]),
-            vec![Event::Csi { private: None, intermediates: vec![], params: vec![-1, 3], subparams: 0, final_byte: b'H' }]
+            vec![Event::Csi {
+                private: None,
+                intermediates: vec![],
+                params: vec![-1, 3],
+                subparams: 0,
+                final_byte: b'H'
+            }]
         );
     }
 
     #[test]
     fn utf8_split_across_reads() {
         let bytes = "好".as_bytes();
-        assert_eq!(events(&[&bytes[..1], &bytes[1..]]), vec![Event::Print('好')]);
-        assert_eq!(events(&[&bytes[..2], &bytes[2..]]), vec![Event::Print('好')]);
+        assert_eq!(
+            events(&[&bytes[..1], &bytes[1..]]),
+            vec![Event::Print('好')]
+        );
+        assert_eq!(
+            events(&[&bytes[..2], &bytes[2..]]),
+            vec![Event::Print('好')]
+        );
     }
 
     /// 半个字后面来了普通字节：残段丢掉，那个字节照常显示（不能把后面的内容一起吃掉）
@@ -408,7 +442,13 @@ mod tests {
 
     #[test]
     fn osc_title_ends_with_bell() {
-        assert_eq!(events(&["\x1b]0;我的终端\x07".as_bytes()]), vec![Event::Osc { code: 0, text: "我的终端".into() }]);
+        assert_eq!(
+            events(&["\x1b]0;我的终端\x07".as_bytes()]),
+            vec![Event::Osc {
+                code: 0,
+                text: "我的终端".into()
+            }]
+        );
     }
 
     /// `4:3`（弯曲下划线）、`38:2::r:g:b`：冒号后面的是子参数，要能和分号区分开
@@ -430,13 +470,22 @@ mod tests {
     #[test]
     fn dcs_is_swallowed_whole() {
         // 没实现的 DCS（这里是 DECUDAK）整条吃掉，后面的字照样是字
-        assert_eq!(events(&["\x1bP1$z\x1b\\x".as_bytes()]), vec![Event::Print('x')]);
+        assert_eq!(
+            events(&["\x1bP1$z\x1b\\x".as_bytes()]),
+            vec![Event::Print('x')]
+        );
     }
 
     #[test]
     fn control_inside_csi_still_executes() {
         let out = events(&["\x1b[3\x07m".as_bytes()]);
         assert!(out.contains(&Event::Control(7)), "{out:?}");
-        assert!(out.contains(&Event::Csi { private: None, intermediates: vec![], params: vec![3], subparams: 0, final_byte: b'm' }));
+        assert!(out.contains(&Event::Csi {
+            private: None,
+            intermediates: vec![],
+            params: vec![3],
+            subparams: 0,
+            final_byte: b'm'
+        }));
     }
 }

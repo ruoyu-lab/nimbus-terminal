@@ -69,12 +69,22 @@ fn control_code(text: &str) -> Option<u8> {
     Some(code)
 }
 
-fn named_key(named: NamedKey, keymap: Keymap, modifiers: Modifiers, ctrl: bool, shift: bool) -> Option<Vec<u8>> {
+fn named_key(
+    named: NamedKey,
+    keymap: Keymap,
+    modifiers: Modifiers,
+    ctrl: bool,
+    shift: bool,
+) -> Option<Vec<u8>> {
     // 方向键和这几个「有转义码形状」的键：没有修饰键时是短形式，有了就带参数
     let modified = |code: &str| csi(code, modifiers);
     let cursor = |last: u8| {
         if modifiers.is_empty() {
-            let prefix: &[u8] = if keymap.application_cursor { b"\x1bO" } else { b"\x1b[" };
+            let prefix: &[u8] = if keymap.application_cursor {
+                b"\x1bO"
+            } else {
+                b"\x1b["
+            };
             let mut bytes = prefix.to_vec();
             bytes.push(last);
             bytes
@@ -129,7 +139,11 @@ fn named_key(named: NamedKey, keymap: Keymap, modifiers: Modifiers, ctrl: bool, 
         _ => return None,
     };
     // Option / Alt 加回车、退格、Tab、Esc：照 Meta 的习惯在前面加一个 ESC（Alt+退格是按词删除）
-    let meta = modifiers.has_alt() && matches!(named, NamedKey::Enter | NamedKey::Backspace | NamedKey::Tab | NamedKey::Escape);
+    let meta = modifiers.has_alt()
+        && matches!(
+            named,
+            NamedKey::Enter | NamedKey::Backspace | NamedKey::Tab | NamedKey::Escape
+        );
     if meta {
         let mut prefixed = vec![0x1b];
         prefixed.extend(bytes);
@@ -140,7 +154,9 @@ fn named_key(named: NamedKey, keymap: Keymap, modifiers: Modifiers, ctrl: bool, 
 
 /// xterm 的修饰键参数：1 起算，Shift +1、Alt +2、Ctrl +4
 fn modifier_code(modifiers: Modifiers) -> u8 {
-    1 + u8::from(modifiers.has_shift()) + 2 * u8::from(modifiers.has_alt()) + 4 * u8::from(modifiers.has_control())
+    1 + u8::from(modifiers.has_shift())
+        + 2 * u8::from(modifiers.has_alt())
+        + 4 * u8::from(modifiers.has_control())
 }
 
 /// `\x1b[1;{修饰键}final`
@@ -177,7 +193,9 @@ fn modified_final(final_char: u8, modifiers: Modifiers) -> Vec<u8> {
 }
 
 fn ascii_of(key: &Key) -> Option<u8> {
-    let Key::Character(text) = key else { return None };
+    let Key::Character(text) = key else {
+        return None;
+    };
     let ch = text.chars().next()?;
     ch.is_ascii().then_some(ch as u8)
 }

@@ -548,17 +548,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aureole-terminal"
-version = "0.1.0"
-dependencies = [
- "aureole",
- "libc",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "unicode-width",
-]
-
-[[package]]
 name = "aureole-testing"
 version = "0.0.1-beta.1"
 source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=adc0c77#adc0c77d16fbfe812e637e302ca1db4a983d3e56"
@@ -1814,6 +1803,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nimbus-terminal"
+version = "0.1.0"
+dependencies = [
+ "aureole",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "serde",
+ "serde_json",
+ "unicode-width",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2076,6 +2079,7 @@ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.2",
  "block2 0.6.2",
+ "libc",
  "objc2 0.6.5",
  "objc2-core-foundation",
 ]

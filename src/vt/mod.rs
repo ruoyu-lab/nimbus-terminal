@@ -123,7 +123,8 @@ pub struct Terminal {
     /// 写字用的笔
     pub pen: Attributes,
     pub modes: Modes,
-    pub cursor_shape: CursorShape,
+    /// 程序用 DECSCUSR 指定的形状；`None` 是没指定（用设置里的默认形状）
+    pub cursor_shape: Option<CursorShape>,
     /// OSC 0 / 2 设的标题，空的用窗口自己的标题
     pub title: String,
     /// 响过几次铃（`view` 拿它决定闪一下还是出声）
@@ -139,6 +140,8 @@ pub struct Terminal {
     output: Vec<u8>,
     /// 主屏光标（切副屏时存一下，切回来还原）
     saved_on_primary: Option<(Point, Attributes)>,
+    /// 历史上限：整台终端复位、换屏时要带到新的屏上
+    scrollback_limit: usize,
 }
 
 impl Terminal {
@@ -151,7 +154,7 @@ impl Terminal {
             on_alternate: false,
             pen: Attributes::default(),
             modes: Modes::default(),
-            cursor_shape: CursorShape::Block,
+            cursor_shape: None,
             title: String::new(),
             bell: 0,
             charsets: [Charset::Ascii; 2],
@@ -161,21 +164,89 @@ impl Terminal {
             events: Vec::new(),
             output: Vec::new(),
             saved_on_primary: None,
+            scrollback_limit: screen::HISTORY_LIMIT,
         }
     }
 
     /// 现在显示的那块屏
     pub fn screen(&self) -> &Screen {
-        if self.on_alternate { &self.alternate } else { &self.primary }
+        if self.on_alternate {
+            &self.alternate
+        } else {
+            &self.primary
+        }
     }
 
     fn screen_mut(&mut self) -> &mut Screen {
-        if self.on_alternate { &mut self.alternate } else { &mut self.primary }
+        if self.on_alternate {
+            &mut self.alternate
+        } else {
+            &mut self.primary
+        }
     }
 
     /// 能往回翻的历史有多少行（副屏没有历史）
     pub fn scrollback_len(&self) -> usize {
-        if self.on_alternate { 0 } else { self.primary.history_len() }
+        if self.on_alternate {
+            0
+        } else {
+            self.primary.history_len()
+        }
+    }
+
+    /// 改历史的上限（设置里的「历史行数」）
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        self.scrollback_limit = limit;
+        self.primary.set_history_limit(limit);
+        self.alternate.set_history_limit(limit);
+    }
+
+    /// 把主屏（历史加现在的屏幕）写成一段能原样喂回终端的文字：带颜色、粗体这些 SGR，行与行之间 `\r\n`。
+    /// 末尾空白的行去掉，最多留最后 `max_lines` 行。副屏（vim、less）是临时画布，不存。
+    /// 用来关掉应用时存下终端里的内容，下次恢复标签时先喂进去
+    pub fn transcript(&self, max_lines: usize) -> String {
+        let screen = &self.primary;
+        let mut rows: Vec<&[Cell]> = (0..screen.history_len())
+            .rev()
+            .filter_map(|from_end| screen.history_line(from_end))
+            .map(|line| line.as_slice())
+            .collect();
+        rows.extend(screen.lines.iter().map(|line| line.as_slice()));
+        let is_blank = |line: &[Cell]| {
+            line.iter()
+                .all(|cell| cell.ch == ' ' && cell.attrs.background.is_none())
+        };
+        while rows.last().is_some_and(|line| is_blank(line)) {
+            rows.pop();
+        }
+        let rows = &rows[rows.len().saturating_sub(max_lines)..];
+        let mut text = String::new();
+        for (index, line) in rows.iter().enumerate() {
+            if index > 0 {
+                text.push_str("\r\n");
+            }
+            // 行尾没有样式的空格不写
+            let end = line
+                .iter()
+                .rposition(|cell| *cell != Cell::PLAIN)
+                .map_or(0, |last| last + 1);
+            let mut pen = Attributes::default();
+            for cell in &line[..end] {
+                // 宽字的右半不带字
+                if cell.width == 0 {
+                    continue;
+                }
+                if cell.attrs != pen {
+                    pen = cell.attrs;
+                    push_sgr(&mut text, pen);
+                }
+                text.push(if cell.ch.is_control() { ' ' } else { cell.ch });
+            }
+            if pen != Attributes::default() {
+                text.push_str("\x1b[0m");
+            }
+        }
+        text
     }
 
     /// 主屏一共往历史里放过多少行（只增不减）
@@ -185,7 +256,9 @@ impl Terminal {
 
     /// 按键编码要看的几个模式
     pub fn keymap(&self) -> keys::Keymap {
-        keys::Keymap { application_cursor: self.modes.application_cursor }
+        keys::Keymap {
+            application_cursor: self.modes.application_cursor,
+        }
     }
 
     pub fn size(&self) -> (usize, usize) {
@@ -224,8 +297,17 @@ impl Terminal {
         match event {
             Event::Print(ch) => self.print(ch),
             Event::Control(byte) => self.control(byte),
-            Event::Escape { intermediates, final_byte } => self.escape(intermediates, final_byte),
-            Event::Csi { private, intermediates, params, subparams, final_byte } => self.csi(private, intermediates, &params, subparams, final_byte),
+            Event::Escape {
+                intermediates,
+                final_byte,
+            } => self.escape(intermediates, final_byte),
+            Event::Csi {
+                private,
+                intermediates,
+                params,
+                subparams,
+                final_byte,
+            } => self.csi(private, intermediates, &params, subparams, final_byte),
             Event::Osc { code, text } => self.osc(code, &text),
         }
     }
@@ -234,7 +316,9 @@ impl Terminal {
         let ch = self.charsets[self.active_charset].map(ch);
         // 组合字符（变音符号、零宽）要接到前面那一格上才不出错，那需要一格存一整个字素簇，
         // 现在先把它们丢掉：宁可少个音标，也不要错位
-        let Some(width) = ch.width().filter(|width| *width > 0) else { return };
+        let Some(width) = ch.width().filter(|width| *width > 0) else {
+            return;
+        };
         if width > 2 {
             return;
         }
@@ -270,7 +354,11 @@ impl Terminal {
     fn escape(&mut self, intermediates: Vec<u8>, final_byte: u8) {
         if !intermediates.is_empty() {
             // `ESC ( 0` / `ESC ( B`（G0）、`ESC ) 0`（G1）指定字符集；`ESC # 8`（对齐测试）等认不出来就整条丢
-            let charset = if final_byte == b'0' { Charset::LineDrawing } else { Charset::Ascii };
+            let charset = if final_byte == b'0' {
+                Charset::LineDrawing
+            } else {
+                Charset::Ascii
+            };
             match intermediates.as_slice() {
                 [b'('] => self.charsets[0] = charset,
                 [b')'] => self.charsets[1] = charset,
@@ -304,7 +392,14 @@ impl Terminal {
     }
 
     /// `\x1b[...` 的大分发
-    fn csi(&mut self, private: Option<u8>, intermediates: Vec<u8>, params: &[i32], subparams: u32, final_byte: u8) {
+    fn csi(
+        &mut self,
+        private: Option<u8>,
+        intermediates: Vec<u8>,
+        params: &[i32],
+        subparams: u32,
+        final_byte: u8,
+    ) {
         // 参数缺省值按 ECMA-48：位移、位置类是 1，擦除和模式是 0
         let value = |index: usize, default: i32| param(params, index, default);
         let count = |index: usize| value(index, 1).max(1) as usize;
@@ -327,17 +422,27 @@ impl Terminal {
             }
             (None, b'd') => {
                 let column = self.screen().cursor.column;
-                self.screen_mut().move_to(count(0).saturating_sub(1), column);
+                self.screen_mut()
+                    .move_to(count(0).saturating_sub(1), column);
             }
             (None, b'H') | (None, b'f') => {
                 let (columns, rows) = self.screen_size();
-                let row = if params.is_empty() { 0 } else { value(0, 1).clamp(1, rows.max(1) as i32) as usize - 1 };
-                let column = if params.len() < 2 { 0 } else { value(1, 1).clamp(1, columns.max(1) as i32) as usize - 1 };
+                let row = if params.is_empty() {
+                    0
+                } else {
+                    value(0, 1).clamp(1, rows.max(1) as i32) as usize - 1
+                };
+                let column = if params.len() < 2 {
+                    0
+                } else {
+                    value(1, 1).clamp(1, columns.max(1) as i32) as usize - 1
+                };
                 self.screen_mut().move_to(row, column);
             }
             (None, b'J') => {
                 let pen = self.pen;
-                self.screen_mut().erase_display(value(0, 0).max(0) as u8, pen);
+                self.screen_mut()
+                    .erase_display(value(0, 0).max(0) as u8, pen);
             }
             (None, b'K') => {
                 let pen = self.pen;
@@ -393,7 +498,11 @@ impl Terminal {
             (None, b'r') => {
                 let (_, rows) = self.screen_size();
                 let top = count(0);
-                let bottom = if params.len() < 2 { rows } else { value(1, rows as i32).clamp(1, rows.max(1) as i32) as usize };
+                let bottom = if params.len() < 2 {
+                    rows
+                } else {
+                    value(1, rows as i32).clamp(1, rows.max(1) as i32) as usize
+                };
                 self.screen_mut().set_region(top.saturating_sub(1), bottom);
             }
             (None, b'h') | (None, b'l') => self.set_modes(None, params, final_byte == b'h'),
@@ -421,7 +530,9 @@ impl Terminal {
             (None, b'c') => self.output.extend_from_slice(b"\x1b[?62;22c"),
             (Some(b'>'), b'c') => self.output.extend_from_slice(b"\x1b[>1;10;0c"),
             // DECSCUSR：光标的形状
-            (None, b'q') if intermediates.first() == Some(&b' ') => self.set_cursor_shape(value(0, 0)),
+            (None, b'q') if intermediates.first() == Some(&b' ') => {
+                self.set_cursor_shape(value(0, 0))
+            }
             _ => {}
         }
     }
@@ -445,12 +556,14 @@ impl Terminal {
 
     fn set_cursor_shape(&mut self, param: i32) {
         let (shape, blink) = match param {
-            0 | 1 => (CursorShape::Block, true),
-            2 => (CursorShape::Block, false),
-            3 => (CursorShape::Underline, true),
-            4 => (CursorShape::Underline, false),
-            5 => (CursorShape::Bar, true),
-            6 => (CursorShape::Bar, false),
+            // 0 是「回到默认」：形状和闪烁都交还给设置
+            0 => (None, true),
+            1 => (Some(CursorShape::Block), true),
+            2 => (Some(CursorShape::Block), false),
+            3 => (Some(CursorShape::Underline), true),
+            4 => (Some(CursorShape::Underline), false),
+            5 => (Some(CursorShape::Bar), true),
+            6 => (Some(CursorShape::Bar), false),
             _ => return,
         };
         self.cursor_shape = shape;
@@ -506,9 +619,7 @@ impl Terminal {
             self.on_alternate = true;
         } else {
             self.on_alternate = false;
-            if clear_and_save
-                && let Some((cursor, pen)) = self.saved_on_primary.take()
-            {
+            if clear_and_save && let Some((cursor, pen)) = self.saved_on_primary.take() {
                 self.primary.move_to(cursor.row, cursor.column);
                 self.pen = pen;
             }
@@ -520,7 +631,7 @@ impl Terminal {
     fn soft_reset(&mut self) {
         self.pen = Attributes::default();
         self.modes = Modes::default();
-        self.cursor_shape = CursorShape::Block;
+        self.cursor_shape = None;
         self.charsets = [Charset::Ascii; 2];
         self.active_charset = 0;
         self.screen_mut().reset_region();
@@ -531,12 +642,13 @@ impl Terminal {
         let (columns, rows) = (self.primary.columns, self.primary.rows);
         let mut primary = Screen::new(columns, rows);
         primary.records_history = true;
+        primary.set_history_limit(self.scrollback_limit);
         self.primary = primary;
         self.alternate = Screen::new(columns, rows);
         self.on_alternate = false;
         self.pen = Attributes::default();
         self.modes = Modes::default();
-        self.cursor_shape = CursorShape::Block;
+        self.cursor_shape = None;
         self.charsets = [Charset::Ascii; 2];
         self.active_charset = 0;
         self.last_char = None;
@@ -609,7 +721,9 @@ impl Terminal {
                 100..=107 => self.pen.background = Some(ColorSpec::Indexed((code - 100 + 8) as u8)),
                 // 38 / 48 后面跟 `5;n`（256 色）或 `2;r;g;b`（直接色）
                 38 | 48 => {
-                    let Some((color, consumed)) = extended_color(&params[index..]) else { break };
+                    let Some((color, consumed)) = extended_color(&params[index..]) else {
+                        break;
+                    };
                     if code == 38 {
                         self.pen.foreground = Some(color);
                     } else {
@@ -627,7 +741,11 @@ impl Terminal {
     fn osc(&mut self, code: i32, text: &str) {
         if matches!(code, 0 | 2) {
             // 标题会显示在窗口上：控制字符去掉，长度封顶，免得程序拿它刷屏
-            self.title = text.chars().filter(|ch| !ch.is_control()).take(256).collect();
+            self.title = text
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(256)
+                .collect();
         }
     }
 }
@@ -668,6 +786,45 @@ fn param(params: &[i32], index: usize, default: i32) -> i32 {
     }
 }
 
+/// 把一支笔写成一条 SGR：先复位再逐项打开
+fn push_sgr(text: &mut String, pen: Attributes) {
+    use std::fmt::Write;
+
+    text.push_str("\x1b[0");
+    for (on, code) in [
+        (pen.bold, 1),
+        (pen.dim, 2),
+        (pen.italic, 3),
+        (pen.underline, 4),
+        (pen.blink, 5),
+        (pen.inverse, 7),
+        (pen.hidden, 8),
+        (pen.strikethrough, 9),
+    ] {
+        if on {
+            let _ = write!(text, ";{code}");
+        }
+    }
+    for (color, base) in [(pen.foreground, 38), (pen.background, 48)] {
+        match color {
+            Some(ColorSpec::Indexed(index)) => {
+                let _ = write!(text, ";{base};5;{index}");
+            }
+            Some(ColorSpec::Rgb(value)) => {
+                let _ = write!(
+                    text,
+                    ";{base};2;{};{};{}",
+                    (value >> 16) & 0xff,
+                    (value >> 8) & 0xff,
+                    value & 0xff
+                );
+            }
+            None => {}
+        }
+    }
+    text.push('m');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,7 +838,10 @@ mod tests {
         let mut term = Terminal::new(20, 4);
         term.feed(b"\x1b[31mred\x1b[0m plain");
         assert_eq!(text(&term, 0), "red plain");
-        assert_eq!(term.screen().lines[0][0].attrs.foreground, Some(ColorSpec::Indexed(1)));
+        assert_eq!(
+            term.screen().lines[0][0].attrs.foreground,
+            Some(ColorSpec::Indexed(1))
+        );
         assert_eq!(term.screen().lines[0][4].attrs.foreground, None);
     }
 
@@ -714,7 +874,11 @@ mod tests {
     fn cursor_position_report_answers_the_shell() {
         let mut term = Terminal::new(20, 4);
         term.feed(b"ab\x1b[6n");
-        assert_eq!(term.take_output(), b"\x1b[1;3R".to_vec(), "写了两个字，光标在第 3 列（1 起算）");
+        assert_eq!(
+            term.take_output(),
+            b"\x1b[1;3R".to_vec(),
+            "写了两个字，光标在第 3 列（1 起算）"
+        );
         assert!(term.take_output().is_empty());
     }
 
@@ -798,7 +962,10 @@ mod tests {
         term.feed(b"\x1b[?25l\x1b[2;4r\x1b[1m\x1b[!p");
         assert!(term.modes.cursor_visible);
         assert_eq!(term.pen, Attributes::default());
-        assert_eq!((term.screen().region_top, term.screen().region_bottom), (0, 6));
+        assert_eq!(
+            (term.screen().region_top, term.screen().region_bottom),
+            (0, 6)
+        );
     }
 
     /// 按网格的规矩回放改动（先挪、后画），结果必须和屏幕一模一样。
@@ -821,8 +988,32 @@ mod tests {
             }
         }
         const PIECES: &[&str] = &[
-            "hello", "世界", "x", "\r\n", "\r\n", "\r\n", "\n", "\r", "\x1b[2;4r", "\x1b[r", "\x1b[L", "\x1b[2M", "\x1b[3A", "\x1b[2B",
-            "\x1b[H", "\x1b[2J", "\x1b[K", "\x1b[1K", "\x1bM", "\x1b[S", "\x1b[2T", "\x1b[3@", "\x1b[2P", "\x1b[4X", "\x1b[5;3H", "\t",
+            "hello",
+            "世界",
+            "x",
+            "\r\n",
+            "\r\n",
+            "\r\n",
+            "\n",
+            "\r",
+            "\x1b[2;4r",
+            "\x1b[r",
+            "\x1b[L",
+            "\x1b[2M",
+            "\x1b[3A",
+            "\x1b[2B",
+            "\x1b[H",
+            "\x1b[2J",
+            "\x1b[K",
+            "\x1b[1K",
+            "\x1bM",
+            "\x1b[S",
+            "\x1b[2T",
+            "\x1b[3@",
+            "\x1b[2P",
+            "\x1b[4X",
+            "\x1b[5;3H",
+            "\t",
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = move || {
@@ -843,7 +1034,10 @@ mod tests {
                 term.feed(batch.as_bytes());
                 mirror.apply(&mut term);
                 let actual: Vec<String> = (0..6).map(|row| term.screen().line_text(row)).collect();
-                assert_eq!(mirror.0, actual, "第 {round} 轮第 {step} 批之后对不上，这一批是 {batch:?}");
+                assert_eq!(
+                    mirror.0, actual,
+                    "第 {round} 轮第 {step} 批之后对不上，这一批是 {batch:?}"
+                );
             }
         }
     }
@@ -877,5 +1071,37 @@ mod tests {
         // 复位回到默认
         term.feed(b"\x1b[?1002h\x1b[!p");
         assert_eq!(term.modes.mouse, MouseMode::Off);
+    }
+
+    /// 内容写成文字再喂给另一台终端，历史、屏幕、颜色、宽字都原样回来；副屏里的东西不存
+    #[test]
+    fn a_transcript_replays_into_an_identical_screen() {
+        let mut term = Terminal::new(20, 3);
+        term.feed(
+            "one\r\n\x1b[1;31mtwo\x1b[0m\r\n中文 \x1b[48;2;1;2;3mbg\x1b[0m\r\nfour\r\n\x1b[38;5;200mfive\x1b[0m".as_bytes(),
+        );
+        assert_eq!(term.scrollback_len(), 2, "有两行滚进了历史");
+        let saved = term.transcript(100);
+        let mut other = Terminal::new(20, 3);
+        other.feed(saved.as_bytes());
+        assert_eq!(other.scrollback_len(), 2);
+        assert_eq!(other.screen().line_text(0), "中文 bg");
+        assert_eq!(other.transcript(100), saved, "再存一次一样");
+        let two = other.screen().history_line(0).expect("历史里有");
+        assert_eq!(
+            two[0].attrs,
+            term.screen().history_line(0).expect("有")[0].attrs
+        );
+        let bg = &other.screen().lines[0][5];
+        assert_eq!(bg.attrs.background, Some(ColorSpec::Rgb(0x010203)));
+        assert_eq!(
+            other.screen().lines[2][0].attrs.foreground,
+            Some(ColorSpec::Indexed(200))
+        );
+        // 只留最后几行；空行、行尾空格去掉；副屏不存
+        assert_eq!(term.transcript(2).matches("\r\n").count(), 1);
+        assert_eq!(Terminal::new(10, 3).transcript(10), "");
+        term.feed(b"\x1b[?1049h\x1b[Hvim here");
+        assert!(!term.transcript(100).contains("vim here"));
     }
 }

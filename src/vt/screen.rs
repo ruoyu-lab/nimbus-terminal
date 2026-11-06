@@ -47,7 +47,10 @@ impl Attributes {
     /// 擦除、插入空白时空格上留下的样式：只有背景色（BCE）。
     /// 下划线、反色之类留在空格上，擦出来的一片区域会拖着一条线
     fn erased(self) -> Attributes {
-        Attributes { background: self.background, ..Attributes::default() }
+        Attributes {
+            background: self.background,
+            ..Attributes::default()
+        }
     }
 }
 
@@ -80,7 +83,11 @@ impl Cell {
 
     /// 带样式（擦除时用当前的笔，背景色要留下来）的空格
     pub const fn blank(attrs: Attributes) -> Cell {
-        Cell { ch: ' ', width: 1, attrs }
+        Cell {
+            ch: ' ',
+            width: 1,
+            attrs,
+        }
     }
 }
 
@@ -135,6 +142,8 @@ pub struct Screen {
     /// 好让看着的那一屏不跟着动
     archived_total: u64,
     pub records_history: bool,
+    /// 历史最多留多少行，超了挤掉最旧的
+    history_limit: usize,
 }
 
 impl Screen {
@@ -157,6 +166,7 @@ impl Screen {
             history: VecDeque::new(),
             archived_total: 0,
             records_history: false,
+            history_limit: HISTORY_LIMIT,
         };
         for _ in 0..rows {
             screen.lines.push_back(vec![Cell::PLAIN; columns]);
@@ -194,11 +204,19 @@ impl Screen {
         let rows = if self.repaint_all {
             (0..self.lines.len()).collect()
         } else {
-            self.dirty.iter().enumerate().filter(|(_, dirty)| **dirty).map(|(row, _)| row).collect()
+            self.dirty
+                .iter()
+                .enumerate()
+                .filter(|(_, dirty)| **dirty)
+                .map(|(row, _)| row)
+                .collect()
         };
         self.repaint_all = false;
         self.dirty.fill(false);
-        Damage { scrolled_out: std::mem::take(&mut self.scrolled_out), rows }
+        Damage {
+            scrolled_out: std::mem::take(&mut self.scrolled_out),
+            rows,
+        }
     }
 
     /// 滚出屏幕的一行进历史：行尾的默认空格去掉，一行只占它真正用到的那么多
@@ -209,9 +227,19 @@ impl Screen {
         line.shrink_to_fit();
         self.archived_total += 1;
         self.history.push_back(line);
-        if self.history.len() > HISTORY_LIMIT {
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
+        while self.history.len() > self.history_limit {
             self.history.pop_front();
         }
+    }
+
+    /// 改历史的上限；比现在存的少就立刻丢掉最旧的
+    pub fn set_history_limit(&mut self, limit: usize) {
+        self.history_limit = limit;
+        self.trim_history();
     }
 
     /// 改大小。行数变少时，光标下面的行先扔（光标要留在看得见的地方），再从顶上挤进历史；
@@ -277,7 +305,9 @@ impl Screen {
     }
 
     fn put_cell(&mut self, row: usize, column: usize, cell: Cell) {
-        let Some(line) = self.lines.get_mut(row) else { return };
+        let Some(line) = self.lines.get_mut(row) else {
+            return;
+        };
         if column >= line.len() {
             return;
         }
@@ -289,7 +319,9 @@ impl Screen {
     /// 盖到右半，左边的头变空格；盖住头而右半露在外面，右半变空格。不然留下没有头的右半，
     /// 复制出来的字就少了、对不上
     fn break_wide(&mut self, row: usize, from: usize, count: usize) {
-        let Some(line) = self.lines.get_mut(row) else { return };
+        let Some(line) = self.lines.get_mut(row) else {
+            return;
+        };
         if from < line.len() && line[from].width == 0 && from > 0 {
             line[from - 1] = Cell::blank(line[from - 1].attrs.erased());
         }
@@ -302,7 +334,9 @@ impl Screen {
     /// 把一行 `from..to` 擦成空格（样式只留背景色）。切到宽字就连另一半一起擦
     fn blank_range(&mut self, row: usize, from: usize, to: usize, attrs: Attributes) {
         let columns = self.columns;
-        let Some(line) = self.lines.get_mut(row) else { return };
+        let Some(line) = self.lines.get_mut(row) else {
+            return;
+        };
         let (mut from, mut to) = (from.min(columns), to.min(columns));
         if from >= to {
             return;
@@ -341,9 +375,25 @@ impl Screen {
         }
         let (row, column) = (self.cursor.row, self.cursor.column);
         self.break_wide(row, column, width);
-        self.put_cell(row, column, Cell { ch, width: width as u8, attrs });
+        self.put_cell(
+            row,
+            column,
+            Cell {
+                ch,
+                width: width as u8,
+                attrs,
+            },
+        );
         for tail in column + 1..column + width {
-            self.put_cell(row, tail, Cell { ch: ' ', width: 0, attrs });
+            self.put_cell(
+                row,
+                tail,
+                Cell {
+                    ch: ' ',
+                    width: 0,
+                    attrs,
+                },
+            );
         }
         if column + width >= self.columns {
             self.cursor.column = self.columns - 1;
@@ -388,7 +438,9 @@ impl Screen {
         let whole = top == 0 && bottom == self.rows;
         let n = n.min(bottom - top);
         for _ in 0..n {
-            let Some(mut line) = self.lines.remove(top) else { break };
+            let Some(mut line) = self.lines.remove(top) else {
+                break;
+            };
             if whole && self.records_history {
                 let blank = vec![Cell::PLAIN; self.columns];
                 self.archive(std::mem::replace(&mut line, blank));
@@ -419,7 +471,9 @@ impl Screen {
         }
         let n = n.min(bottom - top);
         for _ in 0..n {
-            let Some(mut line) = self.lines.remove(bottom - 1) else { break };
+            let Some(mut line) = self.lines.remove(bottom - 1) else {
+                break;
+            };
             line.fill(Cell::PLAIN);
             self.lines.insert(top, line);
         }
@@ -451,14 +505,22 @@ impl Screen {
 
     /// 光标上移：在滚动区域里时停在区域顶，在区域上面时停在屏幕顶
     pub fn cursor_up(&mut self, n: usize) {
-        let floor = if self.cursor.row >= self.region_top { self.region_top } else { 0 };
+        let floor = if self.cursor.row >= self.region_top {
+            self.region_top
+        } else {
+            0
+        };
         self.cursor.row = self.cursor.row.saturating_sub(n.max(1)).max(floor);
         self.pending_wrap = false;
     }
 
     /// 光标下移：在滚动区域里时停在区域底，在区域下面时停在屏幕底
     pub fn cursor_down(&mut self, n: usize) {
-        let ceiling = if self.cursor.row < self.region_bottom { self.region_bottom - 1 } else { self.rows - 1 };
+        let ceiling = if self.cursor.row < self.region_bottom {
+            self.region_bottom - 1
+        } else {
+            self.rows - 1
+        };
         self.cursor.row = (self.cursor.row + n.max(1)).min(ceiling);
         self.pending_wrap = false;
     }
@@ -511,7 +573,11 @@ impl Screen {
         match mode {
             0 => {
                 // 刚写满一行、光标还停在最后一格上：那一格的字保留，等换行
-                let from = if self.pending_wrap { column + 1 } else { column };
+                let from = if self.pending_wrap {
+                    column + 1
+                } else {
+                    column
+                };
                 self.blank_range(row, from, columns, attrs);
             }
             1 => self.blank_range(row, 0, column + 1, attrs),
@@ -524,7 +590,11 @@ impl Screen {
         let (row, column, columns) = (self.cursor.row, self.cursor.column, self.columns);
         match mode {
             0 => {
-                let from = if self.pending_wrap { column + 1 } else { column };
+                let from = if self.pending_wrap {
+                    column + 1
+                } else {
+                    column
+                };
                 self.blank_range(row, from, columns, attrs);
                 for below in row + 1..self.rows {
                     self.blank_range(below, 0, columns, attrs);
@@ -562,7 +632,9 @@ impl Screen {
         }
         let n = n.max(1).min(self.region_bottom - row);
         for _ in 0..n {
-            let Some(mut line) = self.lines.remove(self.region_bottom - 1) else { break };
+            let Some(mut line) = self.lines.remove(self.region_bottom - 1) else {
+                break;
+            };
             line.fill(Cell::blank(attrs.erased()));
             self.lines.insert(row, line);
         }
@@ -579,7 +651,9 @@ impl Screen {
         }
         let n = n.max(1).min(self.region_bottom - row);
         for _ in 0..n {
-            let Some(mut line) = self.lines.remove(row) else { break };
+            let Some(mut line) = self.lines.remove(row) else {
+                break;
+            };
             line.fill(Cell::blank(attrs.erased()));
             self.lines.insert(self.region_bottom - 1, line);
         }
@@ -593,7 +667,9 @@ impl Screen {
         let (row, from, columns) = (self.cursor.row, self.cursor.column, self.columns);
         let n = n.max(1).min(columns - from);
         self.break_wide(row, from, 0);
-        let Some(line) = self.lines.get_mut(row) else { return };
+        let Some(line) = self.lines.get_mut(row) else {
+            return;
+        };
         line[from..].rotate_right(n);
         line[from..from + n].fill(Cell::blank(attrs.erased()));
         // 挤到行尾的宽字只剩头：补成空格
@@ -609,7 +685,9 @@ impl Screen {
         let (row, from, columns) = (self.cursor.row, self.cursor.column, self.columns);
         let n = n.max(1).min(columns - from);
         self.break_wide(row, from, n);
-        let Some(line) = self.lines.get_mut(row) else { return };
+        let Some(line) = self.lines.get_mut(row) else {
+            return;
+        };
         line[from..].rotate_left(n);
         line[columns - n..].fill(Cell::blank(attrs.erased()));
         self.mark(row);
@@ -658,8 +736,14 @@ impl Screen {
 
     #[cfg(test)]
     pub fn line_text(&self, row: usize) -> String {
-        let Some(line) = self.lines.get(row) else { return String::new() };
-        let text: String = line.iter().filter(|cell| cell.width != 0).map(|cell| cell.ch).collect();
+        let Some(line) = self.lines.get(row) else {
+            return String::new();
+        };
+        let text: String = line
+            .iter()
+            .filter(|cell| cell.width != 0)
+            .map(|cell| cell.ch)
+            .collect();
         text.trim_end().to_string()
     }
 }
@@ -697,7 +781,11 @@ mod tests {
         assert_eq!(screen.take_damage().scrolled_out, 1);
         assert_eq!(screen.line_text(0), "b");
         assert_eq!(screen.history_len(), 1);
-        assert_eq!(screen.history_line(0).map(|line| line.len()), Some(1), "行尾的空格不进历史");
+        assert_eq!(
+            screen.history_line(0).map(|line| line.len()),
+            Some(1),
+            "行尾的空格不进历史"
+        );
     }
 
     /// 只滚区域时，只有区域里的行要重画（区域外的行没动）
@@ -751,7 +839,12 @@ mod tests {
     #[test]
     fn erased_cells_keep_only_the_background() {
         let mut screen = Screen::new(4, 1);
-        let pen = Attributes { underline: true, inverse: true, background: Some(ColorSpec::Indexed(4)), ..Attributes::default() };
+        let pen = Attributes {
+            underline: true,
+            inverse: true,
+            background: Some(ColorSpec::Indexed(4)),
+            ..Attributes::default()
+        };
         screen.erase_line(2, pen);
         let attrs = screen.lines[0][0].attrs;
         assert_eq!(attrs.background, Some(ColorSpec::Indexed(4)));

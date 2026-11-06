@@ -1,0 +1,321 @@
+//! 「目标」下面的文件夹，以及还没归进文件夹的会话。
+
+use std::rc::Rc;
+
+use aureole::prelude::*;
+
+use crate::chrome::menu::{Action, with_actions, with_context_menu};
+use crate::chrome::widgets::{appear, soft};
+use crate::icons::{Icon, icon};
+use crate::tabs::{Folder, FolderPrompt, Tab, Workspace};
+use crate::theme::{fg, hover, mark, selected, text_2, text_3};
+
+/// 文件夹里面的会话，图标缩进到文件夹名字的那一列（没归进文件夹的会话的图标和文件夹的图标对齐，不缩进）
+const FOLDER_SESSION_INDENT: f32 = 23.0;
+
+/// 中间那段滚动的句柄和内容的位置：切到的会话在视口外面时靠它们滚进来
+#[derive(Clone, Copy)]
+pub(super) struct Scrolling {
+    pub list: ScrollHandle,
+    pub content: Signal<Rect>,
+}
+
+/// 文件夹，以及直接列在「目标」下的会话
+pub(super) fn list(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
+    let folders = workspace.folders;
+    let (rows, loose) = (workspace.clone(), workspace.clone());
+    column()
+        .gap(2)
+        // 没归进文件夹的会话：图标和文件夹的图标对齐，收起侧栏时也在，只剩图标
+        .child(sessions(
+            &loose,
+            scrolling,
+            |tab| tab.folder.is_none(),
+            None,
+        ))
+        .child(column().gap(2).each(
+            move || folders.get(),
+            |folder: &Folder| folder.id,
+            move |folder| folder_block(&rows, folder.id, scrolling),
+        ))
+}
+
+fn folder_block(workspace: &Rc<Workspace>, id: u64, scrolling: Scrolling) -> Element {
+    let (collapsed, toggle) = (workspace.collapsed, workspace.clone());
+    let (label, expanded, collapsed_mark) =
+        (workspace.folders, workspace.folders, workspace.folders);
+    // 对应磁盘目录的文件夹，悬停时看得到路径
+    let path = workspace
+        .folders
+        .get_untracked()
+        .iter()
+        .find(|folder| folder.id == id)
+        .and_then(|folder| folder.path.clone());
+    let mut row = row()
+        .name(format!("folder-{id}"))
+        .style(&folder_style())
+        .align(Align::Center)
+        .gap(8)
+        .on_click(move || {
+            if collapsed.get_untracked() {
+                toggle.collapsed.set(false);
+            } else {
+                toggle.toggle_folder(id);
+            }
+        })
+        .child(
+            icon(Icon::Folder, 15.0)
+                .name(format!("folder-icon-{id}"))
+                .color(text_2()),
+        )
+        .child_when(
+            move || !collapsed.get(),
+            move || text(move || folder_name(label, id)).grow(1).max_lines(1),
+        )
+        .child_when(
+            move || !collapsed.get() && folder_open(expanded, id),
+            || icon(Icon::ChevronDown, 14.0).color(text_3()),
+        )
+        .child_when(
+            move || !collapsed.get() && !folder_open(collapsed_mark, id),
+            || icon(Icon::ChevronRight, 14.0).color(text_3()),
+        );
+    if let Some(path) = path {
+        row = row.tooltip(path.display().to_string());
+    }
+    let owner = workspace.clone();
+    let shown = workspace.folders;
+    column()
+        .gap(1)
+        .child(folder_menu(row, workspace, id))
+        .child_when(
+            move || !collapsed.get() && folder_open(shown, id),
+            move || {
+                sessions(
+                    &owner,
+                    scrolling,
+                    move |tab| tab.folder == Some(id),
+                    Some(FOLDER_SESSION_INDENT),
+                )
+            },
+        )
+}
+
+fn folder_name(folders: Signal<Vec<Folder>>, id: u64) -> String {
+    folders
+        .get()
+        .into_iter()
+        .find(|folder| folder.id == id)
+        .map(|folder| folder.name)
+        .unwrap_or_default()
+}
+
+fn folder_open(folders: Signal<Vec<Folder>>, id: u64) -> bool {
+    folders
+        .get()
+        .into_iter()
+        .find(|folder| folder.id == id)
+        .is_some_and(|folder| folder.open)
+}
+
+fn folder_menu(row: Element, workspace: &Rc<Workspace>, id: u64) -> Element {
+    let (create, rename, delete) = (workspace.clone(), workspace.clone(), workspace.clone());
+    with_actions(
+        row,
+        format!("menu-folder-{id}"),
+        vec![
+            Action {
+                id: format!("new-session-folder-{id}"),
+                label: "创建会话".to_string(),
+                // 等菜单卸掉再开。在菜单的点击里直接开，读 shell 的任务会记在菜单上，菜单一关任务就没了
+                run: Rc::new(move || {
+                    let workspace = create.clone();
+                    aureole::detached(|| {
+                        aureole::spawn_local(async move {
+                            aureole::sleep(ms(1)).await;
+                            workspace.new_tab_in(id);
+                        })
+                    });
+                }),
+            },
+            Action {
+                id: format!("rename-folder-{id}"),
+                label: "重命名".to_string(),
+                run: Rc::new(move || rename.folder_prompt.set(Some(FolderPrompt::Rename(id)))),
+            },
+            Action {
+                id: format!("delete-folder-{id}"),
+                label: "删除".to_string(),
+                run: Rc::new(move || delete.delete_folder(id)),
+            },
+        ],
+    )
+}
+
+/// 「目标」下面还没被文件夹占掉的空白：右键可以创建会话（不归任何文件夹）、新建文件夹，或者添加一个磁盘目录
+pub(super) fn blank(workspace: &Rc<Workspace>) -> Element {
+    let prompt = workspace.folder_prompt;
+    let (choose, create) = (workspace.clone(), workspace.clone());
+    with_actions(
+        rect().name("targets-blank").grow(1).min_height(48),
+        "menu-targets".to_string(),
+        vec![
+            Action {
+                id: "new-session".to_string(),
+                label: "创建会话".to_string(),
+                // 等菜单卸掉再开，原因同文件夹菜单里的「创建会话」
+                run: Rc::new(move || {
+                    let workspace = create.clone();
+                    aureole::detached(|| {
+                        aureole::spawn_local(async move {
+                            aureole::sleep(ms(1)).await;
+                            workspace.new_tab_loose();
+                        })
+                    });
+                }),
+            },
+            Action {
+                id: "new-folder".to_string(),
+                label: "新建文件夹".to_string(),
+                run: Rc::new(move || prompt.set(Some(FolderPrompt::Create))),
+            },
+            Action {
+                id: "add-directory".to_string(),
+                label: "添加目录…".to_string(),
+                run: Rc::new(move || choose.choose_directory()),
+            },
+        ],
+    )
+}
+
+fn folder_style() -> Style {
+    soft(
+        Style::new()
+            .height(28)
+            .padding_x(10)
+            .radius(6)
+            .font_size(13)
+            .color(fg())
+            .background(Color::TRANSPARENT)
+            .hovered(|style| style.background(hover())),
+    )
+}
+
+/// 符合条件的会话行，按开的先后。`indent` 是文件夹里的会话文字缩进多少；`None` 是直接列在「目标」下的，带图标
+fn sessions(
+    workspace: &Rc<Workspace>,
+    scrolling: Scrolling,
+    belongs: impl Fn(&Tab) -> bool + 'static,
+    indent: Option<f32>,
+) -> Element {
+    let (tabs, owner) = (workspace.tabs, workspace.clone());
+    column().gap(1).each(
+        move || {
+            tabs.get()
+                .into_iter()
+                .filter(|tab| belongs(tab))
+                .collect::<Vec<_>>()
+        },
+        |tab| tab.id,
+        move |tab| session_row(&owner, tab, scrolling, indent),
+    )
+}
+
+fn session_row(
+    workspace: &Rc<Workspace>,
+    tab: Tab,
+    scrolling: Scrolling,
+    indent: Option<f32>,
+) -> Element {
+    let (active, titles, unseen, collapsed) = (
+        workspace.active,
+        workspace.titles,
+        workspace.unseen,
+        workspace.collapsed,
+    );
+    let id = tab.id;
+    let select = workspace.clone();
+    let Scrolling { list, content } = scrolling;
+    // 这一行成了当前会话时（新开的、点标签栏切的、快捷键切的）滚进视口。
+    // 等一帧再滚：新行刚挂上，位置还没量到
+    let bounds = signal(Rect::default());
+    Effect::new(move || {
+        if active.get() == id {
+            aureole::spawn_local(async move {
+                aureole::sleep(ms(20)).await;
+                let (row, content) = (bounds.get_untracked(), content.get_untracked());
+                let (top, offset, shown) =
+                    (row.y - content.y, list.offset_y(), list.viewport_size()[1]);
+                let bottom = top + row.height;
+                if top < offset {
+                    list.scroll_to(0.0, top);
+                } else if bottom > offset + shown {
+                    list.scroll_to(0.0, bottom - shown);
+                }
+            });
+        }
+    });
+    let title = move || titles.get().get(&id).cloned().unwrap_or_default();
+    let mut session = row()
+        .name(format!("session-{id}"))
+        .report_bounds(bounds)
+        .style_with(
+            &session_style(),
+            &States::new().selected(move || active.get() == id),
+        )
+        .align(Align::Center)
+        .on_click(move || select.select(id));
+    session = match indent {
+        // 文件夹里的：图标缩进到文件夹名字的那一列，看得出是它的子项；行和别的侧栏行一样宽
+        Some(indent) => session
+            .padding_x(10)
+            .gap(8)
+            .child(
+                icon(Icon::Terminal, 15.0)
+                    .name(format!("session-icon-{id}"))
+                    .color(text_2())
+                    .margin_left(indent),
+            )
+            .child(text(title).grow(1).max_lines(1)),
+        // 直接列在「目标」下的：图标和文件夹的图标同一列、同样大，名字和文件夹的名字对齐；
+        // 收起侧栏时只剩图标（名字放进提示里）
+        None => session
+            .padding_x(move || if collapsed.get() { 0.0 } else { 10.0 })
+            .gap(8)
+            .justify(move || {
+                if collapsed.get() {
+                    Justify::Center
+                } else {
+                    Justify::Start
+                }
+            })
+            .tooltip(title)
+            .child(
+                icon(Icon::Terminal, 15.0)
+                    .name(format!("session-icon-{id}"))
+                    .color(text_2()),
+            )
+            .child_when(
+                move || !collapsed.get(),
+                move || text(title).grow(1).max_lines(1),
+            ),
+    };
+    let session = session.child_when(
+        move || !collapsed.get() && unseen.get().contains(&id),
+        || rect().size(6, 6).radius(3).background(mark()),
+    );
+    appear(with_context_menu(session, workspace, "session", id))
+}
+
+fn session_style() -> Style {
+    soft(
+        Style::new()
+            .height(28)
+            .radius(6)
+            .font_size(12)
+            .color(text_2())
+            .background(Color::TRANSPARENT)
+            .hovered(|style| style.background(hover()).color(fg()))
+            .selected(|style| style.background(selected()).color(fg())),
+    )
+}

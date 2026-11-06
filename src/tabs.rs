@@ -1,42 +1,235 @@
-//! 工作区的状态：有哪些标签（每个一个会话）、哪个是当前的、侧栏收起了没有、在哪个页面、
+//! 工作区的状态：有哪些标签（每个一个会话）、哪个是当前的、侧栏收起了没有、设置页开着没有、
 //! 命令面板开着没有、哪些后台标签有新输出。界面（`chrome`）只读这些信号、调这里的方法。
 //!
 //! 只有当前标签挂着视图；别的标签的会话照样在后台读输出、更新自己的屏幕，切回来时视图重新挂上，
 //! 网格里的内容是最新的。
+//!
+//! 侧栏的「目标」下面是文件夹：可以从访达拖一个目录进来，之后在这个文件夹里创建终端就从那个目录起。
+//! 文件夹、开着的标签、侧栏宽度会落盘（见 [`Saved`]），设置在 [`crate::settings`]。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 use aureole::prelude::*;
+use serde::{Deserialize, Serialize};
 
-use crate::app::{Hooks, PADDING, Session, Spawned};
+use crate::app::{Hooks, Launch, PADDING, Session, Spawned};
+use crate::pane::{Axis, Pane};
+use crate::settings::{
+    Form, LastTab, Settings, ShellKind, SidebarStart, Startup, ThemeChoice, TitleSource,
+};
+use crate::store::Store;
+use crate::target::Target;
 use crate::{chrome, view};
 
 /// 打开窗口时的内容区大小
 pub const WINDOW_SIZE: (u32, u32) = (1040, 680);
 /// macOS 红绿灯的位置，要让它在标题栏里垂直居中
 pub const CONTROLS_POSITION: (f32, f32) = (16.0, 13.0);
+/// 终端的默认名字
+pub const DEFAULT_TITLE: &str = "终端";
+/// 文件名
+const STATE_FILE: &str = "state.json";
+/// 每个标签最多存多少行终端内容（文件名是 `output-第几个标签.ansi`）
+const OUTPUT_LINES: usize = 3000;
 
-/// 主卡片里显示哪个页面
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Terminal,
-    Monitor,
+fn output_file(index: usize) -> String {
+    format!("output-{index}.ansi")
 }
+
+/// 设置页左边的分类
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsPage {
+    General,
+    Appearance,
+    Terminal,
+    Shortcuts,
+    About,
+}
+
+impl SettingsPage {
+    pub const ALL: [SettingsPage; 5] = [
+        Self::General,
+        Self::Appearance,
+        Self::Terminal,
+        Self::Shortcuts,
+        Self::About,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::General => "通用",
+            Self::Appearance => "外观",
+            Self::Terminal => "终端",
+            Self::Shortcuts => "快捷键",
+            Self::About => "关于",
+        }
+    }
+
+    /// 界面元素的名字（测试和无障碍用）
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::General => "settings-general",
+            Self::Appearance => "settings-appearance",
+            Self::Terminal => "settings-terminal",
+            Self::Shortcuts => "settings-shortcuts",
+            Self::About => "settings-about",
+        }
+    }
+}
+
+/// 起一个会话：怎么起（连到哪、多少列行、哪个目录、哪个 shell）
+pub type SpawnFn = Rc<dyn Fn(&Launch) -> Spawned>;
 
 /// 一个标签
 #[derive(Clone)]
 pub struct Tab {
     pub id: u64,
-    pub session: Rc<Session>,
+    /// 这个标签里终端的排布：一个，或者拆分出来的好几个
+    pub layout: Signal<Pane>,
+    /// 聚焦的是哪个终端（排布里叶子的编号）：键盘打字、状态条、存目录都看它
+    pub focus: Signal<u64>,
+    pub target: Target,
+    /// 归在哪个文件夹下面；没有就是直接列在「目标」下
+    pub folder: Option<u64>,
+}
+
+impl Tab {
+    /// 聚焦的那个终端的会话
+    pub fn session(&self) -> Rc<Session> {
+        let layout = self.layout.get_untracked();
+        layout
+            .session(self.focus.get_untracked())
+            .or_else(|| layout.session(layout.first_id()))
+            .expect("排布里至少有一个终端")
+    }
+
+    /// 这个标签里的所有会话
+    pub fn sessions(&self) -> Vec<Rc<Session>> {
+        self.layout
+            .get_untracked()
+            .leaves()
+            .into_iter()
+            .map(|(_, session)| session)
+            .collect()
+    }
+}
+
+/// 侧栏「目标」里的一个文件夹
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Folder {
+    pub id: u64,
+    pub name: String,
+    /// 对应的磁盘目录（从访达拖进来、或者「添加目录」选的）。在里面创建的终端从这里起；
+    /// 自己新建的空文件夹没有，用设置里的起始目录
+    pub path: Option<PathBuf>,
+    pub open: bool,
+}
+
+/// 文件夹命名框在新建还是改名
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderPrompt {
+    Create,
+    Rename(u64),
+}
+
+/// 落盘的工作区：文件夹、开着的标签（按标签条的顺序）、侧栏宽度
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Saved {
+    folders: Vec<SavedFolder>,
+    tabs: Vec<SavedTab>,
+    /// 当前标签是 `tabs` 里的第几个
+    active: Option<usize>,
+    sidebar_width: Option<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SavedFolder {
+    id: u64,
+    name: String,
+    path: Option<PathBuf>,
+    open: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SavedTab {
+    folder: Option<u64>,
+    /// 用户给起的名字；没起过就是 `None`
+    title: Option<String>,
+    /// 关掉时聚焦的那个终端的目录（没有 `layout` 的旧文件用它）
+    directory: Option<PathBuf>,
+    /// 拆分的排布
+    layout: Option<SavedPane>,
+    /// 聚焦的是排布里的第几个终端（从 0 数，从左到右、从上到下）
+    focus: Option<usize>,
+}
+
+/// 落盘的排布：一个终端（带关掉时的目录），或者一次拆分
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SavedPane {
+    Pane {
+        directory: Option<PathBuf>,
+    },
+    Split {
+        axis: Axis,
+        ratio: f32,
+        first: Box<SavedPane>,
+        second: Box<SavedPane>,
+    },
+}
+
+impl SavedPane {
+    fn leaf_count(&self) -> usize {
+        match self {
+            Self::Pane { .. } => 1,
+            Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
+        }
+    }
+
+    /// 现在的排布写成落盘的样子
+    fn of(pane: &Pane) -> Self {
+        match pane {
+            Pane::Leaf { session, .. } => Self::Pane {
+                directory: session.working_directory(),
+            },
+            Pane::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => Self::Split {
+                axis: *axis,
+                ratio: ratio.get_untracked(),
+                first: Box::new(Self::of(first)),
+                second: Box::new(Self::of(second)),
+            },
+        }
+    }
+}
+
+impl SavedTab {
+    fn pane_count(&self) -> usize {
+        self.layout.as_ref().map_or(1, SavedPane::leaf_count)
+    }
 }
 
 /// 一个窗口里的全部状态
 pub struct Workspace {
+    /// 全部会话，按开的先后排；侧栏照这个列，不会被挪动
     pub tabs: Signal<Vec<Tab>>,
+    /// 「目标」下面的文件夹，按创建的先后
+    pub folders: Signal<Vec<Folder>>,
+    /// 文件夹命名框：新建，或者在改哪一个
+    pub folder_prompt: Signal<Option<FolderPrompt>>,
+    /// 顶部标签条里的顺序（会话的 id）：拖动只改它，和侧栏的顺序无关
+    pub bar: Signal<Vec<u64>>,
     /// 每个标签现在显示的名字
     pub titles: Signal<HashMap<u64, String>>,
+    /// 当前会话；一个会话都没有时是 0。设置页开着时它还是进设置之前的那个
     pub active: Signal<u64>,
     /// 不在前台、读到了新输出还没看过的标签
     pub unseen: Signal<HashSet<u64>>,
@@ -45,50 +238,645 @@ pub struct Workspace {
     pub collapsed: Signal<bool>,
     /// 侧栏展开时的宽度，拖交界处改它
     pub sidebar_width: Signal<f32>,
-    pub mode: Signal<Mode>,
     pub palette_open: Signal<bool>,
+    /// 设置页开着：卡片里是设置，顶上的标签条收起，侧栏换成设置的分类
+    pub settings_open: Signal<bool>,
+    /// 设置页里选中的分类
+    pub settings_page: Signal<SettingsPage>,
+    /// 设置页上的选择：会话、窗口、界面都读它
+    pub form: Form,
+    /// 重命名框开着时，是在改哪个标签
+    pub renaming: Signal<Option<u64>>,
+    /// 确认关闭框开着时，是在关哪个标签（它前台有程序在跑）
+    pub closing: Signal<Option<u64>>,
+    /// 确认关闭框是只关这个标签里的某个终端（拆分出来的）时，是哪个；`None` 是关整个标签
+    closing_pane: Cell<Option<u64>>,
+    /// 用户起的名字：有就盖过程序设的标题
+    custom_titles: RefCell<HashMap<u64, String>>,
+    /// 程序设的标题（可能是空的）
+    reported_titles: RefCell<HashMap<u64, String>>,
     next_id: Cell<u64>,
-    spawn: Rc<dyn Fn(usize, usize) -> Spawned>,
+    next_pane: Cell<u64>,
+    next_folder: Cell<u64>,
+    spawn: SpawnFn,
     pub window: Option<WindowHandle>,
+    store: Store,
+    /// 排着一次延后的落盘
+    save_pending: Cell<bool>,
+    /// 已经写到盘上的终端内容：第几个标签的文件写的是哪个会话的哪一版，没变就不重写
+    saved_outputs: RefCell<HashMap<usize, (u64, u64)>>,
+    /// 盘上有多少个终端内容文件（多出来的要删）
+    output_files: Cell<usize>,
+    /// 退出时最后存过一次了：之后不再存（窗口关了以后 shell 收到 SIGHUP 退出，
+    /// 屏幕上会多出「进程已退出」，不能把它存进去）
+    finished: Cell<bool>,
     this: Weak<Workspace>,
 }
 
 impl Workspace {
-    pub fn new(spawn: Rc<dyn Fn(usize, usize) -> Spawned>, window: Option<WindowHandle>) -> Rc<Self> {
-        let (width, height) = chrome::terminal_area();
+    /// `store` 是落盘的位置（`Store::none()` 不落盘）。设置和上次的文件夹、侧栏宽度从里面读；
+    /// 上次开着的标签要调 [`Workspace::restore`] 才会开出来
+    pub fn new(spawn: SpawnFn, window: Option<WindowHandle>, store: Store) -> Rc<Self> {
+        // 工作区的信号和副作用不挂在窗口的作用域上：窗口一关作用域就释放，
+        // 而退出时还要最后存一次（读这些信号）
+        aureole::detached(|| Self::build(spawn, window, store))
+    }
+
+    fn build(spawn: SpawnFn, window: Option<WindowHandle>, store: Store) -> Rc<Self> {
+        let settings = Settings::load(&store);
+        let saved: Saved = store.load(STATE_FILE);
+        let (width, height) =
+            window.map_or((WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32), |window| {
+                let [width, height] = window.size();
+                (width, height)
+            });
+        let (width, height) = chrome::terminal_area((width, height));
         let size = view::fit(width - 2.0 * PADDING, height - 2.0 * PADDING, (0.0, 0.0));
-        Rc::new_cyclic(|this| Self {
+        let folders: Vec<Folder> = saved
+            .folders
+            .iter()
+            .map(|folder| Folder {
+                id: folder.id,
+                name: folder.name.clone(),
+                path: folder.path.clone(),
+                open: folder.open,
+            })
+            .collect();
+        let next_folder = folders.iter().map(|folder| folder.id).max().unwrap_or(0) + 1;
+        let sidebar_width = saved
+            .sidebar_width
+            .unwrap_or(chrome::SIDEBAR_DEFAULT)
+            .clamp(chrome::SIDEBAR_MIN, chrome::SIDEBAR_MAX);
+        let workspace = Rc::new_cyclic(|this| Self {
             tabs: signal(Vec::new()),
+            folders: signal(folders),
+            folder_prompt: signal(None),
+            bar: signal(Vec::new()),
             titles: signal(HashMap::new()),
             active: signal(0),
             unseen: signal(HashSet::new()),
             size: signal(size),
-            collapsed: signal(false),
-            sidebar_width: signal(chrome::SIDEBAR_DEFAULT),
-            mode: signal(Mode::Terminal),
+            collapsed: signal(settings.sidebar == SidebarStart::Closed),
+            sidebar_width: signal(sidebar_width),
             palette_open: signal(false),
+            settings_open: signal(false),
+            settings_page: signal(SettingsPage::General),
+            form: Form::new(&settings),
+            renaming: signal(None),
+            closing: signal(None),
+            closing_pane: Cell::new(None),
+            custom_titles: RefCell::new(HashMap::new()),
+            reported_titles: RefCell::new(HashMap::new()),
             next_id: Cell::new(1),
+            next_pane: Cell::new(1),
+            next_folder: Cell::new(next_folder),
             spawn,
             window,
+            store,
+            save_pending: Cell::new(false),
+            saved_outputs: RefCell::new(HashMap::new()),
+            output_files: Cell::new(saved.tabs.iter().map(SavedTab::pane_count).sum()),
+            finished: Cell::new(false),
             this: this.clone(),
-        })
+        });
+        workspace.watch_theme();
+        workspace.watch_settings();
+        workspace.watch_persistence();
+        workspace
     }
 
-    /// 新开一个标签并切过去
+    /// 界面现在是深色还是浅色：设置里的「外观」，选了「跟随系统」就看系统的外观。
+    /// 要在建界面之前就定下来（所以在 `new` 里马上跑一次）
+    fn watch_theme(self: &Rc<Self>) {
+        let appearance = self.form.appearance;
+        Effect::new(move || {
+            let dark = match appearance.get() {
+                ThemeChoice::Light => false,
+                ThemeChoice::Dark => true,
+                ThemeChoice::System => aureole::system_appearance() == aureole::Appearance::Dark,
+            };
+            crate::theme::set_dark(dark);
+        });
+    }
+
+    /// 设置里和已经开着的标签有关的几项：标题来源、历史行数。改了就照新的来
+    fn watch_settings(self: &Rc<Self>) {
+        let (this, form) = (self.this.clone(), self.form);
+        Effect::new(move || {
+            let _ = form.title.get();
+            if let Some(workspace) = this.upgrade() {
+                for id in workspace.bar.get_untracked() {
+                    workspace.refresh_title(id);
+                }
+            }
+        });
+        let this = self.this.clone();
+        Effect::new(move || {
+            let _ = form.scrollback.get();
+            if let Some(workspace) = this.upgrade() {
+                for tab in workspace.tabs.get_untracked() {
+                    for session in tab.sessions() {
+                        session.apply_scrollback();
+                    }
+                }
+            }
+        });
+        form.persist(self.store.clone());
+    }
+
+    // ---- 落盘 ----
+
+    /// 工作区一变就存（稍等一下合并连续的改动）
+    fn watch_persistence(self: &Rc<Self>) {
+        if !self.store.is_persistent() {
+            return;
+        }
+        let this = self.this.clone();
+        let (folders, tabs, bar, titles, active, width) = (
+            self.folders,
+            self.tabs,
+            self.bar,
+            self.titles,
+            self.active,
+            self.sidebar_width,
+        );
+        Effect::new(move || {
+            let _ = (
+                folders.get(),
+                tabs.get(),
+                bar.get(),
+                titles.get(),
+                active.get(),
+                width.get(),
+            );
+            if let Some(workspace) = this.upgrade() {
+                workspace.save_soon();
+            }
+        });
+    }
+
+    /// 每隔 2 秒存一次：shell 的当前目录变了没有信号，只能定时去问
+    fn autosave(&self) {
+        if !self.store.is_persistent() {
+            return;
+        }
+        let this = self.this.clone();
+        // 任务不挂在任何界面上：窗口里的东西卸载不能把它一起取消
+        aureole::detached(|| {
+            aureole::spawn_local(async move {
+                loop {
+                    aureole::sleep(secs(2.0)).await;
+                    let Some(workspace) = this.upgrade() else {
+                        break;
+                    };
+                    workspace.save_now();
+                }
+            })
+        });
+    }
+
+    fn save_soon(&self) {
+        if self.save_pending.replace(true) {
+            return;
+        }
+        let this = self.this.clone();
+        aureole::detached(|| {
+            aureole::spawn_local(async move {
+                aureole::sleep(ms(300)).await;
+                if let Some(workspace) = this.upgrade() {
+                    workspace.save_pending.set(false);
+                    workspace.save_now();
+                }
+            })
+        });
+    }
+
+    /// 现在的工作区，写成要落盘的样子（标签按标签条的顺序）
+    fn snapshot(&self) -> Saved {
+        let tabs = self.tabs.get_untracked();
+        let customs = self.custom_titles.borrow();
+        let bar = self.bar.get_untracked();
+        let ordered: Vec<&Tab> = bar
+            .iter()
+            .filter_map(|id| tabs.iter().find(|tab| tab.id == *id))
+            .collect();
+        let active = self.active.get_untracked();
+        Saved {
+            folders: self
+                .folders
+                .get_untracked()
+                .iter()
+                .map(|folder| SavedFolder {
+                    id: folder.id,
+                    name: folder.name.clone(),
+                    path: folder.path.clone(),
+                    open: folder.open,
+                })
+                .collect(),
+            tabs: ordered
+                .iter()
+                .map(|tab| {
+                    let layout = tab.layout.get_untracked();
+                    let focus = tab.focus.get_untracked();
+                    SavedTab {
+                        folder: tab.folder,
+                        title: customs.get(&tab.id).cloned(),
+                        directory: tab.session().working_directory(),
+                        focus: layout.leaves().iter().position(|(id, _)| *id == focus),
+                        layout: Some(SavedPane::of(&layout)),
+                    }
+                })
+                .collect(),
+            active: ordered.iter().position(|tab| tab.id == active),
+            sidebar_width: Some(self.sidebar_width.get_untracked()),
+        }
+    }
+
+    /// 要退出了：最后存一次，之后不再存
+    pub fn finish(&self) {
+        self.save_now();
+        self.finished.set(true);
+    }
+
+    /// 配置存在哪个目录；不落盘时是 `None`
+    pub fn config_directory(&self) -> Option<PathBuf> {
+        self.store.directory().map(Path::to_path_buf)
+    }
+
+    /// 马上存。没变就不写
+    pub fn save_now(&self) {
+        if !self.store.is_persistent() || self.finished.get() {
+            return;
+        }
+        self.store.save(STATE_FILE, &self.snapshot());
+        self.save_outputs();
+    }
+
+    /// 存每个终端里的内容（按标签条的顺序，标签里从左到右、从上到下，和 `state.json` 里的排布一一对应；
+    /// 文件名里的序号是这个终端在全部终端里排第几）。设置里关了就把存过的删掉；自上次存以后没有新输出的不重写
+    fn save_outputs(&self) {
+        let enabled = self.form.save_output.get_untracked();
+        let tabs = self.tabs.get_untracked();
+        let bar = self.bar.get_untracked();
+        let panes: Vec<(u64, Rc<Session>)> = if enabled {
+            bar.iter()
+                .filter_map(|id| tabs.iter().find(|tab| tab.id == *id))
+                .flat_map(|tab| tab.layout.get_untracked().leaves())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut saved = self.saved_outputs.borrow_mut();
+        for (index, (pane, session)) in panes.iter().enumerate() {
+            let stamp = (*pane, session.output_version());
+            if saved.get(&index) == Some(&stamp) {
+                continue;
+            }
+            let text = session.transcript(OUTPUT_LINES);
+            if text.is_empty() {
+                self.store.remove(&output_file(index));
+            } else {
+                self.store.save_text(&output_file(index), &text);
+            }
+            saved.insert(index, stamp);
+        }
+        for index in panes.len()..self.output_files.get().max(saved.len()) {
+            self.store.remove(&output_file(index));
+            saved.remove(&index);
+        }
+        self.output_files.set(panes.len());
+    }
+
+    /// 把上次开着的标签（连同拆分、每个终端的目录和里面的内容）再开出来，选中上次选中的那个。
+    /// 设置里「启动时」选了空白就什么也不做。返回开了几个标签
+    pub fn restore(&self) -> usize {
+        if self.form.startup.get_untracked() != Startup::Restore {
+            return 0;
+        }
+        let saved: Saved = self.store.load(STATE_FILE);
+        let folders = self.folders.get_untracked();
+        let keep_output = self.form.save_output.get_untracked();
+        // 终端内容的文件按全部终端的先后编号，和存的时候的顺序一样
+        let mut flat = 0usize;
+        let mut opened = Vec::new();
+        for tab in &saved.tabs {
+            // 文件夹被删过的，标签放回「目标」下面
+            let folder = tab
+                .folder
+                .filter(|id| folders.iter().any(|folder| folder.id == *id));
+            let tab_id = self.new_id();
+            let layout = tab.layout.clone().unwrap_or(SavedPane::Pane {
+                directory: tab.directory.clone(),
+            });
+            let pane = self.build_pane(tab_id, folder, &layout, keep_output, &mut flat);
+            let focus = tab
+                .focus
+                .and_then(|index| pane.leaves().get(index).map(|(id, _)| *id))
+                .unwrap_or_else(|| pane.first_id());
+            self.push_tab(tab_id, folder, pane, focus);
+            if let Some(title) = &tab.title {
+                self.rename_tab(tab_id, title);
+            }
+            opened.push(tab_id);
+        }
+        // 上次选中的那个；没记下来就是第一个
+        if let Some(&id) = saved
+            .active
+            .and_then(|index| opened.get(index))
+            .or(opened.first())
+        {
+            self.activate(id);
+        }
+        opened.len()
+    }
+
+    /// 按落盘的排布把终端一个个开出来
+    fn build_pane(
+        &self,
+        tab: u64,
+        folder: Option<u64>,
+        saved: &SavedPane,
+        keep_output: bool,
+        flat: &mut usize,
+    ) -> Pane {
+        match saved {
+            SavedPane::Pane { directory } => {
+                let history = keep_output
+                    .then(|| self.store.load_text(&output_file(*flat)))
+                    .flatten();
+                *flat += 1;
+                let (id, session) = self.spawn_pane(tab, folder, directory.clone(), history);
+                Pane::leaf(id, session)
+            }
+            SavedPane::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let first = self.build_pane(tab, folder, first, keep_output, flat);
+                let second = self.build_pane(tab, folder, second, keep_output, flat);
+                Pane::split_node(
+                    *axis,
+                    ratio.clamp(crate::pane::RATIO_RANGE.0, crate::pane::RATIO_RANGE.1),
+                    first,
+                    second,
+                )
+            }
+        }
+    }
+
+    // ---- 新建、文件夹 ----
+
+    /// 新开一个本机标签并切过去。当前会话在某个文件夹里时，新会话也归到那里
     pub fn new_tab(&self) {
-        let (columns, rows) = self.size.get_untracked();
-        let spawned = (self.spawn)(columns, rows);
+        let folder = self
+            .tabs
+            .get_untracked()
+            .iter()
+            .find(|tab| tab.id == self.active.get_untracked())
+            .and_then(|tab| tab.folder);
+        let id = self.open(folder, None, None);
+        self.activate(id);
+    }
+
+    /// 新开一个不归任何文件夹的终端（直接列在「目标」下），用设置里的起始目录
+    pub fn new_tab_loose(&self) {
+        let id = self.open(None, None, None);
+        self.activate(id);
+    }
+
+    /// 在这个文件夹里新开一个本机终端，并把它展开。文件夹有目录就从那个目录起
+    pub fn new_tab_in(&self, folder: u64) {
+        self.reveal_folder(folder);
+        let id = self.open(Some(folder), None, None);
+        self.activate(id);
+    }
+
+    /// 新建一个文件夹，名字空着就用「文件夹」「文件夹 2」这样排下去。这样的文件夹没有对应的目录
+    pub fn create_folder(&self, name: &str) -> u64 {
+        let name = name.trim();
+        let name = if name.is_empty() {
+            self.fresh_folder_name()
+        } else {
+            name.to_string()
+        };
+        self.push_folder(name, None)
+    }
+
+    fn push_folder(&self, name: String, path: Option<PathBuf>) -> u64 {
+        let id = self.next_folder.get();
+        self.next_folder.set(id + 1);
+        self.folders.update(|folders| {
+            folders.push(Folder {
+                id,
+                name,
+                path,
+                open: true,
+            });
+        });
+        id
+    }
+
+    /// 把一个磁盘目录加进「目标」（从访达拖进来、或者选的）：文件夹用目录的名字，
+    /// 之后在里面创建的终端从这个目录起。这个目录已经有文件夹了就只是展开它。
+    /// 不是目录（文件、不存在）返回 `None`
+    pub fn add_directory(&self, path: &Path) -> Option<u64> {
+        if !path.is_dir() {
+            return None;
+        }
+        let same = |other: &Path| {
+            other == path
+                || matches!(
+                    (other.canonicalize(), path.canonicalize()),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        };
+        let existing = self
+            .folders
+            .get_untracked()
+            .iter()
+            .find(|folder| folder.path.as_deref().is_some_and(same))
+            .map(|folder| folder.id);
+        if let Some(id) = existing {
+            self.reveal_folder(id);
+            return Some(id);
+        }
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        Some(self.push_folder(name, Some(path.to_path_buf())))
+    }
+
+    /// 弹出系统的选择目录对话框，选好的目录加进「目标」并在里面开一个终端
+    pub fn choose_directory(&self) {
+        let this = self.this.clone();
+        // 对话框的任务不能记在按钮或菜单上：选完马上要换界面，它们的作用域会被卸掉
+        aureole::detached(|| {
+            aureole::spawn_local(async move {
+                let mut dialog = aureole::FileDialog::new().title("选择目录");
+                if let Some(home) = std::env::var_os("HOME") {
+                    dialog = dialog.directory(home);
+                }
+                let Some(path) = dialog.pick_directory().await else {
+                    return;
+                };
+                if let Some(workspace) = this.upgrade()
+                    && let Some(folder) = workspace.add_directory(&path)
+                {
+                    workspace.new_tab_in(folder);
+                }
+            })
+        });
+    }
+
+    /// 还没被占用的默认文件夹名
+    pub fn fresh_folder_name(&self) -> String {
+        let names: Vec<String> = self
+            .folders
+            .get_untracked()
+            .iter()
+            .map(|folder| folder.name.clone())
+            .collect();
+        let mut candidate = "文件夹".to_string();
+        let mut number = 2u32;
+        while names.iter().any(|name| name == &candidate) {
+            candidate = format!("文件夹 {number}");
+            number += 1;
+        }
+        candidate
+    }
+
+    pub fn rename_folder(&self, id: u64, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.folders.update(|folders| {
+            if let Some(folder) = folders.iter_mut().find(|folder| folder.id == id) {
+                folder.name = name.to_string();
+            }
+        });
+    }
+
+    /// 删掉文件夹，里面的会话一起关掉
+    pub fn delete_folder(&self, id: u64) {
+        let sessions: Vec<u64> = self
+            .tabs
+            .get_untracked()
+            .iter()
+            .filter(|tab| tab.folder == Some(id))
+            .map(|tab| tab.id)
+            .collect();
+        for session in sessions {
+            self.close_tab(session);
+        }
+        self.folders
+            .update(|folders| folders.retain(|folder| folder.id != id));
+        if self.folder_prompt.get_untracked() == Some(FolderPrompt::Rename(id)) {
+            self.folder_prompt.set(None);
+        }
+    }
+
+    pub fn toggle_folder(&self, id: u64) {
+        self.folders.update(|folders| {
+            if let Some(folder) = folders.iter_mut().find(|folder| folder.id == id) {
+                folder.open = !folder.open;
+            }
+        });
+    }
+
+    fn reveal_folder(&self, id: u64) {
+        let closed = self
+            .folders
+            .get_untracked()
+            .iter()
+            .any(|folder| folder.id == id && !folder.open);
+        if !closed {
+            return;
+        }
+        self.folders.update(|folders| {
+            if let Some(folder) = folders.iter_mut().find(|folder| folder.id == id) {
+                folder.open = true;
+            }
+        });
+    }
+
+    // ---- 起会话 ----
+
+    /// 新会话从哪个目录起：`explicit`（恢复上次时用关掉时的目录）、所在文件夹的目录、
+    /// 设置里指定的起始目录，依次找第一个真是目录的；都没有就是 `None`（主目录）
+    fn start_directory(&self, folder: Option<u64>, explicit: Option<PathBuf>) -> Option<PathBuf> {
+        let from_folder = folder.and_then(|id| {
+            self.folders
+                .get_untracked()
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .and_then(|candidate| candidate.path.clone())
+        });
+        let from_settings = (self.form.directory.get_untracked()
+            == crate::settings::DirectoryKind::Custom)
+            .then(|| expand_home(self.form.directory_path.get_untracked().trim()))
+            .flatten();
+        [explicit, from_folder, from_settings]
+            .into_iter()
+            .flatten()
+            .find(|path| path.is_dir())
+    }
+
+    fn new_id(&self) -> u64 {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        let fallback = spawned.name.clone();
-        let (for_title, for_size, for_exit, for_activity) = (self.this.clone(), self.this.clone(), self.this.clone(), self.this.clone());
+        id
+    }
+
+    /// 开一个标签（里面一个终端），放进标签条和侧栏，但不切过去。返回它的 id
+    fn open(
+        &self,
+        folder: Option<u64>,
+        directory: Option<PathBuf>,
+        history: Option<String>,
+    ) -> u64 {
+        let id = self.new_id();
+        let (pane, session) = self.spawn_pane(id, folder, directory, history);
+        self.push_tab(id, folder, Pane::leaf(pane, session), pane);
+        id
+    }
+
+    /// 起一个终端（会话），它属于标签 `tab`。返回它在标签里的编号和会话
+    fn spawn_pane(
+        &self,
+        tab: u64,
+        folder: Option<u64>,
+        directory: Option<PathBuf>,
+        history: Option<String>,
+    ) -> (u64, Rc<Session>) {
+        let (columns, rows) = self.size.get_untracked();
+        let shell = (self.form.shell.get_untracked() == ShellKind::Program)
+            .then(|| self.form.shell_program.get_untracked().trim().to_string())
+            .filter(|program| !program.is_empty());
+        let launch = Launch {
+            target: Target::Local,
+            columns,
+            rows,
+            directory: self.start_directory(folder, directory),
+            shell,
+            dark_background: crate::theme::dark().get_untracked(),
+        };
+        let spawned = (self.spawn)(&launch);
+        let pane = self.next_pane.get();
+        self.next_pane.set(pane + 1);
+        let (for_title, for_size, for_exit, for_activity) = (
+            self.this.clone(),
+            self.this.clone(),
+            self.this.clone(),
+            self.this.clone(),
+        );
         let hooks = Hooks {
             title: Rc::new(move |title| {
                 if let Some(workspace) = for_title.upgrade() {
-                    let shown = if title.is_empty() { fallback.clone() } else { title.to_string() };
-                    workspace.titles.update(|titles| {
-                        titles.insert(id, shown);
-                    });
+                    workspace.set_reported_title(tab, title.to_string());
                 }
             }),
             resized: Rc::new(move |columns, rows| {
@@ -97,120 +885,359 @@ impl Workspace {
                 }
             }),
             exited: Rc::new(move |code| {
-                // 正常退出（`exit`、Ctrl-D）标签就关；出错退出留着，屏幕上有原因
+                // 正常退出（`exit`、Ctrl-D）这个终端就关（拆分出来的只关它，最后一个关标签）；出错退出留着，屏幕上有原因
                 if code == 0
                     && let Some(workspace) = for_exit.upgrade()
                 {
-                    workspace.close_tab(id);
+                    workspace.close_pane(tab, pane);
                 }
             }),
             activity: Rc::new(move || {
                 if let Some(workspace) = for_activity.upgrade()
-                    && workspace.active.get_untracked() != id
+                    && workspace.active.get_untracked() != tab
                 {
                     workspace.unseen.update(|unseen| {
-                        unseen.insert(id);
+                        unseen.insert(tab);
                     });
                 }
             }),
         };
-        let name = spawned.name.clone();
-        let session = Session::start(spawned, columns, rows, hooks);
-        self.titles.update(|titles| {
-            titles.entry(id).or_insert(name);
-        });
-        self.tabs.update(|tabs| tabs.push(Tab { id, session }));
-        self.activate(id);
+        let session = Session::start(spawned, columns, rows, hooks, self.form, history.as_deref());
+        (pane, session)
     }
 
-    /// 切到这个标签：回到终端页面，有新输出的标记清掉
+    /// 把排布放进新的标签：进标签条和侧栏的末尾
+    fn push_tab(&self, id: u64, folder: Option<u64>, layout: Pane, focus: u64) {
+        self.refresh_title(id);
+        // 信号放在不挂界面的作用域里：标签是在点击、快捷键、命令面板的处理器里开的，
+        // 记在它们的作用域上，一会儿就释放了
+        let (layout, focus) = aureole::detached(|| (signal(layout), signal(focus)));
+        self.tabs.update(|tabs| {
+            tabs.push(Tab {
+                id,
+                layout,
+                focus,
+                target: Target::Local,
+                folder,
+            })
+        });
+        self.bar.update(|bar| bar.push(id));
+    }
+
+    // ---- 拆分 ----
+
+    /// 把当前标签里聚焦的终端拆开：新终端在右边（左右分）或下边（上下分），从聚焦的那个终端现在的目录起，
+    /// 并且聚焦到它。设置页开着、没有标签时什么也不做
+    pub fn split(&self, axis: Axis) {
+        if self.settings_open.get_untracked() {
+            return;
+        }
+        let Some(tab) = self
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == self.active.get_untracked())
+        else {
+            return;
+        };
+        let directory = tab.session().working_directory();
+        let (pane, session) = self.spawn_pane(tab.id, tab.folder, directory, None);
+        let layout = tab.layout.get_untracked();
+        tab.layout
+            .set(layout.split(tab.focus.get_untracked(), axis, Pane::leaf(pane, session)));
+        tab.focus.set(pane);
+    }
+
+    /// 聚焦到标签里的这个终端（点了它）
+    pub fn focus_pane(&self, tab: u64, pane: u64) {
+        if let Some(tab) = self
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|candidate| candidate.id == tab)
+            && tab.focus.get_untracked() != pane
+        {
+            tab.focus.set(pane);
+        }
+    }
+
+    /// 关标签里的一个终端，不问。是最后一个就关整个标签
+    pub fn close_pane(&self, tab_id: u64, pane: u64) {
+        let Some(tab) = self
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == tab_id)
+        else {
+            return;
+        };
+        let layout = tab.layout.get_untracked();
+        let Some((rest, next_focus)) = layout.remove(pane) else {
+            self.close_tab(tab_id);
+            return;
+        };
+        if let Some(session) = layout.session(pane) {
+            session.close();
+        }
+        if tab.focus.get_untracked() == pane {
+            tab.focus.set(next_focus);
+        }
+        tab.layout.set(rest);
+    }
+
+    /// 要关标签里的一个终端：开了「关闭前确认」而且它前台有程序在跑时先问
+    pub fn request_close_pane(&self, tab_id: u64, pane: u64) {
+        let busy = self.form.confirm_close.get_untracked()
+            && self
+                .tabs
+                .get_untracked()
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| tab.layout.get_untracked().session(pane))
+                .is_some_and(|session| session.is_busy());
+        if busy {
+            self.closing_pane.set(Some(pane));
+            self.closing.set(Some(tab_id));
+        } else {
+            self.close_pane(tab_id, pane);
+        }
+    }
+
+    /// 确认框里点了「关闭」：关它问的那个标签（或者标签里的那个终端）
+    pub fn confirm_close(&self) {
+        let Some(tab) = self.closing.get_untracked() else {
+            return;
+        };
+        let pane = self.closing_pane.take();
+        self.closing.set(None);
+        match pane {
+            Some(pane) => self.close_pane(tab, pane),
+            None => self.close_tab(tab),
+        }
+    }
+
+    // ---- 标题 ----
+
+    /// 程序（shell、vim）设了标题：记下来；按设置决定显示不显示、用户给这个标签起过名字时不显示它
+    fn set_reported_title(&self, id: u64, title: String) {
+        self.reported_titles.borrow_mut().insert(id, title);
+        self.refresh_title(id);
+    }
+
+    /// 重新算这个标签显示什么：用户起的名字，其次（设置允许时）程序报告的标题，最后是「终端」
+    fn refresh_title(&self, id: u64) {
+        let shown = if let Some(custom) = self.custom_titles.borrow().get(&id) {
+            custom.clone()
+        } else {
+            let reported = self
+                .reported_titles
+                .borrow()
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            if self.form.title.get_untracked() == TitleSource::Reported && !reported.is_empty() {
+                reported
+            } else {
+                DEFAULT_TITLE.to_string()
+            }
+        };
+        self.titles.update(|titles| {
+            titles.insert(id, shown);
+        });
+    }
+
+    /// 给标签起名，之后程序设的标题不再改它。名字去掉首尾空白；空的就清掉自己起的名字，退回默认
+    pub fn rename_tab(&self, id: u64, name: &str) {
+        if !self.has_tab(id) {
+            return;
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            self.custom_titles.borrow_mut().remove(&id);
+        } else {
+            self.custom_titles.borrow_mut().insert(id, name.to_string());
+        }
+        self.refresh_title(id);
+    }
+
+    // ---- 切换 ----
+
+    /// 切到这个标签：回到终端页面；有新输出的标记清掉
     fn activate(&self, id: u64) {
+        self.settings_open.set(false);
+        self.show(id);
+    }
+
+    fn show(&self, id: u64) {
         self.active.set(id);
-        self.mode.set(Mode::Terminal);
         self.unseen.update(|unseen| {
             unseen.remove(&id);
         });
+        if let Some(folder) = self
+            .tabs
+            .get_untracked()
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.folder)
+        {
+            self.reveal_folder(folder);
+        }
     }
 
-    /// 关一个标签。最后一个关掉时关窗口
+    /// 打开设置页：顶上的标签条收起，侧栏换成设置的分类。当前会话不变，退出设置就回到它
+    pub fn open_settings(&self) {
+        self.settings_open.set(true);
+    }
+
+    /// 退出设置页，回到进来之前的会话（或者「没有标签」）
+    pub fn close_settings(&self) {
+        self.settings_open.set(false);
+    }
+
+    pub fn toggle_settings(&self) {
+        self.settings_open.update(|open| *open = !*open);
+    }
+
+    // ---- 关闭 ----
+
+    /// 用户要关一个标签（点关闭、⌘W、右键删除）：设置里开了「关闭前确认」而且它前台有程序在跑时先问一下，
+    /// 否则直接关
+    pub fn request_close(&self, id: u64) {
+        let busy = self.form.confirm_close.get_untracked()
+            && self
+                .tabs
+                .get_untracked()
+                .iter()
+                .find(|tab| tab.id == id)
+                .is_some_and(|tab| tab.sessions().iter().any(|session| session.is_busy()));
+        if busy {
+            self.closing_pane.set(None);
+            self.closing.set(Some(id));
+        } else {
+            self.close_tab(id);
+        }
+    }
+
+    /// 关一个标签，不问。最后一个关掉时按设置：留着空窗口，或者退出应用
     pub fn close_tab(&self, id: u64) {
         let mut tabs = self.tabs.get_untracked();
-        let Some(index) = tabs.iter().position(|tab| tab.id == id) else { return };
+        let Some(index) = tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
         let closed = tabs.remove(index);
-        closed.session.close();
+        for session in closed.sessions() {
+            session.close();
+        }
         self.unseen.update(|unseen| {
             unseen.remove(&id);
         });
-        if tabs.is_empty() {
-            if let Some(window) = self.window {
-                window.close();
+        let mut bar = self.bar.get_untracked();
+        let slot = bar.iter().position(|&shown| shown == id);
+        bar.retain(|&shown| shown != id);
+        if self.active.get_untracked() == id {
+            // 关的是当前这个：换到标签条上原来右边的那个，没有就换到左边的。一个都不剩就空着
+            if bar.is_empty() {
+                self.active.set(0);
+            } else {
+                let slot = slot.unwrap_or(0).min(bar.len() - 1);
+                self.show(bar[slot]);
             }
-        } else if self.active.get_untracked() == id {
-            // 关的是当前这个：换到原来右边的那个，没有就换到左边的
-            self.activate(tabs[index.min(tabs.len() - 1)].id);
         }
         self.titles.update(|titles| {
             titles.remove(&id);
         });
+        self.custom_titles.borrow_mut().remove(&id);
+        self.reported_titles.borrow_mut().remove(&id);
+        for prompt in [self.renaming, self.closing] {
+            if prompt.get_untracked() == Some(id) {
+                prompt.set(None);
+            }
+        }
+        let empty = tabs.is_empty();
+        self.bar.set(bar);
         self.tabs.set(tabs);
+        if empty && self.form.last_tab.get_untracked() == LastTab::Quit {
+            self.finish();
+            aureole::quit();
+        }
     }
 
+    /// ⌘W：设置页开着时是退出设置，否则关当前标签
     pub fn close_active(&self) {
-        self.close_tab(self.active.get_untracked());
+        if self.settings_open.get_untracked() {
+            self.close_settings();
+        } else {
+            let active = self.active.get_untracked();
+            let focus = self
+                .tabs
+                .get_untracked()
+                .iter()
+                .find(|tab| tab.id == active)
+                .filter(|tab| tab.layout.get_untracked().leaves().len() > 1)
+                .map(|tab| tab.focus.get_untracked());
+            match focus {
+                // 拆分过的标签：⌘W 只关聚焦的那个终端，最后一个才关标签
+                Some(pane) => self.request_close_pane(active, pane),
+                None => self.request_close(active),
+            }
+        }
     }
 
+    fn has_tab(&self, id: u64) -> bool {
+        self.tabs.get_untracked().iter().any(|tab| tab.id == id)
+    }
+
+    /// 点标签条、侧栏上的会话：切过去（设置页开着就退出设置）
     pub fn select(&self, id: u64) {
-        if self.tabs.get_untracked().iter().any(|tab| tab.id == id) {
+        if self.has_tab(id) {
             self.activate(id);
         }
     }
 
-    /// 切到第 `index` 个（0 起算）标签
+    /// 切到标签条上第 `index` 个（0 起算）标签
     fn select_index(&self, index: usize) {
-        if let Some(tab) = self.tabs.get_untracked().get(index) {
-            self.activate(tab.id);
+        if let Some(&id) = self.bar.get_untracked().get(index) {
+            self.select(id);
         }
     }
 
-    pub fn index_of(&self, id: u64) -> Option<usize> {
-        self.tabs.get_untracked().iter().position(|tab| tab.id == id)
+    /// 标签在顶部标签条上的位置
+    pub fn bar_index(&self, id: u64) -> Option<usize> {
+        self.bar
+            .get_untracked()
+            .iter()
+            .position(|&shown| shown == id)
     }
 
-    /// 把标签挪到第 `to` 个位置（拖动换位置）；已经在那里就什么也不做
+    /// 把标签挪到标签条上第 `to` 个位置（拖动换位置）；只动顶部的顺序，侧栏不变。已经在那里就什么也不做
     pub fn move_tab(&self, id: u64, to: usize) {
-        let Some(from) = self.index_of(id) else { return };
+        let Some(from) = self.bar_index(id) else {
+            return;
+        };
         if from == to {
             return;
         }
-        self.tabs.update(|tabs| {
-            let tab = tabs.remove(from);
-            tabs.insert(to.min(tabs.len()), tab);
+        self.bar.update(|bar| {
+            let moved = bar.remove(from);
+            bar.insert(to.min(bar.len()), moved);
         });
     }
 
-    /// 往右（`1`）或往左（`-1`）切一个，到头了绕回去
+    /// 按标签条的顺序往右（`1`）或往左（`-1`）切一个，到头了绕回去
     fn cycle(&self, step: isize) {
-        let tabs = self.tabs.get_untracked();
-        let active = self.active.get_untracked();
-        let Some(index) = tabs.iter().position(|tab| tab.id == active) else { return };
-        let next = (index as isize + step).rem_euclid(tabs.len() as isize) as usize;
-        self.activate(tabs[next].id);
-    }
-
-    /// 跳到第一个有新输出的标签（侧栏的「需要我」）。没有就什么也不做
-    pub fn jump_to_unseen(&self) {
-        let unseen = self.unseen.get_untracked();
-        if let Some(tab) = self.tabs.get_untracked().iter().find(|tab| unseen.contains(&tab.id)) {
-            self.activate(tab.id);
+        let bar = self.bar.get_untracked();
+        if bar.is_empty() {
+            return;
         }
+        let next = match self.bar_index(self.active.get_untracked()) {
+            Some(index) => (index as isize + step).rem_euclid(bar.len() as isize) as usize,
+            None => 0,
+        };
+        self.select(bar[next]);
     }
 
     pub fn toggle_sidebar(&self) {
         self.collapsed.update(|collapsed| *collapsed = !*collapsed);
-    }
-
-    pub fn show_monitor(&self) {
-        self.mode.set(Mode::Monitor);
     }
 
     /// 快捷键。macOS 用 ⌘，别的平台用 Ctrl+Shift（Ctrl 单独要留给 shell）。收下了返回 `true`
@@ -220,491 +1247,100 @@ impl Workspace {
             return false;
         }
         // Ctrl+Tab / Ctrl+Shift+Tab：各平台都一样
-        if modifiers.has_control() && !modifiers.has_super() && matches!(event.key, Key::Named(NamedKey::Tab)) {
+        if modifiers.has_control()
+            && !modifiers.has_super()
+            && matches!(event.key, Key::Named(NamedKey::Tab))
+        {
             self.cycle(if modifiers.has_shift() { -1 } else { 1 });
             return true;
         }
-        let command = if modifiers.has_super() { !modifiers.has_control() } else { modifiers.has_control() && modifiers.has_shift() };
+        let command = if modifiers.has_super() {
+            !modifiers.has_control()
+        } else {
+            modifiers.has_control() && modifiers.has_shift()
+        };
         if !command {
             return false;
         }
-        let Key::Character(text) = &event.base else { return false };
+        let Key::Character(text) = &event.base else {
+            return false;
+        };
         match text.as_str() {
             "t" | "T" => self.new_tab(),
             "w" | "W" => self.close_active(),
             "b" | "B" => self.toggle_sidebar(),
+            // ⌘D 左右分，⌘⇧D 上下分（iTerm 的习惯）
+            "d" | "D" => self.split(if modifiers.has_shift() {
+                Axis::Rows
+            } else {
+                Axis::Columns
+            }),
             "k" | "K" => self.palette_open.update(|open| *open = !*open),
+            "," => self.toggle_settings(),
             // ⌘⇧[ / ⌘⇧]
             "[" | "{" => self.cycle(-1),
             "]" | "}" => self.cycle(1),
             // ⌘1..⌘8 是第几个，⌘9 是最后一个（浏览器的习惯）
-            digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8") => self.select_index(digit.parse::<usize>().unwrap_or(1) - 1),
-            "9" => self.select_index(self.tabs.get_untracked().len().saturating_sub(1)),
+            digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8") => {
+                self.select_index(digit.parse::<usize>().unwrap_or(1) - 1)
+            }
+            "9" => self.select_index(self.bar.get_untracked().len().saturating_sub(1)),
             _ => return false,
         }
         true
     }
 }
 
+/// `~` 或 `~/xx` 展开成主目录；空串是 `None`
+fn expand_home(text: &str) -> Option<PathBuf> {
+    if text.is_empty() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match (text.strip_prefix('~'), home) {
+        (Some(""), Some(home)) => Some(home),
+        (Some(rest), Some(home)) if rest.starts_with('/') => {
+            Some(home.join(rest.trim_start_matches('/')))
+        }
+        _ => Some(PathBuf::from(text)),
+    }
+}
+
+thread_local! {
+    /// 退出应用时要最后存一次的工作区。这里拿着强引用：窗口一关，界面连同它拿着的工作区都释放了，
+    /// 到应用的退出钩子（窗口都关完以后才调用）就存不了终端里最后几秒的输出了
+    static EXIT: RefCell<Option<Rc<Workspace>>> = const { RefCell::new(None) };
+}
+
+/// 窗口要关了、应用要退出了：把工作区最后存一遍（当前目录、终端里的内容都是最后一刻的）。多次调用只有第一次起作用
+pub fn save_on_exit() {
+    if let Some(workspace) = EXIT.with(|slot| slot.borrow().clone()) {
+        workspace.finish();
+    }
+}
+
 /// 窗口的根视图
 pub fn root() -> Element {
     crate::native::keep_window_still_unless_asked();
-    let workspace = Workspace::new(Rc::new(crate::app::spawn_login_shell), current_window());
-    workspace.new_tab();
+    let store = Store::system();
+    let window = current_window();
+    let workspace = Workspace::new(Rc::new(crate::app::spawn), window, store.clone());
+    EXIT.with(|slot| *slot.borrow_mut() = Some(workspace.clone()));
+    if let Some(window) = window {
+        // 上次最大化着，这次也最大化（大小位置在开窗口时就定好了，见 `main`）
+        let plan = crate::display::Memory::load(&store).plan(
+            &crate::display::displays(),
+            (WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32),
+        );
+        if plan.maximized {
+            window.set_maximized(true);
+        }
+        crate::display::track(window, store);
+    }
+    workspace.restore();
+    workspace.autosave();
     chrome::build(workspace)
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use aureole::MouseButton;
-    use aureole::testing::Harness;
-
-    use super::*;
-    use crate::pty::{Pty, Recorder};
-
-    /// 不起真 shell 的工作区：每个标签一个只记录写入的假 pty
-    fn mounted() -> (Harness, Rc<Workspace>) {
-        mounted_with(aureole::TitleBarInfo {
-            height: 40.0,
-            controls: Some(Rect { x: 16.0, y: 13.0, width: 54.0, height: 14.0 }),
-            inset_left: 82.0,
-            inset_right: 0.0,
-        })
-    }
-
-    /// 用给定的标题栏度量挂（macOS 的红绿灯，或者没有系统按钮的 Windows、Linux）
-    fn mounted_with(info: aureole::TitleBarInfo) -> (Harness, Rc<Workspace>) {
-        let spawn: Rc<dyn Fn(usize, usize) -> Spawned> = Rc::new(|_, _| Spawned {
-            pty: Some(Pty::from_backend(Arc::new(Recorder::default()))),
-            queue: None,
-            error: None,
-            name: "zsh".to_string(),
-        });
-        let workspace = Workspace::new(spawn, None);
-        workspace.new_tab();
-        let harness = Harness::new(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32, chrome::build(workspace.clone()));
-        harness.set_title_bar_info(info);
-        harness.frame();
-        (harness, workspace)
-    }
-
-    fn ids(workspace: &Workspace) -> Vec<u64> {
-        workspace.tabs.get_untracked().iter().map(|tab| tab.id).collect()
-    }
-
-    fn command(harness: &Harness, key: &str) {
-        harness.key_down_with(Key::Character(key.into()), Modifiers::SUPER);
-        harness.frame();
-    }
-
-    #[test]
-    fn starts_with_one_tab_named_after_the_shell() {
-        let (harness, workspace) = mounted();
-        assert_eq!(ids(&workspace), [1]);
-        assert_eq!(workspace.active.get_untracked(), 1);
-        assert_eq!(harness.text("tab-1").as_deref(), Some("zsh"));
-        assert!(harness.bounds("grid").is_some(), "当前标签的终端要挂着");
-    }
-
-    /// ⌘T 新开一个并切过去；⌘W 关掉当前的，换到邻居
-    #[test]
-    fn command_t_and_w_open_and_close_tabs() {
-        let (harness, workspace) = mounted();
-        command(&harness, "t");
-        command(&harness, "t");
-        assert_eq!(ids(&workspace), [1, 2, 3]);
-        assert_eq!(workspace.active.get_untracked(), 3);
-        command(&harness, "w");
-        assert_eq!(ids(&workspace), [1, 2]);
-        assert_eq!(workspace.active.get_untracked(), 2, "关了最右的，换到左边的");
-        workspace.select(1);
-        command(&harness, "w");
-        assert_eq!(workspace.active.get_untracked(), 2, "关了最左的，换到右边的");
-    }
-
-    #[test]
-    fn number_keys_and_ctrl_tab_switch_tabs() {
-        let (harness, workspace) = mounted();
-        command(&harness, "t");
-        command(&harness, "t");
-        command(&harness, "1");
-        assert_eq!(workspace.active.get_untracked(), 1);
-        command(&harness, "9");
-        assert_eq!(workspace.active.get_untracked(), 3, "⌘9 是最后一个");
-        harness.key_down_with(Key::Named(NamedKey::Tab), Modifiers::CONTROL);
-        assert_eq!(workspace.active.get_untracked(), 1, "绕回第一个");
-        harness.key_down_with(Key::Named(NamedKey::Tab), Modifiers::CONTROL | Modifiers::SHIFT);
-        assert_eq!(workspace.active.get_untracked(), 3, "反方向绕回最后一个");
-    }
-
-    /// 点标签栏上的元素：新建、选中、关闭
-    #[test]
-    fn clicking_the_bar_opens_selects_and_closes() {
-        let (harness, workspace) = mounted();
-        harness.click_named("new-tab");
-        harness.frame();
-        assert_eq!(ids(&workspace), [1, 2]);
-        harness.click_named("tab-1");
-        harness.frame();
-        assert_eq!(workspace.active.get_untracked(), 1);
-        // 点关闭只关，不能顺带把那个标签选中
-        harness.click_named("close-2");
-        harness.frame();
-        assert_eq!(ids(&workspace), [1]);
-        assert_eq!(workspace.active.get_untracked(), 1);
-    }
-
-    /// shell 正常退出（退出码 0）标签自己关掉；出错退出的留着
-    #[test]
-    fn a_clean_exit_closes_the_tab_but_a_failure_keeps_it() {
-        let (_harness, workspace) = mounted();
-        workspace.new_tab();
-        let tabs = workspace.tabs.get_untracked();
-        (tabs[1].session.hooks_for_test().exited)(0);
-        assert_eq!(ids(&workspace), [1]);
-        let tab = workspace.tabs.get_untracked()[0].clone();
-        tab.session.exited_for_test(2);
-        assert_eq!(ids(&workspace), [1], "出错退出不自动关");
-    }
-
-    /// 程序设的标题显示在标签上；空标题退回 shell 的名字
-    #[test]
-    fn osc_title_shows_on_the_tab() {
-        let (harness, workspace) = mounted();
-        let session = workspace.tabs.get_untracked()[0].session.clone();
-        session.feed_for_test("\x1b]0;vim main.rs\x07");
-        harness.frame();
-        assert_eq!(harness.text("tab-1").as_deref(), Some("vim main.rs"));
-        session.feed_for_test("\x1b]0;\x07");
-        harness.frame();
-        assert_eq!(harness.text("tab-1").as_deref(), Some("zsh"));
-    }
-
-    /// 标题栏的空白处按住再动是拖动窗口；双击交给系统（缩放或最小化）
-    #[test]
-    fn empty_title_bar_space_drags_and_double_clicks_like_a_title_bar() {
-        let (harness, _workspace) = mounted();
-        // 标签后面的空白（标签最宽 200，从红绿灯右边起，到 x = 600 还是空的）
-        let (x, y) = (600.0, 10.0);
-        harness.mouse_down(x, y, MouseButton::Left);
-        harness.mouse_move(x - 20.0, y);
-        assert_eq!(harness.window_drag_count(), 1, "空白处按住再动，要交给系统去拖窗口");
-        harness.mouse_up(MouseButton::Left);
-        harness.advance(secs(1.0));
-        harness.double_click(x, y);
-        assert_eq!(harness.title_bar_double_click_count(), 1);
-    }
-
-    /// 第一个标签要从红绿灯右边开始，不能压在它们上面
-    #[test]
-    fn tabs_start_to_the_right_of_the_traffic_lights() {
-        let (harness, _workspace) = mounted();
-        let tab = harness.bounds("tab-1").expect("标签在");
-        assert!(tab.x >= 82.0, "标签从 x = {} 开始，红绿灯占到 82", tab.x);
-        let button = harness.bounds("new-tab").expect("新建按钮在");
-        assert!(button.y >= 0.0 && button.y + button.height <= 40.0, "按钮在标题栏的高度里");
-    }
-
-    /// 没有系统窗口按钮的平台自己画最小化、最大化、关闭，而且标签仍然从左边的小边距开始
-    #[test]
-    fn platforms_without_system_buttons_draw_their_own() {
-        let (harness, _workspace) = mounted_with(aureole::TitleBarInfo { height: 40.0, ..Default::default() });
-        let tab = harness.bounds("tab-1").expect("标签在");
-        assert!(tab.x < 90.0, "没有红绿灯就不用让那么多：{}", tab.x);
-        let (x, y) = (WINDOW_SIZE.0 as f32 - 20.0, 20.0);
-        harness.mouse_down(x, y, MouseButton::Left);
-        harness.mouse_move(x - 10.0, y);
-        harness.mouse_up(MouseButton::Left);
-        assert_eq!(harness.window_drag_count(), 0, "窗口按钮上按住不拖窗口");
-    }
-
-    /// 按在标签上拖不动窗口（标签自己要收点击），双击标签也不会缩放窗口
-    #[test]
-    fn tabs_do_not_drag_the_window() {
-        let (harness, _workspace) = mounted();
-        let [x, y] = harness.bounds("tab-1").expect("标签在").center();
-        harness.mouse_down(x, y, MouseButton::Left);
-        harness.mouse_move(x + 20.0, y);
-        harness.mouse_up(MouseButton::Left);
-        assert_eq!(harness.window_drag_count(), 0);
-        harness.advance(secs(1.0));
-        harness.double_click(x, y);
-        assert_eq!(harness.title_bar_double_click_count(), 0);
-    }
-
-    /// ⌘B 收起侧栏：宽度变窄，再按展开
-    #[test]
-    fn command_b_collapses_and_expands_the_sidebar() {
-        let (harness, workspace) = mounted();
-        let open = harness.bounds("sidebar").expect("侧栏在").width;
-        command(&harness, "b");
-        harness.advance(secs(1.0));
-        assert!(workspace.collapsed.get_untracked());
-        let closed = harness.bounds("sidebar").expect("侧栏在").width;
-        assert!(closed < open / 2.0, "收起后只剩图标：{open} → {closed}");
-        harness.click_named("toggle-sidebar");
-        harness.advance(secs(1.0));
-        assert!(!workspace.collapsed.get_untracked());
-        assert!(harness.bounds("sidebar").expect("侧栏在").width > closed * 2.0);
-    }
-
-    /// 标签的尺寸：宽 80、离展开按钮 8px；关闭按钮离上、右、下都是 4px
-    #[test]
-    fn tab_geometry_is_tight_and_the_close_button_is_evenly_inset() {
-        let (harness, _workspace) = mounted();
-        let toggle = harness.bounds("toggle-sidebar").expect("按钮在");
-        let tab = harness.bounds("tab-1").expect("标签在");
-        let close = harness.bounds("close-1").expect("关闭按钮在");
-        assert!((tab.x - (toggle.x + toggle.width) - 8.0).abs() < 0.5, "标签离按钮 {}", tab.x - (toggle.x + toggle.width));
-        assert!((tab.width - 80.0).abs() < 0.5, "标签宽 {}", tab.width);
-        let (top, right, bottom) = (close.y - tab.y, tab.x + tab.width - (close.x + close.width), tab.y + tab.height - (close.y + close.height));
-        assert!((top - 4.0).abs() < 0.5 && (right - 4.0).abs() < 0.5 && (bottom - 4.0).abs() < 0.5, "关闭按钮的边距：上 {top} 右 {right} 下 {bottom}");
-    }
-
-    /// 按住标签向右拖过相邻的标签就换位，拖回去换回来；被拖的标签被选中
-    #[test]
-    fn dragging_a_tab_reorders_it() {
-        let (harness, workspace) = mounted();
-        workspace.new_tab();
-        workspace.new_tab();
-        harness.frame();
-        assert_eq!(ids(&workspace), [1, 2, 3]);
-        let [x, y] = harness.bounds("tab-1").expect("标签在").center();
-        harness.mouse_down(x, y, MouseButton::Left);
-        harness.mouse_move(x + 30.0, y);
-        harness.mouse_move(x + 90.0, y);
-        harness.mouse_up(MouseButton::Left);
-        harness.frame();
-        assert_eq!(ids(&workspace), [2, 1, 3], "向右拖了一格多");
-        assert_eq!(workspace.active.get_untracked(), 1, "被拖的标签被选中");
-        assert_eq!(harness.window_drag_count(), 0);
-        harness.advance(secs(1.0));
-        let [x, y] = harness.bounds("tab-1").expect("标签在").center();
-        harness.mouse_down(x, y, MouseButton::Left);
-        harness.mouse_move(x - 30.0, y);
-        harness.mouse_move(x - 90.0, y);
-        harness.mouse_up(MouseButton::Left);
-        harness.frame();
-        assert_eq!(ids(&workspace), [1, 2, 3], "往回拖换回来");
-    }
-
-
-    /// 拖到标签条的两头再往外拖：被拖的标签停在头尾的格子里，不被标签条裁掉
-    #[test]
-    fn a_dragged_tab_stays_visible_at_both_ends() {
-        let (harness, workspace) = mounted();
-        workspace.new_tab();
-        workspace.new_tab();
-        harness.frame();
-        harness.advance(secs(1.0));
-        let [x, y] = harness.bounds("tab-2").expect("标签在").center();
-        harness.mouse_down(x, y, MouseButton::Left);
-        // 选中的标签是白底：数它在标签这一行上有多少白色像素
-        let white_width = |harness: &Harness| {
-            let shot = harness.screenshot();
-            let row = (harness.bounds("tab-2").expect("标签在").y + 8.0) as u32;
-            (0..shot.width.min(600)).filter(|&px| shot.pixel(px, row).0[..3].iter().all(|&c| c > 250)).count()
-        };
-        for far in [200.0, -300.0] {
-            for step in 1..=20 {
-                harness.mouse_move(x + far * step as f32 / 20.0, y);
-                harness.advance(ms(16));
-            }
-            assert!(white_width(&harness) >= 70, "拖到 {far} 以外，标签被裁掉了：{}", white_width(&harness));
-        }
-        harness.mouse_up(MouseButton::Left);
-    }
-
-    /// 标签多到放不下：标签保持 80 宽、滚动着看，竖向滚轮翻成横向；最右边仍留着空白可以拖窗口
-    #[test]
-    fn many_tabs_scroll_and_a_drag_area_stays_on_the_right() {
-        let (harness, workspace) = mounted();
-        for _ in 0..14 {
-            workspace.new_tab();
-        }
-        harness.frame();
-        harness.advance(secs(1.0));
-        let tab = harness.bounds("tab-1").expect("标签在");
-        assert!((tab.width - 80.0).abs() < 0.5, "标签挤满了也不压窄：{}", tab.width);
-        let plus = harness.bounds("new-tab").expect("新建按钮在");
-        assert!(plus.x + plus.width + 64.0 <= WINDOW_SIZE.0 as f32, "新建按钮右边 {} 后面要给拖动区留 64", plus.x + plus.width);
-        // 最后一个标签是当前的，已经滚到看得见
-        let last = harness.window_bounds("tab-15").expect("最后的标签在");
-        assert!(last.x >= 0.0 && last.x + last.width <= plus.x + 0.5, "当前标签滚进视口：{last:?}");
-        // 竖向滚轮向上（往回）：标签往右走
-        harness.wheel(300.0, 20.0, 0.0, -5.0);
-        harness.advance(secs(1.0));
-        let moved = harness.window_bounds("tab-15").expect("最后的标签在");
-        assert!(moved.x > last.x + 20.0, "滚轮把标签翻回去了：{} → {}", last.x, moved.x);
-        // 右边的空白拖动窗口
-        let (x, y) = (plus.x + plus.width + 20.0, 10.0);
-        harness.mouse_down(x, y, MouseButton::Left);
-        harness.mouse_move(x - 10.0, y);
-        assert_eq!(harness.window_drag_count(), 1, "新建按钮后面的空白能拖窗口");
-        harness.mouse_up(MouseButton::Left);
-    }
-
-    /// 会话多到侧栏放不下：中间一段滚动，每一行保持原来的高度，不被挤扁，顶上的开关也不动
-    #[test]
-    fn many_sessions_scroll_in_the_sidebar_instead_of_squeezing() {
-        let (harness, workspace) = mounted();
-        let before = (harness.bounds("nav-new").expect("在").height, harness.bounds("session-1").expect("在").height, harness.bounds("mode-terminal").expect("在").height);
-        for _ in 0..30 {
-            workspace.new_tab();
-        }
-        harness.frame();
-        harness.advance(secs(1.0));
-        let after = (harness.bounds("nav-new").expect("在").height, harness.bounds("session-1").expect("在").height, harness.bounds("mode-terminal").expect("在").height);
-        assert_eq!(before, after, "行高不变");
-        let sidebar = harness.bounds("sidebar").expect("在");
-        let last = harness.window_bounds("session-31").expect("最后一个会话在");
-        assert!(last.y + last.height <= sidebar.y + sidebar.height + 0.5, "当前会话滚进了侧栏：{last:?}");
-        // 滚轮能滚到最前面的行
-        harness.wheel(60.0, 300.0, 0.0, -80.0);
-        harness.advance(secs(1.0));
-        let first = harness.window_bounds("nav-new").expect("在");
-        assert!(first.y >= sidebar.y && first.y + first.height <= sidebar.y + sidebar.height, "滚回顶上：{first:?}");
-    }
-
-    /// 侧栏和卡片的交界处：指针变成左右箭头，按住左右拖改侧栏宽度，有上下限；收起时没有拖动条
-    #[test]
-    fn dragging_the_sidebar_edge_resizes_it() {
-        let (harness, workspace) = mounted();
-        // 拖动条在侧栏右边缘里面 4 像素的地方
-        let width = harness.bounds("sidebar").expect("侧栏在").width;
-        let edge = width - 4.0;
-        harness.mouse_move(edge, 300.0);
-        assert_eq!(harness.cursor(), Cursor::ResizeHorizontal);
-        harness.mouse_down(edge, 300.0, MouseButton::Left);
-        harness.mouse_move(edge + 60.0, 300.0);
-        harness.mouse_up(MouseButton::Left);
-        harness.frame();
-        assert!((workspace.sidebar_width.get_untracked() - (width + 60.0)).abs() < 1.0, "宽度跟着指针走：{}", workspace.sidebar_width.get_untracked());
-        assert_eq!(harness.window_drag_count(), 0, "拖动条上不能拖窗口");
-        harness.mouse_down(edge + 60.0, 300.0, MouseButton::Left);
-        harness.mouse_move(2000.0, 300.0);
-        harness.mouse_up(MouseButton::Left);
-        assert!(workspace.sidebar_width.get_untracked() <= 360.0, "有上限");
-        harness.mouse_down(workspace.sidebar_width.get_untracked() - 4.0, 300.0, MouseButton::Left);
-        harness.mouse_move(0.0, 300.0);
-        harness.mouse_up(MouseButton::Left);
-        assert!(workspace.sidebar_width.get_untracked() >= 176.0, "有下限");
-        command(&harness, "b");
-        harness.advance(secs(1.0));
-        assert!(harness.bounds("sidebar-resize").is_none(), "收起时没有拖动条");
-    }
-
-    /// 后台标签有了新输出：「需要我」亮起来，点它跳过去，标记清掉；前台标签的输出不算
-    #[test]
-    fn background_output_marks_the_tab_and_needs_me_jumps_to_it() {
-        let (harness, workspace) = mounted();
-        workspace.new_tab();
-        let tabs = workspace.tabs.get_untracked();
-        (tabs[1].session.hooks_for_test().activity)();
-        assert!(workspace.unseen.get_untracked().is_empty(), "前台标签的输出不算");
-        (tabs[0].session.hooks_for_test().activity)();
-        assert_eq!(workspace.unseen.get_untracked().len(), 1);
-        harness.frame();
-        harness.click_named("needs-me");
-        harness.frame();
-        assert_eq!(workspace.active.get_untracked(), 1);
-        assert!(workspace.unseen.get_untracked().is_empty());
-    }
-
-    /// ⌘K 打开命令面板，点命令执行并关掉面板
-    #[test]
-    fn command_k_opens_the_palette_and_a_command_runs() {
-        let (harness, workspace) = mounted();
-        command(&harness, "k");
-        assert!(workspace.palette_open.get_untracked());
-        // 浮层里的元素，边界是浮层自己的坐标；面板放在窗口正中，换算成窗口坐标再点
-        let panel = harness.bounds("palette").expect("面板在");
-        let row = harness.bounds("cmd-new-tab").expect("命令在");
-        let origin = ((WINDOW_SIZE.0 as f32 - panel.width) / 2.0, (WINDOW_SIZE.1 as f32 - panel.height) / 2.0);
-        let [x, y] = row.center();
-        harness.click(origin.0 + x, origin.1 + y);
-        harness.frame();
-        assert_eq!(ids(&workspace), [1, 2]);
-        assert!(!workspace.palette_open.get_untracked());
-    }
-
-    /// 监控页是占位：点侧栏的开关切过去，点标签切回终端
-    #[test]
-    fn the_monitor_page_is_a_placeholder_and_tabs_bring_the_terminal_back() {
-        let (harness, workspace) = mounted();
-        harness.click_named("mode-monitor");
-        harness.frame();
-        assert_eq!(workspace.mode.get_untracked(), Mode::Monitor);
-        assert!(harness.bounds("grid").is_none(), "监控页里没有终端");
-        harness.click_named("tab-1");
-        harness.frame();
-        assert_eq!(workspace.mode.get_untracked(), Mode::Terminal);
-        assert!(harness.bounds("grid").is_some());
-    }
-
-    /// 窗口缩小：卡片和终端要跟着缩进窗口里（以前内容把卡片撑出了窗口，右边和下边都看不到），行列数跟着变少
-    #[test]
-    fn shrinking_the_window_keeps_the_card_and_terminal_inside() {
-        let (harness, workspace) = mounted();
-        let (columns, rows) = workspace.size.get_untracked();
-        harness.resize(720.0, 460.0);
-        harness.frame();
-        harness.advance(secs(1.0));
-        let card = harness.bounds("card").expect("卡片在");
-        assert!(card.x + card.width <= 720.0 + 0.5, "卡片右边 {} 超出窗口 720", card.x + card.width);
-        assert!(card.y + card.height <= 460.0 + 0.5, "卡片下边 {} 超出窗口 460", card.y + card.height);
-        let grid = harness.bounds("grid").expect("终端在");
-        assert!(grid.x + grid.width <= card.x + card.width + 0.5 && grid.y + grid.height <= card.y + card.height + 0.5, "终端要在卡片里面");
-        let (new_columns, new_rows) = workspace.size.get_untracked();
-        assert!(new_columns < columns && new_rows < rows, "行列数跟着变少：{columns}×{rows} → {new_columns}×{new_rows}");
-    }
-
-    /// 收起侧栏：不能露出快捷键提示，宽度窄到只放得下图标
-    #[test]
-    fn collapsed_sidebar_shows_only_icons() {
-        let (harness, workspace) = mounted();
-        let shown = |harness: &Harness| format!("{:?}", harness.element_tree());
-        assert!(shown(&harness).contains("⌘T") && shown(&harness).contains("⌘K"), "展开时有快捷键提示");
-        command(&harness, "b");
-        harness.advance(secs(1.0));
-        let collapsed = shown(&harness);
-        assert!(!collapsed.contains("⌘T") && !collapsed.contains("⌘K"), "收起后快捷键提示不能露出来");
-        assert!(!collapsed.contains("新建会话") || harness.text("nav-new").as_deref().unwrap_or("").is_empty(), "收起后文字也不留");
-        let sidebar = harness.bounds("sidebar").expect("侧栏在").width;
-        assert!(sidebar <= 50.0, "收起后的宽度 {sidebar}，只放图标不用这么宽");
-        // 后台有新输出时，收起后「需要我」也要看得出来（一个小点），不能因为文字没了就没有提示
-        workspace.new_tab();
-        (workspace.tabs.get_untracked()[0].session.hooks_for_test().activity)();
-        harness.frame();
-        assert_eq!(workspace.unseen.get_untracked().len(), 1);
-    }
-
-    /// 评审界面用：把几种状态存成 PNG。平时不跑；
-    /// `UI_SHOTS=目录 cargo test screenshots_for_review -- --ignored` 出图（离屏渲染，没有系统材质）
-    #[test]
-    #[ignore = "出图用，不是检查"]
-    fn screenshots_for_review() {
-        let Ok(directory) = std::env::var("UI_SHOTS") else { return };
-        let directory = std::path::PathBuf::from(directory);
-        let save = |harness: &Harness, name: &str| {
-            harness.advance(secs(1.0));
-            harness.screenshot().save_png(directory.join(name)).expect("存得下 PNG");
-        };
-        let (harness, workspace) = mounted();
-        harness.set_scale_factor(2.0);
-        workspace.new_tab();
-        workspace.tabs.get_untracked()[0].session.feed_for_test("\x1b[32mlicha\x1b[0m \x1b[34m~/终端\x1b[0m % cargo test\r\nrunning 77 tests\r\ntest result: \x1b[32mok\x1b[0m. 77 passed\r\n");
-        (workspace.tabs.get_untracked()[0].session.hooks_for_test().activity)();
-        save(&harness, "1-expanded.png");
-        command(&harness, "b");
-        save(&harness, "2-collapsed.png");
-        command(&harness, "b");
-        harness.resize(720.0, 460.0);
-        save(&harness, "3-smallest.png");
-        harness.resize(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32);
-        command(&harness, "k");
-        save(&harness, "4-palette.png");
-    }
-}
+mod tests;

@@ -1,0 +1,174 @@
+//! 命令面板（⌘K）：搜索会话和命令。
+
+use std::rc::Rc;
+
+use aureole::prelude::*;
+
+use crate::chrome::widgets::{pop, soft};
+use crate::icons::{Icon, icon};
+use crate::tabs::Workspace;
+use crate::theme::{card_bg, fg, hover, line, popup_shadow, text_2, text_3};
+
+/// 面板里的一条命令
+#[derive(Clone)]
+struct Command {
+    id: String,
+    label: String,
+    hint: &'static str,
+    run: Rc<dyn Fn()>,
+}
+
+fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
+    let command = |id: &str, label: &str, hint: &'static str, run: Rc<dyn Fn()>| Command {
+        id: id.to_string(),
+        label: label.to_string(),
+        hint,
+        run,
+    };
+    let (new_tab, close, toggle, settings, choose, columns, rows) = (
+        workspace.clone(),
+        workspace.clone(),
+        workspace.clone(),
+        workspace.clone(),
+        workspace.clone(),
+        workspace.clone(),
+        workspace.clone(),
+    );
+    let mut list = vec![
+        command(
+            "cmd-new-tab",
+            "新建会话",
+            "⌘T",
+            Rc::new(move || new_tab.new_tab()),
+        ),
+        command(
+            "cmd-close-tab",
+            "关闭当前会话",
+            "⌘W",
+            Rc::new(move || close.close_active()),
+        ),
+        command(
+            "cmd-toggle-sidebar",
+            "收起或展开侧栏",
+            "⌘B",
+            Rc::new(move || toggle.toggle_sidebar()),
+        ),
+        command(
+            "cmd-split-columns",
+            "左右分屏",
+            "⌘D",
+            Rc::new(move || columns.split(crate::pane::Axis::Columns)),
+        ),
+        command(
+            "cmd-split-rows",
+            "上下分屏",
+            "⌘⇧D",
+            Rc::new(move || rows.split(crate::pane::Axis::Rows)),
+        ),
+        command(
+            "cmd-choose-directory",
+            "选择目录…",
+            "",
+            Rc::new(move || choose.choose_directory()),
+        ),
+        command(
+            "cmd-settings",
+            "打开设置",
+            "⌘,",
+            Rc::new(move || settings.open_settings()),
+        ),
+    ];
+    let titles = workspace.titles.get_untracked();
+    for tab in workspace.tabs.get_untracked() {
+        let select = workspace.clone();
+        let title = titles.get(&tab.id).cloned().unwrap_or_default();
+        list.push(command(
+            &format!("cmd-session-{}", tab.id),
+            &format!("切换到会话：{title}"),
+            "",
+            Rc::new(move || select.select(tab.id)),
+        ));
+    }
+    list
+}
+
+/// 命令面板：搜索框加一列命令，打字过滤，回车执行第一条，点哪条执行哪条
+pub(super) fn view(workspace: Rc<Workspace>) -> Element {
+    let query = signal(String::new());
+    let all = commands(&workspace);
+    let filter = {
+        let all = all.clone();
+        move || {
+            let typed = query.get();
+            let needle = typed.to_lowercase();
+            all.iter()
+                .filter(|command| {
+                    needle.is_empty() || command.label.to_lowercase().contains(&needle)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        }
+    };
+    let (first, owner) = (filter.clone(), workspace.clone());
+    let open = workspace.palette_open;
+    pop(column()
+        .name("palette")
+        .width(560)
+        .radius(10)
+        .background(card_bg())
+        .shadow(popup_shadow())
+        .child(
+            row()
+                .align(Align::Center)
+                .gap(10)
+                .padding_x(16)
+                .padding_y(10)
+                .color(text_2())
+                .child(icon(Icon::Search, 17.0))
+                .child(
+                    text_field(query)
+                        .placeholder("搜索命令和会话…")
+                        .grow(1)
+                        // 框和焦点环都去掉：整块面板就是输入区，不要再套一层框
+                        .background(Color::TRANSPARENT)
+                        .border(0, Color::TRANSPARENT)
+                        .focus_ring(FocusRing::NONE)
+                        .font_size(15)
+                        .on_submit(move |_| {
+                            if let Some(command) = first().first() {
+                                (command.run)();
+                            }
+                            open.set(false);
+                        }),
+                ),
+        )
+        .child(rect().height(1).background(line()))
+        .child(column().padding(6).gap(2).each(
+            filter,
+            |command| format!("{}|{}", command.id, command.label),
+            move |command| {
+                let owner = owner.clone();
+                row()
+                    .name(command.id.clone())
+                    .style(&palette_row_style())
+                    .align(Align::Center)
+                    .on_click(move || {
+                        (command.run)();
+                        owner.palette_open.set(false);
+                    })
+                    .child(text(command.label.clone()).grow(1).max_lines(1))
+                    .child(text(command.hint).font_size(11).color(text_3()))
+            },
+        )))
+}
+
+fn palette_row_style() -> Style {
+    soft(
+        Style::new()
+            .height(34)
+            .padding_x(12)
+            .radius(6)
+            .color(fg())
+            .hovered(|s| s.background(hover())),
+    )
+}

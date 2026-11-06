@@ -6,6 +6,7 @@ use std::ffi::{CString, c_char, c_int};
 use std::io::{self, ErrorKind};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -19,10 +20,7 @@ const ENVIRONMENT: &[(&str, &str)] = &[
     // 仿真层按 xterm 的口径实现，报这个 shell 才会发 256 色和真彩
     ("TERM", "xterm-256color"),
     ("COLORTERM", "truecolor"),
-    ("TERM_PROGRAM", "aureole-terminal"),
-    // 白底黑字（`前景;背景` 的色号）。vim、bat 这类程序靠它猜背景深浅，不给就当深色背景，
-    // 配出浅色的字落在白底上。主题的底色在 `view` 里，换底色时这里要跟着改
-    ("COLORFGBG", "0;15"),
+    ("TERM_PROGRAM", "Nimbus"),
 ];
 
 /// 从 Finder / Dock 启动的应用没有 `LANG`，shell 会退回 C 语言环境：中文显示成问号、
@@ -82,28 +80,101 @@ impl Drop for Session {
 
 impl PtyBackend for Session {
     fn write(&self, bytes: &[u8]) -> io::Result<()> {
-        let sender = self.writes.lock().map_err(|_| io::Error::other("写入线程的状态锁坏了"))?;
-        sender.send(bytes.to_vec()).map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "写入线程已经退出"))
+        let sender = self
+            .writes
+            .lock()
+            .map_err(|_| io::Error::other("写入线程的状态锁坏了"))?;
+        sender
+            .send(bytes.to_vec())
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "写入线程已经退出"))
     }
 
     fn resize(&self, columns: u16, rows: u16) {
-        let size = libc::winsize { ws_row: rows, ws_col: columns, ws_xpixel: 0, ws_ypixel: 0 };
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         // SAFETY: `fd` 是还开着的 pty 主端，`size` 是栈上的 `winsize`，请求号 `TIOCSWINSZ` 说明带的就是它。
         // 改不动就算了（子进程可能正好退出）：行列对不上比崩掉好，这里也没有能报告给它的地方
         let _failed = unsafe { libc::ioctl(self.master.fd, libc::TIOCSWINSZ, &size) };
     }
+
+    fn working_directory(&self) -> Option<PathBuf> {
+        if self.exited.load(Ordering::Acquire) {
+            return None;
+        }
+        directory_of(self.process_id)
+    }
+
+    fn is_busy(&self) -> bool {
+        if self.exited.load(Ordering::Acquire) {
+            return false;
+        }
+        // SAFETY: `fd` 是还开着的 pty 主端（`Session` 持有 `Arc<Master>`）；`tcgetpgrp` 只读，出错返回 -1
+        let foreground = unsafe { libc::tcgetpgrp(self.master.fd) };
+        // shell 是自己这个会话的首进程，进程组号就是它的 pid；前台换成别的组就是有程序在跑
+        foreground > 0 && foreground != self.process_id
+    }
+}
+
+/// 进程当前所在的目录（macOS 用 `proc_pidinfo`）
+#[cfg(target_os = "macos")]
+fn directory_of(process_id: c_int) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+
+    // SAFETY: `proc_vnodepathinfo` 是纯数据的 C 结构，全零是合法的初始值
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as c_int;
+    // SAFETY: 缓冲是栈上的 `info`，长度就是它的大小；内核最多写这么多
+    let written = unsafe {
+        libc::proc_pidinfo(
+            process_id,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: `vip_path` 是连续的 32 × 32 = 1024 字节（`MAXPATHLEN`），在 `info` 里面，`info` 比这个切片活得久
+    let bytes =
+        unsafe { std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast::<u8>(), 1024) };
+    let end = bytes.iter().position(|&byte| byte == 0)?;
+    (end > 0).then(|| PathBuf::from(OsStr::from_bytes(&bytes[..end])))
+}
+
+#[cfg(target_os = "linux")]
+fn directory_of(process_id: c_int) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{process_id}/cwd")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn directory_of(_process_id: c_int) -> Option<PathBuf> {
+    None
 }
 
 /// 起一个 pty 子进程，返回句柄和读字节的队列
 pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
-    let program = CString::new(config.program).map_err(|_| io::Error::new(ErrorKind::InvalidInput, "程序名里有 0 字节"))?;
+    let program = CString::new(config.program)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "程序名里有 0 字节"))?;
     let mut arguments = vec![program.clone()];
     for argument in &config.arguments {
-        arguments.push(CString::new(argument.as_str()).map_err(|_| io::Error::new(ErrorKind::InvalidInput, "参数里有 0 字节"))?);
+        arguments.push(
+            CString::new(argument.as_str())
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "参数里有 0 字节"))?,
+        );
     }
     // `execvp` 要的是以 `null` 结尾的指针数组。`arguments` 那些 `CString` 一直活到函数结束，
     // 指针在 `fork` 之后、`exec` 之前这段路上才不会失效
-    let argv: Vec<*const c_char> = arguments.iter().map(|argument| argument.as_ptr()).chain(std::iter::once(ptr::null())).collect();
+    let argv: Vec<*const c_char> = arguments
+        .iter()
+        .map(|argument| argument.as_ptr())
+        .chain(std::iter::once(ptr::null()))
+        .collect();
     let directory = config
         .working_directory
         .as_ref()
@@ -111,19 +182,41 @@ pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
         .transpose()
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "目录名里有 0 字节"))?;
     // `fork` 之后不再分配内存，所以所有字符串现在就备好
+    // 白底黑字是 `0;15`，深底浅字是 `15;0`（`前景;背景` 的色号）。vim、bat 这类程序靠它猜背景深浅，
+    // 不给就当深色背景，配出浅色的字落在白底上
+    let color_hint = (
+        "COLORFGBG",
+        if config.dark_background {
+            "15;0"
+        } else {
+            "0;15"
+        },
+    );
     let variables: Vec<(CString, CString)> = ENVIRONMENT
         .iter()
         .copied()
+        .chain(std::iter::once(color_hint))
         .chain(locale_fallback())
-        .map(|(name, value)| (CString::new(name).unwrap_or_default(), CString::new(value).unwrap_or_default()))
+        .map(|(name, value)| {
+            (
+                CString::new(name).unwrap_or_default(),
+                CString::new(value).unwrap_or_default(),
+            )
+        })
         .collect();
 
     let (queue, producer) = ByteQueue::pair();
     let mut master: RawFd = -1;
-    let mut size = libc::winsize { ws_row: config.rows, ws_col: config.columns, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut size = libc::winsize {
+        ws_row: config.rows,
+        ws_col: config.columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     // SAFETY: 四个参数分别指向：放主端描述符的变量、`null`（不要终端文件名，终端属性用内核默认的）、
     // 窗口大小。子进程不会从这一行返回（要么 `exec` 换掉地址空间，要么 `_exit`）
-    let process_id = unsafe { libc::forkpty(&mut master, ptr::null_mut(), ptr::null_mut(), &mut size) };
+    let process_id =
+        unsafe { libc::forkpty(&mut master, ptr::null_mut(), ptr::null_mut(), &mut size) };
     match process_id {
         -1 => Err(io::Error::last_os_error()),
         0 => child(&argv, &variables, directory.as_ref()),
@@ -133,14 +226,23 @@ pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
             let exited = Arc::new(AtomicBool::new(false));
             start_writer(master.clone(), receiver);
             start_reader(master.clone(), producer, pid, exited.clone());
-            let session = Arc::new(Session { master, writes: Mutex::new(sender), process_id: pid, exited });
+            let session = Arc::new(Session {
+                master,
+                writes: Mutex::new(sender),
+                process_id: pid,
+                exited,
+            });
             Ok((Pty { backend: session }, queue))
         }
     }
 }
 
 /// 子进程这条路不返回：换目录、设环境变量、变成 shell
-fn child(arguments: &[*const c_char], variables: &[(CString, CString)], directory: Option<&CString>) -> ! {
+fn child(
+    arguments: &[*const c_char],
+    variables: &[(CString, CString)],
+    directory: Option<&CString>,
+) -> ! {
     // 行编辑（回车前的退格、方向键）按字符而不是按字节删：内核的终端驱动要知道这是 UTF-8
     // SAFETY: 标准输入此刻就是 `forkpty` 给子进程接好的从端；`termios` 是栈上的结构，`tcgetattr` 填满它才用
     unsafe {
@@ -173,7 +275,12 @@ fn child(arguments: &[*const c_char], variables: &[(CString, CString)], director
 }
 
 /// 读的一端：一直堵在 `read` 上，读到多少就交给主线程多少
-fn start_reader(master: Arc<Master>, producer: Producer, process_id: c_int, exited: Arc<AtomicBool>) {
+fn start_reader(
+    master: Arc<Master>,
+    producer: Producer,
+    process_id: c_int,
+    exited: Arc<AtomicBool>,
+) {
     std::thread::Builder::new()
         .name("pty 读取".to_string())
         .spawn(move || {
@@ -181,7 +288,8 @@ fn start_reader(master: Arc<Master>, producer: Producer, process_id: c_int, exit
             loop {
                 // SAFETY: `fd` 被这一轮循环手里的 `Arc` 保持着打开；
                 // 缓冲是自己拥有的 `Vec`，长度写的就是它的容量
-                let read = unsafe { libc::read(master.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+                let read =
+                    unsafe { libc::read(master.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
                 match read {
                     0 => break,
                     n if n > 0 => {
@@ -254,7 +362,14 @@ mod tests {
 
     /// 起 `/bin/sh -c 脚本`，80 × 24
     fn sh(script: &str) -> Config {
-        Config { program: "/bin/sh".to_string(), arguments: vec!["-c".to_string(), script.to_string()], columns: 80, rows: 24, working_directory: None }
+        Config {
+            program: "/bin/sh".to_string(),
+            arguments: vec!["-c".to_string(), script.to_string()],
+            columns: 80,
+            rows: 24,
+            working_directory: None,
+            dark_background: false,
+        }
     }
 
     /// 读队列，直到子进程退出（带退出码），或者读到的文字里出现了 `until`（退出码是 `None`）。
@@ -271,9 +386,15 @@ mod tests {
                         return (text.into_owned(), None);
                     }
                 }
-                Some(Chunk::Closed(code)) => return (String::from_utf8_lossy(&output).into_owned(), Some(code)),
+                Some(Chunk::Closed(code)) => {
+                    return (String::from_utf8_lossy(&output).into_owned(), Some(code));
+                }
                 None => {
-                    assert!(Instant::now() < deadline, "等了 10 秒，到现在读到的是 {:?}", String::from_utf8_lossy(&output));
+                    assert!(
+                        Instant::now() < deadline,
+                        "等了 10 秒，到现在读到的是 {:?}",
+                        String::from_utf8_lossy(&output)
+                    );
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
@@ -283,7 +404,10 @@ mod tests {
     /// 读到子进程退出：全部输出和退出码
     fn drain(queue: &ByteQueue) -> (String, i32) {
         let (output, code) = collect(queue, None);
-        (output, code.expect("没有等待的内容时，只会因为子进程退出而返回"))
+        (
+            output,
+            code.expect("没有等待的内容时，只会因为子进程退出而返回"),
+        )
     }
 
     #[test]
@@ -304,7 +428,14 @@ mod tests {
     /// `exec` 失败（程序不存在）：子进程用 127 退出，不能带着父进程的状态继续跑
     #[test]
     fn a_missing_program_exits_with_127() {
-        let config = Config { program: "/nonexistent/shell".to_string(), arguments: Vec::new(), columns: 80, rows: 24, working_directory: None };
+        let config = Config {
+            program: "/nonexistent/shell".to_string(),
+            arguments: Vec::new(),
+            columns: 80,
+            rows: 24,
+            working_directory: None,
+            dark_background: false,
+        };
         let (_pty, queue) = spawn(config).expect("fork 本身是成功的");
         assert_eq!(drain(&queue).1, 127);
     }
@@ -324,9 +455,13 @@ mod tests {
 
     #[test]
     fn the_child_gets_the_terminal_environment() {
-        let (_pty, queue) = spawn(sh("echo \"$TERM|$COLORTERM|$COLORFGBG|$TERM_PROGRAM\"")).expect("起得来");
+        let (_pty, queue) =
+            spawn(sh("echo \"$TERM|$COLORTERM|$COLORFGBG|$TERM_PROGRAM\"")).expect("起得来");
         let (output, _) = drain(&queue);
-        assert!(output.contains("xterm-256color|truecolor|0;15|aureole-terminal"), "{output:?}");
+        assert!(
+            output.contains("xterm-256color|truecolor|0;15|Nimbus"),
+            "{output:?}"
+        );
     }
 
     /// 测试进程自己在项目目录里，所以子进程报出 `/` 就说明 `chdir` 生效了
@@ -344,5 +479,57 @@ mod tests {
         let (pty, queue) = spawn(sh("exec sleep 30")).expect("起得来");
         drop(pty);
         assert_eq!(drain(&queue).1, 128 + 1);
+    }
+
+    /// 反复问，直到 `done` 成立或者等了 5 秒
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        done()
+    }
+
+    /// 问得到 shell 现在在哪个目录：起始目录，以及 `cd` 之后的新目录
+    #[test]
+    fn the_working_directory_follows_the_shell() {
+        let mut config = sh("read line; cd /; read line");
+        config.working_directory = Some(PathBuf::from("/usr"));
+        let (pty, _queue) = spawn(config).expect("起得来");
+        assert!(
+            wait_until(|| pty.backend.working_directory() == Some(PathBuf::from("/usr"))),
+            "起始目录：{:?}",
+            pty.backend.working_directory()
+        );
+        pty.write(b"go\n").expect("写得进去");
+        assert!(
+            wait_until(|| pty.backend.working_directory() == Some(PathBuf::from("/"))),
+            "cd 之后：{:?}",
+            pty.backend.working_directory()
+        );
+    }
+
+    /// 前台有程序在跑才算忙：shell 在等输入时不忙，`sleep` 跑着时忙，Ctrl-C 之后又不忙
+    #[test]
+    fn busy_means_a_program_other_than_the_shell_is_in_the_foreground() {
+        let config = Config {
+            program: "/bin/sh".to_string(),
+            arguments: vec!["-i".to_string()],
+            columns: 80,
+            rows: 24,
+            working_directory: None,
+            dark_background: false,
+        };
+        let (pty, _queue) = spawn(config).expect("起得来");
+        // 交互式 shell 才有作业控制，前台进程组才会换成 sleep 的
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!pty.backend.is_busy(), "等输入时不忙");
+        pty.write(b"sleep 30\n").expect("写得进去");
+        assert!(wait_until(|| pty.backend.is_busy()), "sleep 跑着时忙");
+        pty.write(b"\x03").expect("写得进去");
+        assert!(wait_until(|| !pty.backend.is_busy()), "Ctrl-C 之后不忙");
     }
 }

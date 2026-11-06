@@ -47,7 +47,9 @@ struct Shared {
 impl Shared {
     /// 锁坏了（别的线程在持锁时 panic）也照样用里面的数据：队列的状态每一步都是自洽的
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -65,7 +67,11 @@ impl Producer {
             if let Chunk::Bytes(bytes) = &chunk {
                 // 单块比上限还大也放行（上限是「已经攒了这么多就别再塞」，不是单块大小）
                 while state.queued >= MAX_QUEUED && !state.abandoned && !state.closed {
-                    state = self.shared.space.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state = self
+                        .shared
+                        .space
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
                 if state.closed {
                     return !state.abandoned;
@@ -95,9 +101,23 @@ pub struct ByteQueue {
 
 impl ByteQueue {
     pub fn pair() -> (Self, Producer) {
-        let state = State { chunks: VecDeque::new(), queued: 0, waker: None, closed: false, abandoned: false };
-        let shared = Arc::new(Shared { state: Mutex::new(state), space: Condvar::new() });
-        (Self { shared: shared.clone() }, Producer { shared })
+        let state = State {
+            chunks: VecDeque::new(),
+            queued: 0,
+            waker: None,
+            closed: false,
+            abandoned: false,
+        };
+        let shared = Arc::new(Shared {
+            state: Mutex::new(state),
+            space: Condvar::new(),
+        });
+        (
+            Self {
+                shared: shared.clone(),
+            },
+            Producer { shared },
+        )
     }
 
     /// 现在就取一块，没有就是 `None`（不等）。一次处理一批、处理完再画一次，靠它
@@ -194,9 +214,13 @@ mod tests {
             producer.push(Chunk::Bytes(vec![1; 16]));
             done_sender.send(()).ok();
         });
-        assert!(done.recv_timeout(Duration::from_millis(200)).is_err(), "队列满了，第二次 push 不该返回");
+        assert!(
+            done.recv_timeout(Duration::from_millis(200)).is_err(),
+            "队列满了，第二次 push 不该返回"
+        );
         assert!(matches!(queue.try_next(), Some(Chunk::Bytes(bytes)) if bytes.len() == MAX_QUEUED));
-        done.recv_timeout(Duration::from_secs(5)).expect("取走之后读线程应该继续");
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("取走之后读线程应该继续");
         handle.join().ok();
         assert!(matches!(queue.try_next(), Some(Chunk::Bytes(bytes)) if bytes.len() == 16));
     }
