@@ -66,6 +66,38 @@ fn blank(store: Store) -> (Harness, Rc<Workspace>, Fake) {
     (harness, workspace, fake)
 }
 
+/// 同 [`blank`]，但在左上角画上 macOS 的红绿灯（真机上是系统画的，离屏渲染里没有）：
+/// 位置和 `title_bar()` 里给的一致。README 的截图要带上它们
+fn blank_with_traffic_lights(store: Store) -> (Harness, Rc<Workspace>, Fake) {
+    let fake = Fake::default();
+    let workspace = Workspace::new(fake.spawn(), None, store);
+    let light = |fill: u32, edge: u32| {
+        rect()
+            .size(12, 12)
+            .radius(6)
+            .background(Color::hex(fill))
+            .border(1, Color::hex(edge))
+    };
+    let lights = row()
+        .inset_left(16)
+        .inset_top(14)
+        .gap(8)
+        .child(light(0xff5f57, 0xe0443e))
+        .child(light(0xfebc2e, 0xdea123))
+        .child(light(0x28c840, 0x1aab29));
+    let harness = Harness::new(
+        WINDOW_SIZE.0 as f32,
+        WINDOW_SIZE.1 as f32,
+        column()
+            .grow(1)
+            .child(chrome::build(workspace.clone()))
+            .child(lights),
+    );
+    harness.set_title_bar_info(title_bar());
+    harness.frame();
+    (harness, workspace, fake)
+}
+
 /// 不起真 shell 的工作区，已经开着一个标签：每个标签一个只记录写入的假 pty
 fn mounted() -> (Harness, Rc<Workspace>) {
     mounted_with(title_bar())
@@ -2483,20 +2515,29 @@ fn switching_the_appearance_does_not_replay_the_enter_animations() {
     assert!(!crate::theme::just_switched(), "没变就不算");
 }
 
-/// 外观页有「粗细」选项，选了存得住
+/// 外观页有「粗细」（常规、粗两档），点了存得住
 #[test]
-fn the_appearance_page_has_a_font_weight_menu() {
+fn the_appearance_page_has_a_font_weight_switch() {
     use crate::settings::FontWeight;
     let (harness, workspace) = mounted();
     workspace.open_settings();
     workspace.settings_page.set(SettingsPage::Appearance);
     harness.advance(secs(1.0));
-    assert!(harness.window_bounds("set-font-weight").is_some(), "粗细在");
-    workspace.form.font_weight.set(FontWeight::Bold);
+    assert!(
+        harness.window_bounds("set-font-weight-regular").is_some(),
+        "常规在"
+    );
+    assert!(
+        harness.window_bounds("set-font-weight-light").is_none(),
+        "只有两档"
+    );
+    click_menu(&harness, "set-font-weight-bold");
     assert_eq!(workspace.form.snapshot().font_weight, FontWeight::Bold);
+    click_menu(&harness, "set-font-weight-regular");
+    assert_eq!(workspace.form.snapshot().font_weight, FontWeight::Regular);
 }
 
-/// 字体粗细真的改变终端里字的粗细：粗的比细的墨多（Menlo 只有常规和粗两档，细取常规），格子大小不变
+/// 字体粗细真的改变终端里字的粗细：粗的比细的墨多，格子大小不变
 #[test]
 fn the_font_weight_setting_changes_how_heavy_the_terminal_text_is() {
     use crate::settings::FontWeight;
@@ -2516,7 +2557,7 @@ fn the_font_weight_setting_changes_how_heavy_the_terminal_text_is() {
         sum
     };
     let columns = workspace.size.get_untracked();
-    workspace.form.font_weight.set(FontWeight::Light);
+    workspace.form.font_weight.set(FontWeight::Regular);
     harness.advance(secs(1.0));
     let light = ink(&harness);
     workspace.form.font_weight.set(FontWeight::Bold);
@@ -2836,7 +2877,7 @@ fn screenshots_for_readme() {
     const LOG: &str = "\x1b[1;32m➜\x1b[0m \x1b[36mnimbus-terminal\x1b[0m tail -f server.log\r\n\x1b[90m22:31:07\x1b[0m \x1b[32mINFO\x1b[0m  listening on 127.0.0.1:3000\r\n\x1b[90m22:31:12\x1b[0m \x1b[32mINFO\x1b[0m  GET /api/tabs 200 3ms\r\n\x1b[90m22:31:14\x1b[0m \x1b[33mWARN\x1b[0m  slow query 412ms\r\n\x1b[90m22:31:19\x1b[0m \x1b[32mINFO\x1b[0m  GET /api/panes 200 5ms\r\n";
     let project = directory.join("项目");
     let scene = |dark: bool| {
-        let (harness, workspace, _fake) = blank(Store::none());
+        let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
         harness.set_scale_factor(1.5);
         workspace.form.appearance.set(if dark {
             ThemeChoice::Dark

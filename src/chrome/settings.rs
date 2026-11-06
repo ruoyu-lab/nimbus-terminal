@@ -207,7 +207,17 @@ fn appearance(form: Form) -> Element {
                 "文字",
                 vec![
                     setting("字体", font_menu(form.font)),
-                    setting("粗细", weight_menu(form.font_weight)),
+                    setting(
+                        "粗细",
+                        segments(
+                            "set-font-weight",
+                            &[
+                                ("regular", "常规", FontWeight::Regular),
+                                ("bold", "粗", FontWeight::Bold),
+                            ],
+                            form.font_weight,
+                        ),
+                    ),
                     setting(
                         "字号",
                         stepper(
@@ -534,21 +544,6 @@ fn font_menu(value: Signal<FontChoice>) -> Element {
         ],
         "set-font",
         "终端字体",
-    )
-}
-
-fn weight_menu(value: Signal<FontWeight>) -> Element {
-    menu(
-        value,
-        [
-            (FontWeight::Light, "细"),
-            (FontWeight::Regular, "常规"),
-            (FontWeight::Medium, "中等"),
-            (FontWeight::Semibold, "半粗"),
-            (FontWeight::Bold, "粗"),
-        ],
-        "set-font-weight",
-        "字体粗细",
     )
 }
 

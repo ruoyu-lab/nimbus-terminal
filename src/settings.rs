@@ -107,24 +107,22 @@ impl FontChoice {
     }
 }
 
-/// 终端字的粗细（字体没有的粗细会取最近的一档）
+/// 终端字的粗细：常规和粗两档
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FontWeight {
-    Light,
+    /// 以前还有细、中等两档，存过的设置里写的是那些名字，归到常规
+    #[serde(alias = "light", alias = "medium")]
     Regular,
-    Medium,
-    Semibold,
+    /// 以前的「半粗」归到粗
+    #[serde(alias = "semibold")]
     Bold,
 }
 
 impl FontWeight {
     pub fn value(self) -> f32 {
         match self {
-            Self::Light => 300.0,
             Self::Regular => 400.0,
-            Self::Medium => 500.0,
-            Self::Semibold => 600.0,
             Self::Bold => 700.0,
         }
     }
@@ -304,12 +302,29 @@ mod tests {
     #[test]
     fn the_font_weight_survives_a_round_trip() {
         let settings = Settings {
-            font_weight: FontWeight::Semibold,
+            font_weight: FontWeight::Bold,
             ..Settings::default()
         };
         let text = serde_json::to_string(&settings).expect("写得出");
         let back: Settings = serde_json::from_str(&text).expect("读得回");
         assert_eq!(back, settings);
+    }
+
+    /// 以前的设置文件里写过细、中等、半粗：读得进来（归到常规、粗），不会因为一个选项读不懂就整份退回默认
+    #[test]
+    fn weights_from_older_versions_still_load() {
+        for (old, expected) in [
+            ("light", FontWeight::Regular),
+            ("medium", FontWeight::Regular),
+            ("regular", FontWeight::Regular),
+            ("semibold", FontWeight::Bold),
+            ("bold", FontWeight::Bold),
+        ] {
+            let text = format!(r#"{{"font_weight":"{old}","font_size":15}}"#);
+            let loaded: Settings = serde_json::from_str(&text).expect("读得进来");
+            assert_eq!(loaded.font_weight, expected, "{old}");
+            assert_eq!(loaded.font_size, 15.0, "别的项也在");
+        }
     }
 
     #[test]
