@@ -133,7 +133,7 @@ fn location() -> Option<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        home().map(|home| {
+        user_home().map(|home| {
             home.join("Library/Application Support")
                 .join(crate::product::NAME)
         })
@@ -149,7 +149,7 @@ fn location() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
-            .or_else(|| home().map(|home| home.join(".config")))
+            .or_else(|| user_home().map(|home| home.join(".config")))
             .map(|path| path.join("nimbus-terminal"))
     }
 }
@@ -172,11 +172,16 @@ fn adopt_legacy(old: &Path, new: &Path) {
     }
 }
 
-#[cfg(not(windows))]
-fn home() -> Option<PathBuf> {
+/// 用户的主目录。先看 `HOME`（类 Unix，以及有人在 Windows 上自己设了的），没有再用 `USERPROFILE`
+pub(crate) fn user_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        })
 }
 
 #[cfg(test)]

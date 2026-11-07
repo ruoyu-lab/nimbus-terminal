@@ -6,7 +6,7 @@
 
 **A clean terminal that remembers where you left off.**
 
-Built from scratch on the [Aureole](https://github.com/ruoyu-lab/aureole-framework) UI framework, with its own pty and xterm emulation. No WebView, no Electron.
+Built from scratch on the [Aureole](https://github.com/ruoyu-lab/aureole) UI framework, with its own pty and xterm emulation. No WebView, no Electron.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f6fed.svg)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)

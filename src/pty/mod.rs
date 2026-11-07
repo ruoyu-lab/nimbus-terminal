@@ -1,7 +1,7 @@
 //! pty 层：起一个子进程，把它的终端接到我们手上。
 //!
 //! 跨平台的接缝是 [`PtyBackend`]：类 Unix 走 `forkpty`（[`posix`]，在 macOS 上跑，Linux 是同一套代码），
-//! Windows 要另写一份 ConPTY 实现，那边现在调用会直接报错，而不是编出一个能过但跑不对的二进制。
+//! Windows 走 ConPTY（[`windows`](self::windows)）。
 //!
 //! 数据走两条线：
 //! - **读**：后台线程堵住 pty 的读端，读到多少就塞进 [`ByteQueue`]，主线程 `await` 它
@@ -10,6 +10,8 @@
 #[cfg(unix)]
 mod posix;
 mod queue;
+#[cfg(windows)]
+mod windows;
 
 use std::io;
 use std::path::PathBuf;
@@ -97,6 +99,9 @@ impl Config {
 
     /// 用户默认的 shell，加上登录 shell 该有的那几个参数
     pub fn login_shell(columns: u16, rows: u16) -> Self {
+        #[cfg(windows)]
+        let program = windows::default_shell().to_string_lossy().into_owned();
+        #[cfg(not(windows))]
         let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         Self::shell(program, columns, rows)
     }
@@ -116,24 +121,24 @@ impl Config {
     }
 }
 
-/// 新会话的起始目录：用户的主目录。从 Finder、Dock 启动的应用当前目录是 `/`，不能拿来当起点；
-/// 没有 `HOME` 时返回 `None`，由子进程沿用当前目录
+/// 新会话的起始目录：用户的主目录。从访达、程序坞、开始菜单启动的应用，当前目录不是主目录，不能拿来当起点；
+/// 没有主目录时返回 `None`，由子进程沿用当前目录
 fn home_directory() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
+    crate::store::user_home()
 }
 
 /// 起一个 pty，返回句柄和读到的字节
 pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
     #[cfg(unix)]
     return posix::spawn(config);
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    return windows::spawn(config);
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = config;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "这一版只在 macOS（类 Unix）上实现了 pty，Windows 的 ConPTY 还没写",
+            "这一版的 pty 只实现了类 Unix 和 Windows",
         ))
     }
 }
@@ -188,7 +193,9 @@ mod tests {
     /// 测试进程的当前目录是项目目录，不是主目录：起始目录要是主目录，说明没有拿当前目录凑合
     #[test]
     fn a_login_shell_starts_in_the_home_directory() {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        assert_eq!(Config::login_shell(80, 24).working_directory, home);
+        assert_eq!(
+            Config::login_shell(80, 24).working_directory,
+            home_directory()
+        );
     }
 }

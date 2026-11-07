@@ -2997,3 +2997,23 @@ fn screenshots_for_readme() {
     save(&harness, "settings.png");
     let _ = std::fs::remove_dir_all(&project);
 }
+
+/// `~` 展开成主目录；`/` 和 `\` 都认，`~名字` 不动
+#[test]
+fn tilde_expands_to_the_home_directory_with_either_separator() {
+    let Some(home) = crate::store::user_home() else {
+        return;
+    };
+    assert_eq!(super::expand_home("~"), Some(home.clone()));
+    assert_eq!(super::expand_home("~/work"), Some(home.join("work")));
+    assert_eq!(super::expand_home("~\\work"), Some(home.join("work")));
+    assert_eq!(
+        super::expand_home("~work"),
+        Some(std::path::PathBuf::from("~work"))
+    );
+    assert_eq!(super::expand_home(""), None);
+    assert_eq!(
+        super::expand_home("/tmp"),
+        Some(std::path::PathBuf::from("/tmp"))
+    );
+}

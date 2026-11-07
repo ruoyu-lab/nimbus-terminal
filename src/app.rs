@@ -265,7 +265,9 @@ impl Session {
     fn ring(&self) {
         match self.form.bell.get_untracked() {
             Bell::Off => {}
-            Bell::Sound => crate::native::beep(),
+            Bell::Sound => {
+                aureole::beep();
+            }
             Bell::Flash => self.flashes.update(|count| *count += 1),
         }
     }

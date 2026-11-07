@@ -14,7 +14,7 @@ exclude = ["/docs", "/assets/icon.icns", "/.github"]
 
 [dependencies]
 # 只用公开 API，不改框架
-aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "4c8581c" }
+aureole = { git = "https://github.com/ruoyu-lab/aureole.git", rev = "e5fa284" }
 # 字宽（汉字、emoji 两格）：和框架用同一版
 unicode-width = "0.2"
 # 设置、文件夹、窗口位置的落盘（JSON）
@@ -23,7 +23,7 @@ serde_json = "1"
 
 [dev-dependencies]
 # 离屏测试：`Harness` 挂视图、模拟点击和移动，不用 GPU 和窗口
-aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "4c8581c", features = ["testing"] }
+aureole = { git = "https://github.com/ruoyu-lab/aureole.git", rev = "e5fa284", features = ["testing"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -45,6 +45,22 @@ strip = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

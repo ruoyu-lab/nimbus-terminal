@@ -363,11 +363,16 @@ impl Workspace {
     fn watch_theme(self: &Rc<Self>) {
         let appearance = self.form.appearance;
         Effect::new(move || {
-            let dark = match appearance.get() {
-                ThemeChoice::Light => false,
-                ThemeChoice::Dark => true,
-                ThemeChoice::System => aureole::system_appearance() == aureole::Appearance::Dark,
+            // 窗口外框的深浅（Windows 的 Mica）由框架按这个外观画，要和界面自己的深浅一致
+            let (mode, dark) = match appearance.get() {
+                ThemeChoice::Light => (AppearanceMode::Light, false),
+                ThemeChoice::Dark => (AppearanceMode::Dark, true),
+                ThemeChoice::System => (
+                    AppearanceMode::System,
+                    aureole::system_appearance() == aureole::Appearance::Dark,
+                ),
             };
+            aureole::set_appearance_mode(mode);
             crate::theme::set_dark(dark);
         });
     }
@@ -729,7 +734,7 @@ impl Workspace {
         aureole::detached(|| {
             aureole::spawn_local(async move {
                 let mut dialog = aureole::FileDialog::new().title("选择目录");
-                if let Some(home) = std::env::var_os("HOME") {
+                if let Some(home) = crate::store::user_home() {
                     dialog = dialog.directory(home);
                 }
                 let Some(path) = dialog.pick_directory().await else {
@@ -1323,18 +1328,24 @@ impl Workspace {
     }
 }
 
-/// `~` 或 `~/xx` 展开成主目录；空串是 `None`
+/// `~`、`~/xx`、`~\xx` 展开成主目录；空串是 `None`。`~名字` 是另一个用户的目录，这里不展开
 fn expand_home(text: &str) -> Option<PathBuf> {
     if text.is_empty() {
         return None;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    match (text.strip_prefix('~'), home) {
-        (Some(""), Some(home)) => Some(home),
-        (Some(rest), Some(home)) if rest.starts_with('/') => {
-            Some(home.join(rest.trim_start_matches('/')))
-        }
-        _ => Some(PathBuf::from(text)),
+    let Some(rest) = text.strip_prefix('~') else {
+        return Some(PathBuf::from(text));
+    };
+    let Some(home) = crate::store::user_home() else {
+        return Some(PathBuf::from(text));
+    };
+    if rest.is_empty() {
+        return Some(home);
+    }
+    if rest.starts_with(['/', '\\']) {
+        Some(home.join(rest.trim_start_matches(['/', '\\'])))
+    } else {
+        Some(PathBuf::from(text))
     }
 }
 

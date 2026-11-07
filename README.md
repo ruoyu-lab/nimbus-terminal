@@ -6,12 +6,12 @@
 
 **一个干净、好看、能记住你工作现场的终端。**
 
-用 [Aureole](https://github.com/ruoyu-lab/aureole-framework) 界面框架从零写成：自研 pty 和 xterm 仿真，没有 WebView，没有 Electron。
+用 [Aureole](https://github.com/ruoyu-lab/aureole) 界面框架从零写成：自研 pty 和 xterm 仿真，没有 WebView，没有 Electron。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f6fed.svg)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange.svg)
-[![Built with Aureole](https://img.shields.io/badge/built%20with-Aureole-7aa2ff.svg)](https://github.com/ruoyu-lab/aureole-framework)
+[![Built with Aureole](https://img.shields.io/badge/built%20with-Aureole-7aa2ff.svg)](https://github.com/ruoyu-lab/aureole)
 
 [特性](#特性) · [截图](#截图) · [安装](#安装) · [快捷键](#快捷键) · [配置](#配置) · [开发](#开发) · [English](README.en.md)
 
@@ -151,7 +151,7 @@ README_SHOTS=$PWD/docs/screenshots cargo test screenshots_for_readme -- --ignore
 
 ## 致谢
 
-- [Aureole](https://github.com/ruoyu-lab/aureole-framework)：界面框架，字符网格、布局、动画、输入、离屏测试都来自它
+- [Aureole](https://github.com/ruoyu-lab/aureole)：界面框架，字符网格、布局、动画、输入、离屏测试都来自它
 - [Feather](https://feathericons.com/)（MIT）：GitHub 图标
 
 ## 许可证

@@ -74,18 +74,3 @@ pub fn set_application_icon() {
 /// 别的平台的图标由窗口系统管
 #[cfg(not(target_os = "macos"))]
 pub fn set_application_icon() {}
-
-/// 系统提示音（程序输出 BEL、设置里选了「系统提示音」时）
-#[cfg(target_os = "macos")]
-pub fn beep() {
-    #[link(name = "AppKit", kind = "framework")]
-    unsafe extern "C" {
-        fn NSBeep();
-    }
-    // SAFETY: `NSBeep` 不带参数、不碰我们的内存，只是放一声提示音；可以在任何线程调用
-    unsafe { NSBeep() }
-}
-
-/// 别的平台还没有提示音
-#[cfg(not(target_os = "macos"))]
-pub fn beep() {}
