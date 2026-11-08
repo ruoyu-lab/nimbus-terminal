@@ -109,9 +109,8 @@ fn frame(workspace: Rc<Workspace>) -> Element {
         workspace.folder_prompt,
         workspace.closing,
     );
-    // 外框（标题栏和侧栏）用系统的窗口材质，上面只罩一层很薄的颜色，把字衬稳，别把材质涂死。
-    // 深浅和系统一致时罩薄的：浅色字配深色材质、深色字配浅色材质，本来就看得清。
-    // 两边深浅不一致时，系统材质是另一套颜色，罩厚才不会透出来。
+    // 外框（标题栏和侧栏）用系统的窗口材质，这里只盖一层很淡的底，保证字看得清：
+    // 浅色系统里材质本身是浅的，几乎不用盖；深色系统里材质是深的，要盖一层浅色，不然深色的字看不见。
     // 平台不支持材质时退回不透明的底色
     let has_backdrop = capabilities().supports_window_backdrop;
     let backdrop = move || {
@@ -121,7 +120,8 @@ fn frame(workspace: Rc<Workspace>) -> Element {
         let system_dark = system_appearance() == Appearance::Dark;
         match (is_dark(), system_dark) {
             (false, false) => Color::WHITE.with_alpha(0.28),
-            (true, true) => sidebar_bg().with_alpha(0.36),
+            (true, true) => sidebar_bg().with_alpha(0.84),
+            // 界面和系统的深浅不一样：系统的材质是另一种颜色，要盖得厚一点才看不出来
             _ => sidebar_bg().with_alpha(0.98),
         }
     };

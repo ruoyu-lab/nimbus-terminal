@@ -296,14 +296,8 @@ pub fn displays() -> Vec<Display> {
     macos::displays()
 }
 
-/// Windows：枚举现在接着的显示器，坐标和框架报的窗口位置同一套（逻辑像素，原点在主显示器左上角）
-#[cfg(windows)]
-pub fn displays() -> Vec<Display> {
-    windows::displays()
-}
-
 /// 别的平台还没接显示器信息：窗口位置交给系统，只记大小
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(target_os = "macos"))]
 pub fn displays() -> Vec<Display> {
     Vec::new()
 }
@@ -391,146 +385,6 @@ mod macos {
                 primary: index == 0,
             })
             .collect()
-    }
-}
-
-#[cfg(windows)]
-mod windows {
-    use std::ptr;
-
-    use windows_sys::Win32::Foundation::{LPARAM, RECT};
-    use windows_sys::Win32::Graphics::Gdi::{
-        DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
-        MONITORINFO, MONITORINFOEXW,
-    };
-    use windows_sys::Win32::UI::HiDpi::{
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
-        SetProcessDpiAwarenessContext,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY,
-    };
-    use windows_sys::core::BOOL;
-
-    use super::{Area, Display};
-
-    /// 进程还没进窗口库时就要问显示器（窗口位置在 `App::run` 之前就算好）。
-    /// 不先声明按每台显示器的缩放来，系统会把坐标虚拟成 96 DPI，和之后窗口库报的物理像素对不上
-    fn become_dpi_aware() {
-        // SAFETY: 参数是系统定义的常量（每台显示器的 DPI，第二版），不传指针。已经设过时调用会失败，忽略即可
-        unsafe {
-            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        }
-    }
-
-    fn logical(value: i32, scale: f32) -> f32 {
-        value as f32 / scale
-    }
-
-    fn area_of(rect: RECT, scale: f32) -> Area {
-        Area::new(
-            logical(rect.left, scale),
-            logical(rect.top, scale),
-            logical(rect.right - rect.left, scale),
-            logical(rect.bottom - rect.top, scale),
-        )
-    }
-
-    fn wide_string(words: &[u16]) -> String {
-        let end = words
-            .iter()
-            .position(|&unit| unit == 0)
-            .unwrap_or(words.len());
-        String::from_utf16_lossy(&words[..end])
-    }
-
-    /// 显示器接口路径（插拔之后还是这块屏）。问不到就用 `\\.\DISPLAYn`
-    fn identity(device_name: &[u16]) -> String {
-        let mut device: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
-        device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-        // SAFETY: `device_name` 是 `GetMonitorInfo` 填好的、以 0 结尾的设备名；
-        // `device` 是栈上的 `DISPLAY_DEVICEW`，`cb` 已经写成它的大小，系统最多写这么多
-        let found = unsafe {
-            EnumDisplayDevicesW(
-                device_name.as_ptr(),
-                0,
-                &mut device,
-                EDD_GET_DEVICE_INTERFACE_NAME,
-            )
-        };
-        if found != 0 {
-            let id = wide_string(&device.DeviceID);
-            if !id.is_empty() {
-                return id;
-            }
-        }
-        wide_string(device_name)
-    }
-
-    unsafe extern "system" fn collect_monitor(
-        monitor: HMONITOR,
-        _device: HDC,
-        _rect: *mut RECT,
-        data: LPARAM,
-    ) -> BOOL {
-        // SAFETY: `data` 是 `displays` 传进来的 `Vec<HMONITOR>`，回调返回之前它一直活着
-        unsafe {
-            let monitors = &mut *(data as *mut Vec<HMONITOR>);
-            monitors.push(monitor);
-        }
-        1
-    }
-
-    pub(super) fn displays() -> Vec<Display> {
-        become_dpi_aware();
-        let mut monitors = Vec::new();
-        // SAFETY: 回调只把监视器句柄推进上面这个 `Vec`，函数返回前不会再被调用
-        unsafe {
-            EnumDisplayMonitors(
-                ptr::null_mut(),
-                ptr::null(),
-                Some(collect_monitor),
-                &mut monitors as *mut Vec<HMONITOR> as LPARAM,
-            );
-        }
-        let mut found = Vec::new();
-        for monitor in monitors {
-            let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
-            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-            // SAFETY: `info` 是栈上的 `MONITORINFOEXW`，`cbSize` 写成了它的大小（比 `MONITORINFO` 大，用来要设备名）
-            let ok = unsafe {
-                GetMonitorInfoW(
-                    monitor,
-                    &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
-                )
-            };
-            if ok == 0 {
-                continue;
-            }
-            let mut dpi_x = 0u32;
-            let mut dpi_y = 0u32;
-            // SAFETY: `monitor` 是刚枚举到的句柄；两个 `u32` 是写出口
-            let dpi =
-                unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
-            let scale = if dpi >= 0 && dpi_x > 0 {
-                dpi_x as f32 / 96.0
-            } else {
-                1.0
-            };
-            let frame = area_of(info.monitorInfo.rcMonitor, scale);
-            if frame.width <= 0.0 || frame.height <= 0.0 {
-                continue;
-            }
-            found.push(Display {
-                id: identity(&info.szDevice),
-                scale,
-                frame,
-                visible: area_of(info.monitorInfo.rcWork, scale),
-                primary: (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
-            });
-        }
-        found.sort_by_key(|display| !display.primary);
-        found
     }
 }
 
@@ -813,20 +667,6 @@ mod tests {
             maximized: false,
         });
         assert_eq!(memory.plan(&[], (1.0, 1.0)).width, 1200.0);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_reports_the_attached_displays() {
-        let found = displays();
-        assert!(!found.is_empty(), "至少有一块显示器");
-        assert_eq!(found.iter().filter(|display| display.primary).count(), 1);
-        for display in &found {
-            assert!(display.scale > 0.0, "{}", display.id);
-            assert!(display.frame.width > 0.0 && display.frame.height > 0.0);
-            assert!(display.visible.width > 0.0 && display.visible.height > 0.0);
-            assert!(!display.id.is_empty());
-        }
     }
 
     #[test]
