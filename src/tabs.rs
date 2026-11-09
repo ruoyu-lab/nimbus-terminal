@@ -1191,6 +1191,7 @@ impl Workspace {
         };
         let pane = self.next_pane.get();
         self.next_pane.set(pane + 1);
+        let for_alert = self.this.clone();
         let (for_title, for_size, for_exit, for_activity) = (
             self.this.clone(),
             self.this.clone(),
@@ -1221,6 +1222,11 @@ impl Workspace {
                     workspace.close_pane(tab, pane);
                 }
             }),
+            alert: Rc::new(move |alert| {
+                if let Some(workspace) = for_alert.upgrade() {
+                    workspace.alert(tab, pane, alert);
+                }
+            }),
             activity: Rc::new(move || {
                 if let Some(workspace) = for_activity.upgrade()
                     && workspace.active.get_untracked() != tab
@@ -1232,6 +1238,7 @@ impl Workspace {
             }),
         };
         let session = Session::start(spawned, columns, rows, hooks, self.form, history.as_deref());
+        session.set_local(!remote);
         if remote {
             // 断线后按回车重连：用当时的大小再起一次 `ssh` / `docker exec`
             let (spawn, this) = (self.spawn.clone(), self.this.clone());
@@ -1562,6 +1569,70 @@ impl Workspace {
             .into_iter()
             .find(|tab| tab.id == active)?;
         tab.layout.get_untracked().session(tab.focus.get_untracked())
+    }
+
+    /// 用户这会儿正看着这个终端吗：窗口在前台、标签是当前的、拆分过的话它是聚焦的那个
+    fn watching(&self, tab: u64, pane: u64) -> bool {
+        let window_front = self.window.is_none_or(|window| window.is_focused());
+        window_front
+            && !self.settings_open.get_untracked()
+            && self.active.get_untracked() == tab
+            && self
+                .tabs
+                .get_untracked()
+                .iter()
+                .find(|candidate| candidate.id == tab)
+                .is_none_or(|candidate| candidate.focus.get_untracked() == pane)
+    }
+
+    /// 会话要提醒用户：设置里开着、用户又不在看这个终端时发系统通知，点通知回到这个终端
+    pub fn alert(&self, tab: u64, pane: u64, alert: crate::app::Alert) {
+        use crate::app::Alert;
+        if !self.form.notifications.get_untracked() || self.watching(tab, pane) {
+            return;
+        }
+        let name = self
+            .titles
+            .get_untracked()
+            .get(&tab)
+            .cloned()
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "终端".to_string());
+        let (title, body) = match alert {
+            Alert::Finished { seconds } => (
+                "命令已完成".to_string(),
+                format!("{name} · 用时 {}", elapsed_text(seconds)),
+            ),
+            Alert::Message { title, body } if title.is_empty() => (name, body),
+            Alert::Message { title, body } => (format!("{name} · {title}"), body),
+        };
+        let (this, window) = (self.this.clone(), self.window);
+        let shown = aureole::Notification::new(title).body(body).on_click(move || {
+            if let Some(workspace) = this.upgrade() {
+                workspace.select(tab);
+                workspace.focus_pane(tab, pane);
+            }
+            if let Some(window) = window {
+                window.focus();
+            }
+        });
+        // 发不了（macOS 没打包成 .app、系统没开通知）只是没有提醒，不是错误
+        let _ = shown.show();
+    }
+
+    /// 字号加减 `delta`，限制在设置允许的范围里
+    pub fn zoom_font(&self, delta: f64) {
+        let (low, high) = crate::settings::FONT_SIZE;
+        self.form
+            .font_size
+            .update(|size| *size = (*size + delta).clamp(low, high));
+    }
+
+    /// 字号回到默认
+    pub fn reset_font_size(&self) {
+        self.form
+            .font_size
+            .set(crate::settings::Settings::default().font_size);
     }
 
     /// ⌘F：在聚焦的终端里打开查找条
@@ -2113,6 +2184,10 @@ impl Workspace {
             } else {
                 Axis::Columns
             }),
+            // ⌘+ / ⌘- / ⌘0：字号（直接改设置里的字号，和设置页是同一个）
+            "=" | "+" => self.zoom_font(1.0),
+            "-" | "_" => self.zoom_font(-1.0),
+            "0" => self.reset_font_size(),
             "f" | "F" => self.find_in_terminal(),
             "g" | "G" => self.find_step(!modifiers.has_shift()),
             "k" | "K" => self.palette_open.update(|open| *open = !*open),
@@ -2128,6 +2203,15 @@ impl Workspace {
             _ => return false,
         }
         true
+    }
+}
+
+/// 「2 分 10 秒」「45 秒」「1 小时 3 分」
+fn elapsed_text(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds} 秒"),
+        60..=3599 => format!("{} 分 {} 秒", seconds / 60, seconds % 60),
+        _ => format!("{} 小时 {} 分", seconds / 3600, seconds % 3600 / 60),
     }
 }
 

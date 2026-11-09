@@ -225,6 +225,8 @@ settings! {
     copy_on_select: bool = false,
     right_click_paste: bool = false,
     bell: Bell = Bell::Off,
+    /// 窗口在后台时，命令跑完、程序要求弹的通知用系统通知提醒
+    notifications: bool = true,
 }
 
 impl Settings {

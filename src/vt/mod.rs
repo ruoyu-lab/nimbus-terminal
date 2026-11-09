@@ -130,6 +130,8 @@ pub struct Terminal {
     pub title: String,
     /// 响过几次铃（`view` 拿它决定闪一下还是出声）
     pub bell: u64,
+    /// 程序要求弹的系统通知（OSC 9、OSC 777），还没取走的：（标题，正文）。取走前最多留 [`MAX_ALERTS`] 条
+    alerts: Vec<(String, String)>,
     /// G0、G1 现在指定的字符集，以及 SO / SI 选中了哪一个
     charsets: [Charset; 2],
     active_charset: usize,
@@ -158,6 +160,7 @@ impl Terminal {
             cursor_shape: None,
             title: String::new(),
             bell: 0,
+            alerts: Vec::new(),
             charsets: [Charset::Ascii; 2],
             active_charset: 0,
             last_char: None,
@@ -740,6 +743,18 @@ impl Terminal {
     /// OSC：只认标题（0 和 2；1 是图标名，没有图标，忽略）。
     /// 剪贴板（52）、超链接（8）、目录（7）、提示符标记（133）还没做，整条丢掉
     fn osc(&mut self, code: i32, text: &str) {
+        match code {
+            // iTerm 的写法：`9;正文`。`9;4;…` 是 ConEmu 的进度条，不是通知
+            9 if !text.starts_with("4;") => self.push_alert(String::new(), text),
+            // `777;notify;标题;正文`（rxvt、Kitty 等）
+            777 => {
+                if let Some(rest) = text.strip_prefix("notify;") {
+                    let (title, body) = rest.split_once(';').unwrap_or(("", rest));
+                    self.push_alert(title.to_string(), body);
+                }
+            }
+            _ => {}
+        }
         if matches!(code, 0 | 2) {
             // 标题会显示在窗口上：控制字符去掉，长度封顶，免得程序拿它刷屏
             self.title = text
@@ -748,6 +763,28 @@ impl Terminal {
                 .take(256)
                 .collect();
         }
+    }
+}
+
+/// 一次取走之前最多攒几条通知：程序刷屏式地发通知时不会攒出一大堆
+pub const MAX_ALERTS: usize = 4;
+
+impl Terminal {
+    fn push_alert(&mut self, title: String, body: &str) {
+        // 通知是显示给人看的：控制字符去掉、长度封顶，空的不发
+        let clean = |text: &str, limit: usize| -> String {
+            text.chars().filter(|ch| !ch.is_control()).take(limit).collect()
+        };
+        let (title, body) = (clean(&title, 80), clean(body, 200));
+        if (title.is_empty() && body.is_empty()) || self.alerts.len() >= MAX_ALERTS {
+            return;
+        }
+        self.alerts.push((title, body));
+    }
+
+    /// 取走程序要求弹的通知
+    pub fn take_alerts(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.alerts)
     }
 }
 
@@ -947,6 +984,27 @@ mod tests {
         assert_eq!(term.title, "我的终端");
         term.feed(b"\x1b]2;second\x1b\\");
         assert_eq!(term.title, "second");
+    }
+
+    #[test]
+    fn osc_9_and_777_become_alerts() {
+        let mut term = Terminal::new(20, 2);
+        term.feed(b"\x1b]9;build done\x07");
+        term.feed("\x1b]777;notify;标题;正\x01文\x1b\\".as_bytes());
+        term.feed(b"\x1b]9;4;1;50\x07");
+        term.feed(b"\x1b]9;\x07");
+        assert_eq!(
+            term.take_alerts(),
+            vec![
+                (String::new(), "build done".to_string()),
+                ("标题".to_string(), "正文".to_string())
+            ]
+        );
+        assert!(term.take_alerts().is_empty(), "取走就没了");
+        for _ in 0..20 {
+            term.feed(b"\x1b]9;spam\x07");
+        }
+        assert_eq!(term.take_alerts().len(), MAX_ALERTS);
     }
 
     #[test]

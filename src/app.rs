@@ -19,6 +19,7 @@ use aureole::{LocalTask, WheelDelta};
 use crate::pty::{self, ByteQueue, Chunk, Pty};
 use crate::settings::{Bell, Form};
 use crate::target::Target;
+use crate::links;
 use crate::view;
 use crate::vt::mouse::{Action, Button, Report};
 use crate::vt::search::{self, Match};
@@ -40,7 +41,23 @@ pub struct Hooks {
     pub exited: Rc<dyn Fn(i32)>,
     /// 读到了新的输出（一批一次）。标签不在前台时，侧栏靠它提示「有新输出」
     pub activity: Rc<dyn Fn()>,
+    /// 值得叫人回来看一眼的事（命令跑完了、程序要求弹通知）。弹不弹、弹给谁由外面决定
+    pub alert: Rc<dyn Fn(Alert)>,
 }
+
+/// 会话想提醒用户的事
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Alert {
+    /// 前台的命令（任何 shell 之外的程序）跑了这么久，现在结束了
+    Finished { seconds: u64 },
+    /// 程序自己要求的通知（OSC 9、OSC 777），或者前台程序响了铃（`title` 是空的）
+    Message { title: String, body: String },
+}
+
+/// 前台命令至少跑这么久，结束时才算「跑完了」：`ls` 之类一闪而过的不提醒
+pub const FINISHED_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+/// 程序自己发的通知，两条之间至少隔这么久：它刷屏时不跟着刷
+const ALERT_SPACING: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Hooks {
     /// 什么都不管（测试里）
@@ -51,6 +68,7 @@ impl Hooks {
             resized: Rc::new(|_, _| {}),
             exited: Rc::new(|_| {}),
             activity: Rc::new(|| {}),
+            alert: Rc::new(|_| {}),
         }
     }
 }
@@ -188,6 +206,22 @@ pub struct Session {
     waiting: Cell<bool>,
     /// 终端内查找（⌘F）
     find: Find,
+    /// 这是本机的终端（⌘点击文件路径才打得开：服务器上的路径在本机找不到）
+    local: Cell<bool>,
+    /// 指针现在在哪一格（不在终端上是 `None`）
+    pointer_cell: Cell<Option<(usize, usize)>>,
+    /// 指针停着的链接：它在显示的第几行、哪几列
+    hover: Cell<Option<view::Hover>>,
+    /// 指针停着的链接变了：下一次画要整屏重画一遍
+    hover_dirty: Cell<bool>,
+    /// 指针是不是停在链接上（光标变成手指）
+    hovering_link: Signal<bool>,
+    /// 前台命令从什么时候开始跑（没有就是 shell 在等输入）
+    busy_since: Cell<Option<std::time::Instant>>,
+    /// 上一条程序自己发的通知是什么时候
+    last_alert: Cell<Option<std::time::Instant>>,
+    /// 看前台命令跑完没有的定时任务；会话关了就取消
+    watcher: RefCell<Option<LocalTask>>,
 }
 
 /// 终端内查找的状态：查找条是界面，这里是它背后的东西
@@ -243,6 +277,7 @@ impl Session {
         if let Some(queue) = spawned.queue {
             session.start_pump(queue);
         }
+        session.start_watch();
         session
     }
 
@@ -280,6 +315,14 @@ impl Session {
             output_version: Cell::new(0),
             reconnect: RefCell::new(None),
             waiting: Cell::new(false),
+            local: Cell::new(false),
+            pointer_cell: Cell::new(None),
+            hover: Cell::new(None),
+            hover_dirty: Cell::new(false),
+            hovering_link: aureole::detached(|| signal(false)),
+            busy_since: Cell::new(None),
+            last_alert: Cell::new(None),
+            watcher: RefCell::new(None),
             find: Find {
                 open: aureole::detached(|| signal(false)),
                 query: aureole::detached(|| signal(String::new())),
@@ -333,6 +376,52 @@ impl Session {
 
     /// 挂在一个不随界面卸载的作用域上。从文件夹右键菜单里创建时，菜单的作用域马上就释放，
     /// 读任务要是记在菜单上，会被一起取消：shell 已经起来（光标在闪），提示符却永远到不了屏幕
+    /// 每秒看一眼前台有没有命令在跑。手里只拿弱引用：会话释放了任务自己结束
+    fn start_watch(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let task = session_scope().run(|| {
+            aureole::spawn_local(async move {
+                loop {
+                    aureole::sleep(ms(1000)).await;
+                    let Some(session) = weak.upgrade() else { break };
+                    if session.closed.get() {
+                        break;
+                    }
+                    session.watch_busy(session.is_busy(), std::time::Instant::now());
+                }
+            })
+        });
+        *self.watcher.borrow_mut() = Some(task);
+    }
+
+    /// 前台命令的状态变了：从闲到忙记下时间，从忙到闲时跑得够久就报「跑完了」
+    fn watch_busy(&self, busy: bool, now: std::time::Instant) {
+        match (busy, self.busy_since.get()) {
+            (true, None) => self.busy_since.set(Some(now)),
+            (false, Some(since)) => {
+                self.busy_since.set(None);
+                let ran = now.saturating_duration_since(since);
+                if ran >= FINISHED_AFTER {
+                    (self.hooks.alert)(Alert::Finished { seconds: ran.as_secs() });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 程序自己要求的通知、前台程序响铃：交给外面决定弹不弹。两条之间隔一会儿
+    fn alert_message(&self, title: String, body: String, now: std::time::Instant) {
+        if self
+            .last_alert
+            .get()
+            .is_some_and(|last| now.saturating_duration_since(last) < ALERT_SPACING)
+        {
+            return;
+        }
+        self.last_alert.set(Some(now));
+        (self.hooks.alert)(Alert::Message { title, body });
+    }
+
     fn start_pump(self: &Rc<Self>, queue: ByteQueue) {
         let reading = self.clone();
         let task = session_scope().run(|| aureole::spawn_local(pump(reading, queue)));
@@ -404,6 +493,9 @@ impl Session {
         if let Some(task) = self.pump.borrow_mut().take() {
             task.cancel();
         }
+        if let Some(task) = self.watcher.borrow_mut().take() {
+            task.cancel();
+        }
         self.pty.borrow_mut().take();
     }
 
@@ -416,7 +508,7 @@ impl Session {
 
     /// 仿真层攒下的东西送出去：给 shell 的应答、窗口标题、屏幕的改动
     fn flush(&self) {
-        let (reply, title, history, total, alternate, bell) = {
+        let (reply, title, history, total, alternate, bell, alerts) = {
             let mut terminal = self.terminal.borrow_mut();
             (
                 terminal.take_output(),
@@ -425,10 +517,19 @@ impl Session {
                 terminal.scrollback_total(),
                 terminal.on_alternate,
                 terminal.bell,
+                terminal.take_alerts(),
             )
         };
+        let now = std::time::Instant::now();
+        for (title, body) in alerts {
+            self.alert_message(title, body, now);
+        }
         if bell != self.bell_seen.replace(bell) {
             self.ring();
+            // 前台有程序在跑时响铃，多半是它在喊人（TUI 干完了活）；shell 提示符前的响铃不算
+            if self.busy_since.get().is_some() {
+                self.alert_message(String::new(), "终端响铃".to_string(), now);
+            }
         }
         if !reply.is_empty() {
             self.write(&reply);
@@ -454,6 +555,7 @@ impl Session {
         {
             self.search(false);
         }
+        self.update_hover(offset);
         let matches = self.find.matches.borrow();
         let highlights = (self.find.open.get_untracked() && !matches.is_empty()).then(|| {
             view::Highlights {
@@ -467,8 +569,9 @@ impl Session {
             self.look(),
             offset,
             self.shown_offset.get(),
-            self.repaint_all.take() || self.find.dirty.take(),
+            self.repaint_all.take() || self.find.dirty.take() || self.hover_dirty.take(),
             highlights,
+            self.hover.get(),
         );
         drop(matches);
         self.shown_offset.set(offset);
@@ -682,7 +785,116 @@ impl Session {
         }
     }
 
+    /// 指针在这一格上，停着的是哪个链接：网址，或者本机上真的存在的文件路径
+    fn link_under_pointer(&self, offset: usize) -> Option<view::Hover> {
+        let (row, column) = self.pointer_cell.get()?;
+        let found = {
+            let terminal = self.terminal.borrow();
+            view::source_line(&terminal, row, offset)
+                .and_then(|line| links::link_at(line, column))
+        };
+        let (link, start, end) = found?;
+        let hover = view::Hover { row, start, end };
+        // 还停在同一个上：不再问文件系统
+        if self.hover.get() == Some(hover) {
+            return Some(hover);
+        }
+        match link {
+            links::Link::Url(_) => Some(hover),
+            links::Link::Path { path, .. } => {
+                (self.local.get() && self.resolve_path(&path).is_some()).then_some(hover)
+            }
+        }
+    }
+
+    /// 指针停着的链接变了就记下来：画面要加下划线，光标要变手指
+    fn update_hover(&self, offset: usize) {
+        let hover = self.link_under_pointer(offset);
+        if hover != self.hover.get() {
+            self.hover.set(hover);
+            self.hover_dirty.set(true);
+            self.hovering_link.set(hover.is_some());
+        }
+    }
+
+    /// 指针移到了 `cell` 上（离开终端是 `None`）
+    fn pointer_over(&self, cell: Option<(usize, usize)>) {
+        if self.pointer_cell.replace(cell) != cell {
+            self.update_hover(self.offset.get());
+            if self.hover_dirty.get() {
+                self.flush();
+            }
+        }
+    }
+
+    /// 标成本机的终端（别的是服务器、容器）
+    pub fn set_local(&self, local: bool) {
+        self.local.set(local);
+    }
+
+    /// ⌘（别的平台是 Ctrl）加点击：点在链接上就打开。收下了返回 `true`
+    fn open_link_at(&self, event: &PointerEvent) -> bool {
+        let modifier = if cfg!(target_os = "macos") {
+            event.modifiers.has_super()
+        } else {
+            event.modifiers.has_control()
+        };
+        if !modifier || !matches!(event.button, Some(MouseButton::Left)) {
+            return false;
+        }
+        let Some((row, column)) = self.cell_at(event.position) else {
+            return false;
+        };
+        let link = {
+            let terminal = self.terminal.borrow();
+            view::source_line(&terminal, row, self.offset.get())
+                .and_then(|line| links::link_at(line, column))
+        };
+        let Some((link, ..)) = link else {
+            return false;
+        };
+        self.open_link(&link)
+    }
+
+    fn open_link(&self, link: &links::Link) -> bool {
+        match link {
+            links::Link::Url(url) => aureole::open_url(url),
+            links::Link::Path { path, .. } => {
+                if !self.local.get() {
+                    return false;
+                }
+                let Some(resolved) = self.resolve_path(path) else {
+                    return false;
+                };
+                // 目录在访达里打开；文件只有常见的文档、图片、代码才直接用默认应用打开，
+                // 别的（脚本、应用、安装包……）只在访达里选中，不会被点一下就运行起来
+                if resolved.is_dir() || links::is_plain_document(&resolved) {
+                    aureole::open_path(&resolved)
+                } else {
+                    aureole::reveal_path(&resolved)
+                }
+            }
+        }
+    }
+
+    /// 终端里写的路径对应本机的哪个已存在的文件：`~` 展开，相对路径从 shell 现在的目录算起
+    fn resolve_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        let candidate = if let Some(rest) = path.strip_prefix("~/") {
+            crate::store::user_home()?.join(rest)
+        } else if path.starts_with('/') {
+            std::path::PathBuf::from(path)
+        } else {
+            self.working_directory()?.join(path)
+        };
+        candidate.canonicalize().ok()
+    }
+
     fn pointer_down(&self, event: &PointerEvent) {
+        if self.open_link_at(event) {
+            // 这一下是点链接，不开始选字
+            event.prevent_builtin(Builtin::TEXT_SELECT | Builtin::DRAG);
+            return;
+        }
         if !self.mouse_reporting(event.modifiers) {
             return;
         }
@@ -725,6 +937,7 @@ impl Session {
     }
 
     fn pointer_move(&self, event: &PointerEvent) {
+        self.pointer_over(self.cell_at(event.position));
         if !self.mouse_reporting(event.modifiers) {
             return;
         }
@@ -1109,8 +1322,13 @@ pub fn view(
             focus.focus();
         }
     });
-    let (keys_session, ime_session, wheel_session) =
-        (session.clone(), session.clone(), session.clone());
+    let (keys_session, ime_session, wheel_session, leave_session) = (
+        session.clone(),
+        session.clone(),
+        session.clone(),
+        session.clone(),
+    );
+    let hovering = session.hovering_link;
     let (down_session, up_session, move_session, focus_session, click_session) = (
         session.clone(),
         session.clone(),
@@ -1170,6 +1388,15 @@ pub fn view(
                 .on_pointer_down(move |event: &PointerEvent| down_session.pointer_down(event))
                 .on_pointer_up(move |event: &PointerEvent| up_session.pointer_up(event))
                 .on_pointer_move(move |event: &PointerEvent| move_session.pointer_move(event))
+                .on_pointer_leave(move |_: &PointerEvent| leave_session.pointer_over(None))
+                // 指针在链接上是手指，别处是文字光标
+                .cursor(move || {
+                    if hovering.get() {
+                        Cursor::Pointer
+                    } else {
+                        Cursor::Text
+                    }
+                })
                 .on_keyboard_focus(move |focused: bool| focus_session.focus_changed(focused))
                 .on_wheel(move |event: &WheelEvent| {
                     wheel_session.wheel(event);
@@ -1297,6 +1524,191 @@ mod tests {
             grid.x + (column as f32 + 0.5) * cell.0,
             grid.y + (row as f32 + 0.5) * cell.1,
         )
+    }
+
+    fn session_with_alerts() -> (Rc<Session>, Rc<RefCell<Vec<Alert>>>) {
+        let alerts = Rc::new(RefCell::new(Vec::new()));
+        let mut hooks = Hooks::none();
+        let sink = alerts.clone();
+        hooks.alert = Rc::new(move |alert| sink.borrow_mut().push(alert));
+        let session = Session::new(
+            Terminal::new(40, 5),
+            CharGrid::new(40, 5),
+            None,
+            hooks,
+            Form::new(&crate::settings::Settings::default()),
+        );
+        (session, alerts)
+    }
+
+    /// 前台命令跑够 10 秒才算「跑完了」：一闪而过的不提醒，跑得久的结束时提醒一次，带上用了多久
+    #[test]
+    fn finished_alert_needs_a_long_enough_run() {
+        let (session, alerts) = session_with_alerts();
+        let start = std::time::Instant::now();
+        let after = |seconds: u64| start + std::time::Duration::from_secs(seconds);
+        session.watch_busy(true, start);
+        session.watch_busy(false, after(3));
+        assert!(alerts.borrow().is_empty(), "3 秒的不提醒");
+        session.watch_busy(true, after(10));
+        session.watch_busy(true, after(15));
+        assert!(alerts.borrow().is_empty(), "还在跑");
+        session.watch_busy(false, after(22));
+        assert_eq!(*alerts.borrow(), [Alert::Finished { seconds: 12 }]);
+        session.watch_busy(false, after(30));
+        assert_eq!(alerts.borrow().len(), 1, "没有命令在跑时不重复提醒");
+    }
+
+    /// 程序自己要求的通知（OSC 9 / 777）转给外面；刷屏时两条之间要隔一会儿；前台有程序时响铃也算，shell 提示符前的不算
+    #[test]
+    fn programs_can_ask_for_notifications() {
+        let (session, alerts) = session_with_alerts();
+        session.feed_for_test("\x1b]9;build done\x07\x1b]9;second\x07");
+        assert_eq!(
+            *alerts.borrow(),
+            [Alert::Message { title: String::new(), body: "build done".into() }],
+            "紧挨着的第二条被压住"
+        );
+        let (session, alerts) = session_with_alerts();
+        session.feed_for_test("\x07");
+        assert!(alerts.borrow().is_empty(), "没有前台程序时响铃不提醒");
+        session.watch_busy(true, std::time::Instant::now());
+        session.feed_for_test("\x07");
+        assert_eq!(
+            *alerts.borrow(),
+            [Alert::Message { title: String::new(), body: "终端响铃".into() }]
+        );
+        let (session, alerts) = session_with_alerts();
+        session.feed_for_test("\x1b]777;notify;Claude;需要你确认\x07");
+        assert_eq!(
+            *alerts.borrow(),
+            [Alert::Message { title: "Claude".into(), body: "需要你确认".into() }]
+        );
+    }
+
+    /// 网址一直是链接的颜色；指针停上去加下划线、光标变手指，移开就恢复；文字光标回来
+    #[test]
+    fn links_are_colored_and_underline_on_hover() {
+        let (harness, _recorder, grid, cell, session) = mounted_with(
+            "go https://example.com/a now\r\n",
+            crate::settings::Settings::default(),
+        );
+        let link_color = view::colors(crate::theme::is_dark()).link;
+        let style_at = |column: usize| session.grid.cell(0, column).expect("有格子").style;
+        // 没有指针时：网址是链接的颜色，没有下划线；别的字是原样
+        assert_eq!(style_at(5).foreground, Some(link_color));
+        assert!(!style_at(5).underline);
+        assert_ne!(style_at(0).foreground, Some(link_color));
+        assert_eq!(harness.cursor(), Cursor::Default);
+        let (x, y) = center(grid, cell, 0, 8);
+        harness.mouse_move(x, y);
+        harness.frame();
+        assert_eq!(harness.cursor(), Cursor::Pointer, "在链接上是手指");
+        assert!(style_at(3).underline && style_at(23).underline, "整个网址都有下划线");
+        assert!(!style_at(0).underline && !style_at(28).underline, "旁边的字没有");
+        let (ox, oy) = center(grid, cell, 0, 1);
+        harness.mouse_move(ox, oy);
+        harness.frame();
+        assert_eq!(harness.cursor(), Cursor::Text, "移开变回文字光标");
+        assert!(!style_at(8).underline, "下划线撤掉");
+        assert_eq!(style_at(8).foreground, Some(link_color), "颜色还在");
+    }
+
+    /// 文件路径平时不着色（提示符里的路径太多），指针停在本机真有的路径上才有颜色和下划线；不存在的、服务器上的没有
+    #[test]
+    fn paths_light_up_only_when_openable() {
+        let directory = crate::store::tests::scratch("links-hover");
+        std::fs::create_dir_all(&directory).expect("建目录");
+        std::fs::write(directory.join("a.txt"), "x").expect("写文件");
+        // 临时目录的路径太长会折行：用一条短的符号链接指过去，屏幕上写短路径
+        let short = std::path::PathBuf::from(format!("/tmp/nl{}", std::process::id()));
+        let _ = std::fs::remove_file(&short);
+        std::os::unix::fs::symlink(&directory, &short).expect("建链接");
+        let existing = format!("{}/a.txt", short.display());
+        let text = format!("{existing} /no/such/file\r\n");
+        let (harness, _recorder, grid, cell, session) =
+            mounted_with(&text, crate::settings::Settings::default());
+        let link_color = view::colors(crate::theme::is_dark()).link;
+        let style_at = |column: usize| session.grid.cell(0, column).expect("有格子").style;
+        let on_path = existing.chars().count() / 2;
+        let missing = existing.chars().count() + 5;
+        assert_ne!(style_at(on_path).foreground, Some(link_color), "平时不着色");
+        let (x, y) = center(grid, cell, 0, on_path);
+        harness.mouse_move(x, y);
+        harness.frame();
+        assert_eq!(harness.cursor(), Cursor::Text, "不是本机的终端：路径不算链接");
+        session.set_local(true);
+        let (nx, ny) = center(grid, cell, 0, on_path + 1);
+        harness.mouse_move(nx, ny);
+        harness.mouse_move(x, y);
+        harness.frame();
+        assert_eq!(harness.cursor(), Cursor::Pointer);
+        assert!(style_at(on_path).underline);
+        assert_eq!(style_at(on_path).foreground, Some(link_color));
+        let (mx, my) = center(grid, cell, 0, missing);
+        harness.mouse_move(mx, my);
+        harness.frame();
+        assert_eq!(harness.cursor(), Cursor::Text, "不存在的路径不是链接");
+        assert!(!style_at(missing).underline);
+        std::fs::remove_file(&short).ok();
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// ⌘ 加点击打开终端里的网址；不按 ⌘ 点、点在别处都不开；程序抓着鼠标时 ⌘ 点链接也归链接
+    #[test]
+    fn command_click_opens_urls() {
+        let (harness, recorder, grid, cell, _session) = mounted_with(
+            "see https://example.com/a. now\r\n",
+            crate::settings::Settings::default(),
+        );
+        let (x, y) = center(grid, cell, 0, 8);
+        harness.click(x, y);
+        assert!(harness.opened_urls().is_empty(), "不按 ⌘ 不开");
+        let (nx, ny) = center(grid, cell, 0, 1);
+        harness.click_with(nx, ny, Modifiers::SUPER);
+        assert!(harness.opened_urls().is_empty(), "点在别处不开");
+        harness.click_with(x, y, Modifiers::SUPER);
+        assert_eq!(harness.opened_urls(), ["https://example.com/a"]);
+        assert!(recorder.take().is_empty(), "点链接不往 shell 里写东西");
+
+        // 程序抓着鼠标（1000）：⌘ 点链接还是开链接，不上报
+        let (harness, recorder, grid, cell, _session) = mounted_with(
+            "\x1b[?1000h\x1b[?1006hsee https://example.com/b now",
+            crate::settings::Settings::default(),
+        );
+        let (x, y) = center(grid, cell, 0, 8);
+        harness.click_with(x, y, Modifiers::SUPER);
+        assert_eq!(harness.opened_urls(), ["https://example.com/b"]);
+        assert!(recorder.take().is_empty());
+    }
+
+    /// 文件路径：只有本机的终端才打得开，路径要真的存在；`~`、相对路径都能认
+    #[test]
+    fn paths_open_only_for_local_sessions_and_existing_files() {
+        let directory = crate::store::tests::scratch("links");
+        std::fs::create_dir_all(&directory).expect("建目录");
+        let file = directory.join("note.txt");
+        std::fs::write(&file, "hi").expect("写文件");
+        let program = directory.join("run.command");
+        std::fs::write(&program, "#!/bin/sh").expect("写文件");
+        let (_harness, _recorder, _grid, _cell, session) =
+            mounted_with("", crate::settings::Settings::default());
+        let path = |text: &str| links::Link::Path { path: text.to_string(), line: None };
+        let note = file.to_string_lossy().to_string();
+        assert!(!session.open_link(&path(&note)), "服务器的终端不开本机的路径");
+        session.set_local(true);
+        assert!(session.open_link(&path(&note)));
+        assert!(!session.open_link(&path(&format!("{note}.missing"))), "不存在的不开");
+        assert_eq!(
+            session.resolve_path(&note),
+            file.canonicalize().ok(),
+            "绝对路径原样"
+        );
+        assert!(session.resolve_path("./relative-without-a-directory").is_none());
+        // 脚本只在访达里选中，不被点一下就运行
+        assert!(!links::is_plain_document(&program));
+        assert!(links::is_plain_document(&file));
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     /// 程序开了鼠标上报（1000 + SGR）：点一下，按下和松开都要报，坐标是点中的那一格

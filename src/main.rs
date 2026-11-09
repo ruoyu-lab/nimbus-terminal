@@ -18,6 +18,7 @@ mod display;
 mod docker;
 mod files;
 mod icons;
+mod links;
 mod monitor;
 mod native;
 mod pane;

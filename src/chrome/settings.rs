@@ -326,6 +326,13 @@ fn terminal(form: Form) -> Element {
                 ],
             ),
             (
+                "通知",
+                vec![setting(
+                    "窗口在后台时，命令跑完（10 秒以上）、程序要求通知，用系统通知提醒",
+                    toggle(form.notifications, "set-notifications", "后台通知"),
+                )],
+            ),
+            (
                 "响铃",
                 vec![setting(
                     "程序响铃时",
@@ -701,7 +708,7 @@ fn preview(form: Form) -> Element {
 }
 
 fn shortcuts_page() -> Element {
-    const KEYS: [(&str, &str); 14] = [
+    const KEYS: [(&str, &str); 15] = [
         ("新建会话", "⌘T"),
         ("左右分屏", "⌘D"),
         ("上下分屏", "⌘⇧D"),
@@ -709,6 +716,7 @@ fn shortcuts_page() -> Element {
         ("命令面板", "⌘K"),
         ("在终端中查找", "⌘F"),
         ("查找：上一处 / 下一处", "⌘G  ⌘⇧G"),
+        ("放大 / 缩小 / 还原字号", "⌘+  ⌘-  ⌘0"),
         ("收起 / 展开侧栏", "⌘B"),
         ("打开 / 退出设置", "⌘,"),
         ("切到第 1 – 8 个标签", "⌘1 – ⌘8"),
