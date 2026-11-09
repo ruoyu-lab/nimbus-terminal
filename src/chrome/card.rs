@@ -5,6 +5,7 @@ use std::rc::Rc;
 use aureole::prelude::*;
 
 use crate::app;
+use crate::chrome::find;
 use crate::chrome::menu::pane_menu_overlay;
 use crate::chrome::settings;
 use crate::chrome::widgets::{directory_drop, outline_button};
@@ -148,12 +149,22 @@ fn pane_leaf(
     let focused = move || focus.get() == pane;
     // 右键菜单：点在哪、开没开
     let (open, at) = (signal(false), signal([0.0f32, 0.0]));
+    // 查找条：浮在这个终端的右上角。输入框里的字一变就重新找
+    let (find_open, find_query) = (session.find_open(), session.find_query());
+    let bounds = signal(Rect::default());
+    let finder = session.clone();
+    Effect::new(move || {
+        let _ = find_query.get();
+        finder.find_changed();
+    });
+    let (find_bar, find_close) = (session.clone(), session.clone());
     let leaf = column()
         .name(format!("pane-{pane}"))
         .grow(1)
         .min_width(0)
         .min_height(0)
         .clip(true)
+        .report_bounds(bounds)
         .on_pointer_down(move |_: &PointerEvent| owner.focus_pane(tab_id, pane))
         // 从右侧文件页拖来的条目：把它的绝对路径写在这个终端的光标处（引好，不按回车）
         .accepts_drop(|_: &RemotePath| true)
@@ -185,6 +196,22 @@ fn pane_leaf(
             at.set(position);
             open.set(true);
         }));
+    let leaf = leaf.overlay(
+        find_open,
+        Overlay::new(move || find::bar(find_bar.clone()))
+            .at(move || {
+                let bounds = bounds.get();
+                [bounds.x + bounds.width - 12.0, bounds.y + 6.0]
+            })
+            .placement(Placement::bottom().end())
+            .auto_focus(true)
+            // 点终端不关查找条（边看边找）；Esc 才关
+            .on_dismiss(move |dismiss| {
+                if dismiss == Dismiss::Escape {
+                    find_close.close_find();
+                }
+            }),
+    );
     pane_menu_overlay(leaf, open, at, workspace, tab_id, pane)
 }
 

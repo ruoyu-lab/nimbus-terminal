@@ -5064,3 +5064,66 @@ fn revisiting_a_directory_shows_the_cached_listing_while_it_refreshes() {
     // 用 ~ 回主目录也走缓存（读过一次 ~ 就知道主目录是哪个）
     assert_eq!(files_of(&workspace).home.as_deref(), Some("/home/deploy"));
 }
+
+/// ⌘F 打开查找条，打字就找：命中高亮，当前那一处是最新的；回车往更早的找，会翻回历史；Esc 关掉并撤掉高亮
+#[test]
+fn find_bar_highlights_steps_through_history_and_closes() {
+    let (harness, workspace) = mounted();
+    let session = workspace.focused_session().expect("有终端");
+    for index in 0..120 {
+        let marker = if matches!(index, 5 | 60 | 115) { "needle" } else { "hay" };
+        session.feed_for_test(&format!("row {index} {marker}\r\n"));
+    }
+    harness.frame();
+    assert!(harness.bounds("find-bar").is_none());
+    command(&harness, "f");
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("find-bar").is_some(), "⌘F 打开查找条");
+    harness.type_text("needle");
+    harness.advance(secs(1.0));
+    assert_eq!(harness.text("find-status").as_deref(), Some("3/3"));
+    // 最新的一处（115）在屏幕上，是当前；屏幕上只有它
+    let lit = session.highlighted_for_test();
+    assert_eq!(lit.len(), "needle".len(), "{lit:?}");
+    assert!(lit.iter().all(|&(_, _, current)| current));
+    assert_eq!(session.offset_for_test(), 0);
+
+    // 回车：上一处（60），在历史里，翻回去后看得见
+    harness.key_down(NamedKey::Enter);
+    harness.advance(secs(1.0));
+    assert_eq!(harness.text("find-status").as_deref(), Some("2/3"));
+    assert!(session.offset_for_test() > 0, "翻回历史");
+    let lit = session.highlighted_for_test();
+    assert_eq!(lit.len(), "needle".len(), "{lit:?}");
+    assert!(lit.iter().all(|&(_, _, current)| current));
+    // ⌘⇧G 回到下一处
+    harness.key_down_with(Key::Character("G".into()), Modifiers::SUPER | Modifiers::SHIFT);
+    harness.advance(secs(1.0));
+    assert_eq!(harness.text("find-status").as_deref(), Some("3/3"));
+    assert_eq!(session.offset_for_test(), 0);
+
+    // Esc 关掉：高亮撤掉
+    harness.key_down(NamedKey::Escape);
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("find-bar").is_none(), "Esc 关查找条");
+    assert!(session.highlighted_for_test().is_empty());
+}
+
+/// 没有命中显示「无结果」；新输出让命中跟着变
+#[test]
+fn find_bar_reports_no_match_and_follows_new_output() {
+    let (harness, workspace) = mounted();
+    let session = workspace.focused_session().expect("有终端");
+    session.feed_for_test("alpha\r\n");
+    command(&harness, "f");
+    harness.advance(secs(1.0));
+    harness.type_text("zzz");
+    harness.advance(secs(1.0));
+    assert_eq!(harness.text("find-status").as_deref(), Some("无结果"));
+    assert!(session.highlighted_for_test().is_empty());
+    // 查找条开着时又来了输出：新的命中也要高亮
+    session.feed_for_test("zzz again\r\n");
+    harness.advance(secs(1.0));
+    assert_eq!(harness.text("find-status").as_deref(), Some("1/1"));
+    assert_eq!(session.highlighted_for_test().len(), 3);
+}

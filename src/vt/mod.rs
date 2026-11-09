@@ -10,6 +10,7 @@ pub mod keys;
 pub mod mouse;
 mod parser;
 pub mod screen;
+pub mod search;
 
 use unicode_width::UnicodeWidthChar;
 

@@ -23,6 +23,7 @@
 //! 共用的小零件在 `widgets`。
 
 mod card;
+mod find;
 mod menu;
 mod palette;
 mod panel;

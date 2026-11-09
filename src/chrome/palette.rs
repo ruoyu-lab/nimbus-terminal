@@ -25,6 +25,7 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
         hint,
         run,
     };
+    let find = workspace.clone();
     let (new_tab, close, toggle, settings, choose, columns, rows) = (
         workspace.clone(),
         workspace.clone(),
@@ -46,6 +47,12 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
             "关闭当前会话",
             "⌘W",
             Rc::new(move || close.close_active()),
+        ),
+        command(
+            "cmd-find",
+            "在终端中查找",
+            "⌘F",
+            Rc::new(move || find.find_in_terminal()),
         ),
         command(
             "cmd-toggle-sidebar",

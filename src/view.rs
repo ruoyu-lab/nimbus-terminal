@@ -15,6 +15,7 @@ use aureole::prelude::*;
 
 use crate::settings::CursorStyle;
 use crate::theme::{DARK_CARD, DARK_INK, LIGHT_CARD, LIGHT_INK};
+use crate::vt::search::Match;
 use crate::vt::{Attributes, Cell, ColorSpec, CursorShape, Terminal};
 
 /// 默认字号（逻辑像素）
@@ -49,6 +50,10 @@ pub struct Colors {
     pub foreground: Color,
     /// 响铃闪一下时的底色
     pub flash: Color,
+    /// 查找命中的底色、当前这一处的底色，和命中处的字色
+    pub found: Color,
+    pub found_current: Color,
+    pub found_ink: Color,
     table: [Color; 256],
 }
 
@@ -83,6 +88,9 @@ static LIGHT: LazyLock<Colors> = LazyLock::new(|| Colors {
     background: LIGHT_CARD,
     foreground: LIGHT_INK,
     flash: Color::hex(0xe9eaec),
+    found: Color::hex(0xffe27a),
+    found_current: Color::hex(0xff9b3d),
+    found_ink: Color::hex(0x1f2328),
     table: build_table(&LIGHT16),
 });
 
@@ -90,6 +98,9 @@ static DARK: LazyLock<Colors> = LazyLock::new(|| Colors {
     background: DARK_CARD,
     foreground: DARK_INK,
     flash: Color::hex(0x2e2e2e),
+    found: Color::hex(0x7a6212),
+    found_current: Color::hex(0xe0892b),
+    found_ink: Color::hex(0xf5f5f5),
     table: build_table(&DARK16),
 });
 
@@ -105,6 +116,26 @@ pub struct Look {
     pub cursor: CursorStyle,
     /// 设置允许光标闪烁（程序还可以自己关）
     pub blink: bool,
+}
+
+/// 查找的命中：要高亮的位置，和哪一处是「当前」的。`matches` 按行从小到大排
+#[derive(Clone, Copy)]
+pub struct Highlights<'a> {
+    pub matches: &'a [Match],
+    pub current: Option<usize>,
+}
+
+impl Highlights<'_> {
+    /// 绝对行 `line` 上的命中：`(起列, 止列, 是不是当前这一处)`
+    fn on_line(&self, line: usize) -> Vec<(usize, usize, bool)> {
+        let first = self.matches.partition_point(|hit| hit.line < line);
+        self.matches[first..]
+            .iter()
+            .enumerate()
+            .take_while(|(_, hit)| hit.line == line)
+            .map(|(index, hit)| (hit.start, hit.end, self.current == Some(first + index)))
+            .collect()
+    }
 }
 
 /// 窗口这么大的话放得下几列几行。`cell` 是一格的逻辑像素大小，没量到之前用估计值
@@ -162,6 +193,7 @@ pub fn paint(
     offset: usize,
     shown_offset: usize,
     full: bool,
+    highlights: Option<Highlights>,
 ) {
     let (columns, rows) = terminal.size();
     if grid.size() != [columns, rows] {
@@ -169,10 +201,16 @@ pub fn paint(
     }
     let damage = terminal.damage();
     let colors = look.colors;
-    if full {
+    // 查找开着：命中随时在变（新输出、翻页），每次整屏按「历史加屏幕」那条长条重画，行数不多，不值得做增量
+    if full || highlights.is_some() {
         // 配色换了：每个格子的颜色都要重算
+        let history = terminal.scrollback_len();
         for row in 0..rows {
-            paint_row(grid, colors, row, source_line(terminal, row, offset));
+            let marks = highlights
+                .zip((history + row).checked_sub(offset))
+                .map(|(highlights, line)| highlights.on_line(line))
+                .unwrap_or_default();
+            paint_row(grid, colors, row, source_line(terminal, row, offset), &marks);
         }
     } else if offset == 0 && shown_offset == 0 {
         if damage.scrolled_out > 0 {
@@ -184,11 +222,12 @@ pub fn paint(
                 colors,
                 row,
                 terminal.screen().lines.get(row).map(|line| line.as_slice()),
+                &[],
             );
         }
     } else if offset != shown_offset || !damage.rows.is_empty() || damage.scrolled_out > 0 {
         for row in 0..rows {
-            paint_row(grid, colors, row, source_line(terminal, row, offset));
+            paint_row(grid, colors, row, source_line(terminal, row, offset), &[]);
         }
     }
     let caret = caret(terminal, look, offset);
@@ -198,15 +237,25 @@ pub fn paint(
 }
 
 /// 重写一行：先清成默认底色，再把同样式的一段一次写进去。`line` 比网格窄（历史行去掉了行尾空格）没关系
-fn paint_row(grid: &CharGrid, colors: &Colors, row: usize, line: Option<&[Cell]>) {
+fn paint_row(
+    grid: &CharGrid,
+    colors: &Colors,
+    row: usize,
+    line: Option<&[Cell]>,
+    marks: &[(usize, usize, bool)],
+) {
     grid.clear_row(row, CharCellStyle::default());
     let Some(line) = line else { return };
     let mut column = 0;
     while column < line.len() {
         let attrs = line[column].attrs;
+        let mark = mark_at(marks, column);
         let start = column;
         let mut text = String::new();
-        while column < line.len() && line[column].attrs == attrs {
+        while column < line.len()
+            && line[column].attrs == attrs
+            && mark_at(marks, column) == mark
+        {
             // 宽字的右半不带字，交给 `write` 自己按宽度占格
             if line[column].width != 0 {
                 text.push(if attrs.hidden { ' ' } else { line[column].ch });
@@ -214,9 +263,26 @@ fn paint_row(grid: &CharGrid, colors: &Colors, row: usize, line: Option<&[Cell]>
             column += 1;
         }
         if !text.is_empty() {
-            grid.write(row, start, &text, style(colors, attrs));
+            let mut cell_style = style(colors, attrs);
+            if let Some(current) = mark {
+                // 命中的地方：自己的底色和字色，不管原来是什么样式
+                let background = if current { colors.found_current } else { colors.found };
+                cell_style = cell_style
+                    .inverse(false)
+                    .background(background)
+                    .foreground(colors.found_ink);
+            }
+            grid.write(row, start, &text, cell_style);
         }
     }
+}
+
+/// 这一列在不在命中里：`None` 不在，`Some(true)` 在当前那一处里
+fn mark_at(marks: &[(usize, usize, bool)], column: usize) -> Option<bool> {
+    marks
+        .iter()
+        .find(|(start, end, _)| (*start..*end).contains(&column))
+        .map(|(_, _, current)| *current)
 }
 
 /// 一格的样式：仿真层的写法 → 网格的写法
@@ -296,7 +362,7 @@ mod tests {
     fn live_view_shows_the_screen() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 0, 0, false);
+        paint(&mut terminal, &grid, look(), 0, 0, false, None);
         assert_eq!(rows(&grid), ["4", "5", "6"]);
     }
 
@@ -305,10 +371,10 @@ mod tests {
     fn scrolled_back_view_joins_history_and_screen() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 0, 0, false);
-        paint(&mut terminal, &grid, look(), 2, 0, false);
+        paint(&mut terminal, &grid, look(), 0, 0, false, None);
+        paint(&mut terminal, &grid, look(), 2, 0, false, None);
         assert_eq!(rows(&grid), ["2", "3", "4"]);
-        paint(&mut terminal, &grid, look(), 3, 2, false);
+        paint(&mut terminal, &grid, look(), 3, 2, false, None);
         assert_eq!(rows(&grid), ["1", "2", "3"]);
     }
 
@@ -317,9 +383,9 @@ mod tests {
     fn returning_to_live_restores_the_screen() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 0, 0, false);
-        paint(&mut terminal, &grid, look(), 3, 0, false);
-        paint(&mut terminal, &grid, look(), 0, 3, false);
+        paint(&mut terminal, &grid, look(), 0, 0, false, None);
+        paint(&mut terminal, &grid, look(), 3, 0, false, None);
+        paint(&mut terminal, &grid, look(), 0, 3, false, None);
         assert_eq!(rows(&grid), ["4", "5", "6"]);
     }
 
@@ -328,11 +394,11 @@ mod tests {
     fn new_output_while_scrolled_back_repaints_the_view() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 0, 0, false);
-        paint(&mut terminal, &grid, look(), 2, 0, false);
+        paint(&mut terminal, &grid, look(), 0, 0, false, None);
+        paint(&mut terminal, &grid, look(), 2, 0, false, None);
         terminal.feed(b"\r\n7");
         // 又滚出去一行，看着的那一屏要跟着多翻一行才不动
-        paint(&mut terminal, &grid, look(), 3, 2, false);
+        paint(&mut terminal, &grid, look(), 3, 2, false, None);
         assert_eq!(rows(&grid), ["2", "3", "4"]);
     }
 
@@ -340,9 +406,9 @@ mod tests {
     fn caret_hides_while_scrolled_back() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 1, 0, false);
+        paint(&mut terminal, &grid, look(), 1, 0, false, None);
         assert!(grid.caret().hidden);
-        paint(&mut terminal, &grid, look(), 0, 1, false);
+        paint(&mut terminal, &grid, look(), 0, 1, false, None);
         assert!(!grid.caret().hidden);
     }
 }

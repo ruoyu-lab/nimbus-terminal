@@ -1550,6 +1550,34 @@ impl Workspace {
     }
 
     /// ⌘W：设置页开着时是退出设置，否则关当前标签
+    /// 现在聚焦的那个终端（设置页开着时没有）
+    pub fn focused_session(&self) -> Option<Rc<crate::app::Session>> {
+        if self.settings_open.get_untracked() {
+            return None;
+        }
+        let active = self.active.get_untracked();
+        let tab = self
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == active)?;
+        tab.layout.get_untracked().session(tab.focus.get_untracked())
+    }
+
+    /// ⌘F：在聚焦的终端里打开查找条
+    pub fn find_in_terminal(&self) {
+        if let Some(session) = self.focused_session() {
+            session.open_find();
+        }
+    }
+
+    /// ⌘G、⌘⇧G：跳到上一处（更早的）、下一处
+    pub fn find_step(&self, older: bool) {
+        if let Some(session) = self.focused_session() {
+            session.find_step(older);
+        }
+    }
+
     pub fn close_active(&self) {
         if self.settings_open.get_untracked() {
             self.close_settings();
@@ -2085,6 +2113,8 @@ impl Workspace {
             } else {
                 Axis::Columns
             }),
+            "f" | "F" => self.find_in_terminal(),
+            "g" | "G" => self.find_step(!modifiers.has_shift()),
             "k" | "K" => self.palette_open.update(|open| *open = !*open),
             "," => self.toggle_settings(),
             // ⌘⇧[ / ⌘⇧]

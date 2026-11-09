@@ -20,6 +20,7 @@ pub enum Icon {
     Upload,
     Refresh,
     ArrowUp,
+    ArrowDown,
     Sliders,
     Columns,
     Rows,
@@ -65,6 +66,7 @@ impl Icon {
                 "M20 11A8.1 8.1 0 0 0 4.5 9 M4 5v4h4 M4 13a8.1 8.1 0 0 0 15.5 2 M20 19v-4h-4"
             }
             Icon::ArrowUp => "M12 19V5 M5 12l7-7 7 7",
+            Icon::ArrowDown => "M12 5v14 M5 12l7 7 7-7",
             Icon::Sliders => {
                 "M4 7h9 M17 7h3 M4 17h3 M11 17h9 M13 7a2 2 0 1 0 4 0a2 2 0 1 0-4 0 M7 17a2 2 0 1 0 4 0a2 2 0 1 0-4 0"
             }
