@@ -9,8 +9,22 @@
 - Windows 的 pty 后端（ConPTY）：起 shell、读写、改大小、子进程退出时报退出码、关标签时结束子进程；
   能问到 shell 的当前目录（cmd 有效，PowerShell 的 `cd` 不改进程目录）和下面有没有程序在跑。
   命令标记（OSC 133）、超链接（OSC 8）实测能穿过系统自带的 ConPTY
+- Windows 上按 shell 新建会话：加号旁边的小箭头、命令面板里选命令提示符、Windows PowerShell、PowerShell 7（没装的灰着写「未安装」）；
+  标签记住自己的 shell，拆分、重启都跟着走，默认标题就是 shell 的名字
+- PowerShell 的 shell 集成（5.1 和 7）：自动加载，发命令标记和当前目录（OSC 7），命令间跳转、复制输出、命令跑完通知、命令历史都能用了；
+  仿真层认 OSC 7 和 ConEmu 的 OSC 9;9（以前 9;9 会被当成通知）
+- Windows 上服务器的监控和文件页：另开只用密钥的连接（系统的 OpenSSH 没有连接复用），只能输密码的服务器给出提示
+- Windows 路径：点得开 `C:\…`、`.\…`、`~\…`、共享路径；拖文件进终端按这个终端起的 shell 引；文件页能上传、下载
+- 键盘复制（Ctrl+Shift+C、Ctrl+Insert）、Shift+Insert 粘贴、Ctrl+Shift+A 全选（Windows、Linux）
+- Windows 的打包：`scripts/bundle-windows.ps1`（NSIS 或框架自己的安装程序），可执行文件编译时就带图标和应用标识；窗口位置按显示器记住
 
 ### 改动
+
+- Windows、Linux 的快捷键：Ctrl+Shift 代替 ⌘，分屏改成 Alt+Shift+= / Alt+Shift+-，查找的下一处、上一处是 F3 / Shift+F3；
+  界面上的快捷键提示按平台写
+- 默认 shell：Windows 上按 PowerShell 7 → Windows PowerShell → 命令提示符选
+- 字体选项按平台列（Windows：Cascadia Mono、Consolas、Courier New）；别的平台存的字体在这里没有时退回默认，别的设置不丢
+- Windows 的发布版不开控制台窗口，起 `ssh`、`sftp`、`docker` 也不闪黑窗
 
 - 界面框架更新到 aureole-framework 54913ae（windows-first-tier 分支）：Windows 上改窗口大小不抖、拖着窗口时界面照常、
   隐藏标题栏的窗口能在边框外改大小、默认 DX12、启动快约一倍、应用标识（通知用）。框架仓库是私有的，
@@ -18,6 +32,11 @@
 - 自己画的窗口按钮（Windows、Linux）按 Windows 的样子：各 46 宽、和标题栏一样高、贴着右上角，「— □ ✕」细线图形，
   最大化着时是还原，关闭悬停变红，和分屏按钮隔开。以前最小化、最大化借的是分屏和侧栏的图标，挨着分屏按钮分不清
 - Windows 上外框先不用系统材质：开着材质时系统会在右上角再画一套原生的窗口按钮，和自己画的叠在一起（框架的问题）
+
+### 修正
+
+- Windows 上按 Ctrl+A（回到行首）时整屏也被选中：终端网格自带的复制、全选键不再和写给 shell 的键抢
+- 从服务器下载到 Windows 时，带 `..\`、盘符、`:` 的远端文件名可能写到下载目录外面（或者 NTFS 的备用数据流里）：这些字换成 `_`
 
 ## [0.2.0] - 2026-11-09
 

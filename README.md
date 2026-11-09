@@ -78,7 +78,9 @@
 
 ## 安装
 
-目前只支持 **macOS**（pty 用的是 `forkpty`，Linux 同一套接口但没有在桌面上测过；Windows 上本机终端已经能用（ConPTY），还没打包，SSH 的监控和文件页、shell 集成等还在做，进度和清单见 [docs/windows.md](docs/windows.md)）。
+正式发布的版本目前只有 **macOS**（pty 用的是 `forkpty`，Linux 同一套接口但没有在桌面上测过）。
+Windows 上已经能日常用（ConPTY；命令提示符、Windows PowerShell、PowerShell 7 都能选），但界面框架现在依赖的是私有仓库，
+外面暂时编译不了；和 macOS 的差别见 [docs/windows.md](docs/windows.md)。
 
 ### 下载
 
