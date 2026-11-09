@@ -12,6 +12,15 @@ keywords = ["terminal", "terminal-emulator", "gui", "macos", "rust"]
 categories = ["command-line-utilities", "gui"]
 exclude = ["/docs", "/assets/icon.icns", "/.github"]
 
+# 打包设置，框架的打包工具读（Windows：scripts/bundle-windows.ps1）。macOS 的 .app 由 scripts/bundle-macos.sh 做，不读这里，
+# 包标识符要和它里面的一样。Windows 上编译脚本（build.rs）也读 identifier，编进可执行文件当应用标识
+[package.metadata.bundle]
+name = "Nimbus"
+identifier = "com.ruoyu-lab.nimbus"
+category = "developer-tools"
+# macOS 的图标四周留着系统规定的边，放在 Windows 的任务栏上显小：这张裁掉了大部分边
+icon = "assets/icon-windows.png"
+
 [dependencies]
 # 只用公开 API，不改框架。现在用的是私有仓库 windows-first-tier 分支上的提交（Windows 上改大小、标题栏、输入的改进），
 # 框架出了带这些的公开版本以后换回公开的
@@ -47,11 +56,13 @@ strip = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# ConPTY、起子进程、问子进程（当前目录、下面有没有程序在跑）。和框架依赖树里的是同一版
+# ConPTY、起子进程、问子进程（当前目录、下面有没有程序在跑）、列显示器。和框架依赖树里的是同一版，
+# 用到的特性框架也都开着，不会让它多编一遍
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Wdk_System_Threading",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
@@ -59,6 +70,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Kernel",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

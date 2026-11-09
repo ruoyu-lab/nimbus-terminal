@@ -5,7 +5,7 @@
 //! （标签拖动换位就是这样被抢走的）。这里让它回答 NO，窗口只在框架的 `window_drag_area` 标出来的
 //! 空白处拖动（那条路走 `performWindowDragWithEvent`，和这个方法无关）。
 //!
-//! 另外一处：响铃出声（`NSBeep`，框架没有提示音的接口）。
+//! 另外一处：没打包时把程序坞里的图标换成自己的。
 
 #[cfg(target_os = "macos")]
 pub fn keep_window_still_unless_asked() {
@@ -71,6 +71,7 @@ pub fn set_application_icon() {
     }
 }
 
-/// 别的平台的图标由窗口系统管
+/// 别的平台不用在运行时设：Windows 上图标编在可执行文件里（`build.rs`，打包时打包工具再写一遍），
+/// 框架建窗口时按编号读出来给标题栏和任务栏；Linux 上由安装包里的 .desktop 文件指定
 #[cfg(not(target_os = "macos"))]
 pub fn set_application_icon() {}

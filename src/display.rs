@@ -7,6 +7,8 @@
 //!
 //! 坐标都是逻辑像素，原点在主显示器左上角（和框架报的窗口位置同一套）。
 //! 位置按相对于所在显示器左上角的偏移存，显示器在桌面上的排列变了也还对。
+//! Windows 上每块显示器的物理像素按它自己的缩放比例换算（框架换算窗口位置也是这样），
+//! 缩放不同的几块显示器在逻辑坐标里不一定严丝合缝，可能隔开一段、也可能叠在一起。
 
 use serde::{Deserialize, Serialize};
 
@@ -296,10 +298,154 @@ pub fn displays() -> Vec<Display> {
     macos::displays()
 }
 
+/// 现在接着的显示器。框架的 `aureole::displays()` 用不上：开窗口之前（`main` 里定窗口开在哪）它是空的，
+/// 也没有去掉任务栏的可用区域和重新插拔后不变的身份，所以直接问系统
+#[cfg(windows)]
+pub fn displays() -> Vec<Display> {
+    windows::displays()
+}
+
 /// 别的平台还没接显示器信息：窗口位置交给系统，只记大小
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn displays() -> Vec<Display> {
     Vec::new()
+}
+
+/// 系统给的一块物理像素的矩形（左、上、右、下）换成逻辑像素：按这块显示器自己的缩放比例除。
+/// 窗口在这块显示器上时，框架报的窗口位置也是物理像素除以同一个比例，两边对得上
+#[cfg_attr(not(windows), allow(dead_code))]
+fn logical(left: i32, top: i32, right: i32, bottom: i32, scale: f32) -> Area {
+    Area::new(
+        left as f32 / scale,
+        top as f32 / scale,
+        (right - left) as f32 / scale,
+        (bottom - top) as f32 / scale,
+    )
+}
+
+#[cfg(windows)]
+mod windows {
+    use windows_sys::Win32::Foundation::{LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+        MONITORINFO, MONITORINFOEXW,
+    };
+    use windows_sys::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+        SetThreadDpiAwarenessContext,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY,
+    };
+    use windows_sys::core::BOOL;
+
+    use super::{Display, logical};
+
+    /// 在一条新线程上问。开窗口之前进程还没声明按显示器缩放（窗口库建事件循环时才声明），
+    /// 这时系统给的坐标、缩放都是按 96 DPI 虚拟出来的；只把那条线程设成按显示器缩放，
+    /// 不碰主线程（以后建的窗口按主线程的设置缩放，设过就不再跟着进程走了）
+    pub(super) fn displays() -> Vec<Display> {
+        std::thread::Builder::new()
+            .name("显示器".into())
+            .spawn(|| {
+                // SAFETY: 只改这条线程的缩放感知，参数是系统定义的常量；线程问完就结束，不用改回去
+                unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+                monitors().into_iter().filter_map(describe).collect()
+            })
+            .ok()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default()
+    }
+
+    fn monitors() -> Vec<HMONITOR> {
+        unsafe extern "system" fn collect(
+            monitor: HMONITOR,
+            _: HDC,
+            _: *mut RECT,
+            data: LPARAM,
+        ) -> BOOL {
+            // SAFETY: `data` 是下面传进来的 `Vec` 的地址，列的这段时间里它一直活着，也只有这里用
+            let monitors = unsafe { &mut *(data as *mut Vec<HMONITOR>) };
+            monitors.push(monitor);
+            // 接着列
+            1
+        }
+        let mut monitors: Vec<HMONITOR> = Vec::new();
+        // SAFETY: 不限定设备上下文和范围；回调只在这次调用里被调用，那时 `monitors` 还活着、没有别人借用
+        unsafe {
+            EnumDisplayMonitors(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                Some(collect),
+                &raw mut monitors as LPARAM,
+            )
+        };
+        monitors
+    }
+
+    /// 一块显示器的身份、缩放、整块屏幕和去掉任务栏后的区域；问不到时是 `None`
+    fn describe(monitor: HMONITOR) -> Option<Display> {
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: 句柄是刚列出来的；`cbSize` 是扩展结构体的大小，系统按它写到设备名为止，不出这个结构体
+        if unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) } == 0 {
+            return None;
+        }
+        let (mut dpi, mut dpi_y) = (0, 0);
+        // SAFETY: 两个输出参数都是这里的变量
+        let found =
+            unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y) } >= 0;
+        let scale = if found && dpi > 0 {
+            dpi as f32 / 96.0
+        } else {
+            1.0
+        };
+        let MONITORINFO {
+            rcMonitor: frame,
+            rcWork: work,
+            dwFlags: flags,
+            ..
+        } = info.monitorInfo;
+        Some(Display {
+            id: identity(&info.szDevice),
+            scale,
+            frame: logical(frame.left, frame.top, frame.right, frame.bottom, scale),
+            visible: logical(work.left, work.top, work.right, work.bottom, scale),
+            primary: flags & MONITORINFOF_PRIMARY != 0,
+        })
+    }
+
+    /// 显示器设备的接口路径（`\\?\DISPLAY#厂商和型号#接在哪#{类}`）：认的是显示器本身和它接的口，
+    /// 重启、重新插拔之后不变。问不到时用 GDI 的设备名（`\\.\DISPLAY1`，接法变了可能换号）
+    fn identity(device: &[u16; 32]) -> String {
+        let text = |wide: &[u16]| {
+            String::from_utf16_lossy(
+                &wide[..wide.iter().position(|&c| c == 0).unwrap_or(wide.len())],
+            )
+        };
+        // 系统要以 0 结尾的名字：多留一位，名字占满 32 个字符时也有结尾
+        let mut name = [0u16; 33];
+        name[..32].copy_from_slice(device);
+        let mut monitor = DISPLAY_DEVICEW {
+            cb: size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: 名字以 0 结尾；`cb` 是结构体的大小，系统只写这个结构体
+        let found = unsafe {
+            EnumDisplayDevicesW(
+                name.as_ptr(),
+                0,
+                &mut monitor,
+                EDD_GET_DEVICE_INTERFACE_NAME,
+            )
+        } != 0;
+        let interface = text(&monitor.DeviceID);
+        if found && !interface.is_empty() {
+            interface
+        } else {
+            text(device)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -667,6 +813,96 @@ mod tests {
             maximized: false,
         });
         assert_eq!(memory.plan(&[], (1.0, 1.0)).width, 1200.0);
+    }
+
+    /// Windows 上的一块显示器：系统给的是物理像素（左、上、右、下），底下一条任务栏（物理像素的高）
+    fn windows_display(
+        id: &str,
+        scale: f32,
+        (left, top, right, bottom): (i32, i32, i32, i32),
+        taskbar: i32,
+        primary: bool,
+    ) -> Display {
+        Display {
+            id: id.to_string(),
+            scale,
+            frame: logical(left, top, right, bottom, scale),
+            visible: logical(left, top, right, bottom - taskbar, scale),
+            primary,
+        }
+    }
+
+    /// 物理像素按每块显示器自己的缩放比例换成逻辑像素
+    #[test]
+    fn physical_pixels_are_divided_by_the_display_scale() {
+        assert_eq!(
+            logical(0, 0, 3840, 2160, 1.5),
+            Area::new(0.0, 0.0, 2560.0, 1440.0)
+        );
+        assert_eq!(
+            logical(3840, -120, 5760, 960, 1.0),
+            Area::new(3840.0, -120.0, 1920.0, 1080.0)
+        );
+        assert_eq!(
+            logical(-2880, 0, 0, 1800, 2.0),
+            Area::new(-1440.0, 0.0, 1440.0, 900.0)
+        );
+    }
+
+    /// 主显示器 150%，右边接一块 100% 的：逻辑坐标里两块之间隔着一段，各自的窗口照样记得住、放得回，
+    /// 窗口也不会压在任务栏上
+    #[test]
+    fn displays_with_different_scales_each_keep_their_window() {
+        let main = windows_display("main", 1.5, (0, 0, 3840, 2160), 72, true);
+        let side = windows_display("side", 1.0, (3840, 0, 5760, 1080), 48, false);
+        assert_eq!(main.visible, Area::new(0.0, 0.0, 2560.0, 1392.0));
+        assert_eq!(side.frame.x, 3840.0);
+        let displays = [main.clone(), side];
+        let mut memory = Memory::default();
+        memory.remember(&displays, Area::new(200.0, 100.0, 1200.0, 800.0), false);
+        memory.remember(&displays, Area::new(4000.0, 60.0, 1000.0, 700.0), false);
+        assert_eq!(
+            memory.last.as_ref().map(|key| key.id.as_str()),
+            Some("side")
+        );
+        assert_eq!(
+            memory.plan(&displays, (1040.0, 680.0)).position,
+            Some((4000.0, 60.0))
+        );
+        // 拔掉右边那块：回到主显示器上自己的那份
+        assert_eq!(
+            memory
+                .plan(std::slice::from_ref(&main), (1040.0, 680.0))
+                .position,
+            Some((200.0, 100.0))
+        );
+        // 比可用区域还高的窗口：夹到任务栏上面
+        let plan = Memory::default().plan(&[main], (1040.0, 1600.0));
+        let (_, y) = plan.position.expect("有位置");
+        assert_eq!((y, plan.height), (0.0, 1392.0));
+    }
+
+    /// 问系统要来的显示器说得通：有身份、缩放是正的、可用区域在整块屏幕里面、主显示器最多一块。
+    /// 没有显示器（服务、远程会话）时是空的，也不出错
+    #[cfg(windows)]
+    #[test]
+    fn the_system_displays_are_described_consistently() {
+        let displays = displays();
+        assert!(displays.iter().filter(|display| display.primary).count() <= 1);
+        for display in &displays {
+            assert!(!display.id.is_empty() && display.scale > 0.0, "{display:?}");
+            let (frame, visible) = (display.frame, display.visible);
+            let inside = |inner: f32, outer: f32| inner >= outer - 0.01;
+            assert!(
+                frame.width > 0.0
+                    && frame.height > 0.0
+                    && inside(visible.x, frame.x)
+                    && inside(visible.y, frame.y)
+                    && inside(frame.right(), visible.right())
+                    && inside(frame.bottom(), visible.bottom()),
+                "可用区域在屏幕里面：{display:?}"
+            );
+        }
     }
 
     #[test]

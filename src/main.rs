@@ -8,8 +8,15 @@
 //! - `app`：一个终端会话：把三者接到一块网格上（按键、指针、滚轮、输入法、改大小）
 //! - `store`、`settings`、`display`：落盘、设置项、窗口位置按显示器分别记住
 //! - `tabs`：窗口的状态：标签（每个一个会话）、文件夹、侧栏、页面、命令面板
-//! - `native`：平台补丁（macOS 上标题栏区域的拖动不让系统把窗口拖走；提示音）
+//! - `native`：平台补丁（macOS 上标题栏区域的拖动不让系统把窗口拖走；程序坞里的图标）
 //! - `chrome`：窗口的外观：标题栏、侧栏、主卡片、状态条、命令面板（`theme` 是颜色，`icons` 是图标）
+
+// Windows 上发布版是窗口程序，不多开一个黑色的控制台窗口。调试版留着控制台看日志；测试程序本来就是在控制台里跑的。
+// 没有控制台时 panic 的原因照样写进 crash.log（`log_panics`），往标准错误写的那份系统直接丢掉
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
 
 mod app;
 mod channel;
