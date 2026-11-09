@@ -1,6 +1,6 @@
 [package]
 name = "nimbus-terminal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 description = "用 Aureole 框架写的终端：自研 pty 和 xterm 仿真，屏幕用框架的字符网格画"
