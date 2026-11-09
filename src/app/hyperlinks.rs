@@ -20,9 +20,15 @@ impl Session {
         match link {
             links::Link::Url(_) => Some(hover),
             links::Link::Path { path, .. } => {
-                (self.local.get() && self.resolve_path(&path).is_some()).then_some(hover)
+                (self.local.get() && self.may_open_path(&path)).then_some(hover)
             }
         }
+    }
+
+    /// 这个路径算不算链接：本机上真有这个文件。网络路径不问（服务器连不上时主线程会卡几十秒），
+    /// 先当它在，点了再到后台去找
+    fn may_open_path(&self, path: &str) -> bool {
+        links::is_network_path(path) || self.resolve_path(path).is_some()
     }
 
     /// 指针停着的链接变了就记下来：画面要加下划线，光标要变手指
@@ -81,30 +87,44 @@ impl Session {
                 if !self.local.get() {
                     return false;
                 }
+                // 网络路径：到后台去找，找到了回主线程打开。点击算收下了（找不到就什么也不发生）
+                if links::is_network_path(path) {
+                    let candidate = std::path::PathBuf::from(path);
+                    aureole::detached(|| {
+                        aureole::spawn_blocking(move || {
+                            candidate.canonicalize().ok().map(links::without_verbatim)
+                        })
+                        .then(|resolved| {
+                            if let Some(resolved) = resolved {
+                                open_resolved(&resolved);
+                            }
+                        })
+                    });
+                    return true;
+                }
                 let Some(resolved) = self.resolve_path(path) else {
                     return false;
                 };
-                // 目录在访达里打开；文件只有常见的文档、图片、代码才直接用默认应用打开，
-                // 别的（脚本、应用、安装包……）只在访达里选中，不会被点一下就运行起来
-                if resolved.is_dir() || links::is_plain_document(&resolved) {
-                    aureole::open_path(&resolved)
-                } else {
-                    aureole::reveal_path(&resolved)
-                }
+                open_resolved(&resolved)
             }
         }
     }
 
-    /// 终端里写的路径对应本机的哪个已存在的文件：`~` 展开，相对路径从 shell 现在的目录算起
+    /// 终端里写的路径对应本机的哪个已存在的文件：`~` 展开（Windows 上 `~\` 也算），
+    /// 相对路径从 shell 现在的目录算起。Windows 上的 `\\?\` 原样路径换回平常的写法（外壳不认它，也不给人看它）
     pub(super) fn resolve_path(&self, path: &str) -> Option<std::path::PathBuf> {
-        let candidate = if let Some(rest) = path.strip_prefix("~/") {
+        let home = path
+            .strip_prefix("~/")
+            .or_else(|| path.strip_prefix("~\\").filter(|_| cfg!(windows)));
+        let candidate = if let Some(rest) = home {
             crate::store::user_home()?.join(rest)
-        } else if path.starts_with('/') {
+        } else if std::path::Path::new(path).is_absolute() {
             std::path::PathBuf::from(path)
         } else {
+            // Windows 上 `\…`、`/…` 不算绝对路径（没有盘符）：接在 shell 现在的目录后面，落在它所在的那个盘上
             self.working_directory()?.join(path)
         };
-        candidate.canonicalize().ok()
+        candidate.canonicalize().ok().map(links::without_verbatim)
     }
 
     /// 记下 `position`（网格里的位置）那一格上的链接：网址，或者本机上真有的文件路径
@@ -116,7 +136,7 @@ impl Session {
         });
         let link = link.map(|(link, ..)| link).filter(|link| match link {
             links::Link::Url(_) => true,
-            links::Link::Path { path, .. } => self.local.get() && self.resolve_path(path).is_some(),
+            links::Link::Path { path, .. } => self.local.get() && self.may_open_path(path),
         });
         *self.context_link.borrow_mut() = link;
     }
@@ -129,5 +149,15 @@ impl Session {
     /// 打开链接（菜单里的「打开」）
     pub fn open_link_now(&self, link: &links::Link) -> bool {
         self.open_link(link)
+    }
+}
+
+/// 打开本机上一个已经找到的路径。目录在访达（资源管理器）里打开；文件只有常见的文档、图片、代码才直接用默认应用打开，
+/// 别的（脚本、应用、安装包……）只在访达里选中，不会被点一下就运行起来
+fn open_resolved(resolved: &std::path::Path) -> bool {
+    if resolved.is_dir() || links::is_plain_document(resolved) {
+        aureole::open_path(resolved)
+    } else {
+        aureole::reveal_path(resolved)
     }
 }

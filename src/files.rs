@@ -6,7 +6,7 @@
 //! 引号怎么写取决于那个 shell 是什么；`sftp` 批处理的引号规则是固定的，不管远端用什么 shell。
 //!
 //! 文件名是不可信的输入（远端什么名字都有）：带换行、控制字符的名字不进批处理（换行会变成另一条命令），
-//! 路径一律先变成绝对路径（不会被当成 `sftp` 的选项）。
+//! 路径一律先变成绝对路径（不会被当成 `sftp` 的选项）；存到 Windows 上时，那里文件名不能有的字换掉（反斜杠是分隔符）。
 
 use std::path::{Path, PathBuf};
 
@@ -158,6 +158,85 @@ pub fn shell_word(path: &str) -> Option<String> {
     })
 }
 
+/// 本机 shell 引路径的规矩（从访达、资源管理器拖文件进本机终端时用）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalShell {
+    /// `sh` 一系（zsh、bash、fish……，Windows 上的 Git Bash、WSL 也是）：单引号，见 [`shell_word`]
+    Sh,
+    /// PowerShell：单引号，里面的单引号写两遍
+    PowerShell,
+    /// cmd：双引号
+    Cmd,
+}
+
+impl LocalShell {
+    /// 看程序名认是哪种 shell（`C:\…\pwsh.exe`、`/bin/zsh` 都行，不分大小写）。
+    /// 认不出来的按 cmd 的规矩：Windows 上的程序大多按双引号拆参数（只在 Windows 上这么认）
+    pub fn of_program(program: &str) -> Self {
+        let name = program
+            .trim_matches('"')
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match name.strip_suffix(".exe").unwrap_or(&name) {
+            "pwsh" | "pwsh-preview" | "powershell" => Self::PowerShell,
+            "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "wsl" => Self::Sh,
+            _ => Self::Cmd,
+        }
+    }
+}
+
+/// PowerShell 的单引号字符串：里面的单引号写两遍。PowerShell 把弯的 `‘ ’ ‚ ‛` 也当单引号（不写两遍的话字符串就在那里断了，
+/// 后半截变成命令），一样写两遍
+fn quote_powershell(text: &str) -> Option<String> {
+    let mut quoted = String::from("'");
+    for ch in text.chars() {
+        if matches!(ch, '\'' | '‘' | '’' | '‚' | '‛') {
+            quoted.push(ch);
+        }
+        quoted.push(ch);
+    }
+    quoted.push('\'');
+    Some(quoted)
+}
+
+/// cmd 的双引号。`"` 本来就不会出现在 Windows 的文件名里；有的话不写
+fn quote_cmd(text: &str) -> Option<String> {
+    (!text.contains('"')).then(|| format!("\"{text}\""))
+}
+
+/// 拖进本机终端的路径，按 `shell` 的规矩引好；带控制字符的返回 `None`（同 [`shell_word`]）。
+///
+/// cmd、PowerShell：只有字母数字和 `\ / . _ - : + ~` 的原样写。别的先看双引号行不行：没有 `$`、`` ` ``、`%`、`!`、
+/// 弯双引号的，cmd 和 PowerShell 在双引号里都不展开，两边写法一样——起的是 cmd、里面又开了 PowerShell（或者反过来）
+/// 也还是对的，`Program Files (x86)`、`&`、单引号都不怕。剩下的才按各自的规矩：PowerShell 用单引号
+/// （双引号里 `$(…)` 会被执行），cmd 用双引号（cmd 的双引号里 `%名字%` 没法不展开，只是没有这个变量时原样留着）
+pub fn local_word(path: &str, shell: LocalShell) -> Option<String> {
+    let quote: fn(&str) -> Option<String> = match shell {
+        LocalShell::Sh => return shell_word(path),
+        LocalShell::PowerShell => quote_powershell,
+        LocalShell::Cmd => quote_cmd,
+    };
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return None;
+    }
+    let plain = path.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '\\' | '/' | '.' | '_' | '-' | ':' | '+' | '~')
+    });
+    if plain {
+        return Some(path.to_string());
+    }
+    let expands = path
+        .chars()
+        .any(|ch| matches!(ch, '$' | '`' | '%' | '!' | '"' | '“' | '”' | '„'));
+    if expands {
+        quote(path)
+    } else {
+        quote_cmd(path)
+    }
+}
+
 /// 在远端目录里开一个登录 shell 的命令（`ssh` 的最后一个参数）。
 /// 整条交给远端用户的登录 shell 解释，所以外面包一层 `sh -c '…'`，里面再按 `sh` 的规矩引目录：
 /// 目录进不去就报一句、留在主目录，不让会话一闪而过。目录必须是绝对路径、不能有控制字符
@@ -185,25 +264,42 @@ pub fn quote_sftp(path: &str) -> Option<String> {
     ))
 }
 
-/// 下载一个条目到本地 `local` 的批处理。`remote`、`local` 都得是绝对路径（以 `/` 开头）：
+/// 本地路径在 `sftp` 批处理里的写法。必须从根目录起（`/…`；Windows 上 `C:\…`、`\\服务器\共享\…`）：
+/// 不然以 `-` 开头的名字会被 `sftp` 当成选项，从根目录起的路径不会以 `-` 开头。
+/// Windows 上 `canonicalize` 给的 `\\?\` 前缀先去掉，再换成正斜杠（`C:/Users/…`）：Windows 自带的 `sftp` 认这种写法，
+/// 也不用在批处理里再给反斜杠转义一层。别的平台上反斜杠是文件名里的普通字符，原样
+fn sftp_local(local: &Path) -> Option<String> {
+    if !local.has_root() {
+        return None;
+    }
+    let local = crate::links::without_verbatim(local.to_path_buf());
+    let text = local.to_str()?;
+    Some(if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.to_string()
+    })
+}
+
+/// 下载一个条目到本地 `local` 的批处理。`remote` 得是绝对路径（以 `/` 开头），`local` 见 [`sftp_local`]：
 /// 不然以 `-` 开头的名字会被 `sftp` 当成选项。目录用 `-r`
 pub fn sftp_get(remote: &str, local: &Path, directory: bool) -> Option<String> {
-    let local = local.to_str()?;
-    if !remote.starts_with('/') || !local.starts_with('/') {
+    let local = sftp_local(local)?;
+    if !remote.starts_with('/') {
         return None;
     }
     let flag = if directory { "-r " } else { "" };
     Some(format!(
         "get {flag}{} {}\n",
         quote_sftp(remote)?,
-        quote_sftp(local)?
+        quote_sftp(&local)?
     ))
 }
 
 /// 上传本地 `local` 到远端目录 `remote_dir` 里（名字不变）的批处理。目录用 `-r`
 pub fn sftp_put(local: &Path, remote_dir: &str, directory: bool) -> Option<String> {
-    let local = local.to_str()?;
-    if !remote_dir.starts_with('/') || !local.starts_with('/') {
+    let local = sftp_local(local)?;
+    if !remote_dir.starts_with('/') {
         return None;
     }
     let flag = if directory { "-r " } else { "" };
@@ -215,13 +311,65 @@ pub fn sftp_put(local: &Path, remote_dir: &str, directory: bool) -> Option<Strin
     };
     Some(format!(
         "put {flag}{} {}\n",
-        quote_sftp(local)?,
+        quote_sftp(&local)?,
         quote_sftp(&target)?
     ))
 }
 
-/// 本地要存成什么名字：`name` 在 `directory` 里已经有了就加 ` (1)`、` (2)`……（扩展名前面），不覆盖本地的文件
+/// 远端的名字在 Windows 上当本地文件名：`\ / : * ? " < > |` 换成 `_`（`\` 是分隔符，`..\..\x`、`C:\x` 会跑出下载目录；
+/// `:` 会写进 NTFS 的备用数据流），结尾的点和空格去掉（系统会悄悄去掉，存成的名字就对不上了），
+/// `CON`、`NUL`、`COM1` 这类设备名前面加 `_`（不然写进去的是设备）。去掉之后是空的就叫 `_`
+fn windows_name(name: &str) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let trimmed = replaced.trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        return "_".to_string();
+    }
+    let stem = trimmed
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    let numbered = ["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|rest| {
+            rest.chars().count() == 1
+                && rest
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || matches!(ch, '¹' | '²' | '³'))
+        })
+    });
+    if numbered
+        || matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        )
+    {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 本地要存成什么名字：`name` 在 `directory` 里已经有了就加 ` (1)`、` (2)`……（扩展名前面），不覆盖本地的文件。
+/// Windows 上先把名字换成那里能用的（见 [`windows_name`]），远端的名字跑不出 `directory`
 pub fn unique_local(directory: &Path, name: &str) -> PathBuf {
+    let name = if cfg!(windows) {
+        windows_name(name)
+    } else {
+        name.to_string()
+    };
+    let name = name.as_str();
     let first = directory.join(name);
     if !first.exists() {
         return first;
@@ -585,6 +733,42 @@ mod tests {
         assert_eq!(sftp_put(Path::new("-x"), "/srv", false), None);
     }
 
+    /// 本地路径按本机的 `sftp` 认的写：Windows 上盘符开头的、共享路径算绝对路径，换成正斜杠（批处理里不用再转义反斜杠），
+    /// `\\?\` 原样路径先换回平常的，`C:foo` 不算；别的平台上反斜杠是文件名里的字，原样转义
+    #[test]
+    fn local_paths_are_written_the_way_the_local_sftp_reads_them() {
+        if cfg!(windows) {
+            assert_eq!(
+                sftp_get(
+                    "/srv/a b.txt",
+                    Path::new(r"C:\Users\x\Downloads\a b.txt"),
+                    false
+                )
+                .as_deref(),
+                Some("get \"/srv/a b.txt\" \"C:/Users/x/Downloads/a b.txt\"\n")
+            );
+            assert_eq!(
+                sftp_put(Path::new(r"\\?\D:\data\d"), "/srv", true).as_deref(),
+                Some("put -r \"D:/data/d\" \"/srv/\"\n")
+            );
+            assert_eq!(
+                sftp_put(Path::new(r"\\nas\share\a.txt"), "/srv", false).as_deref(),
+                Some("put \"//nas/share/a.txt\" \"/srv/\"\n")
+            );
+            assert_eq!(
+                sftp_get("/srv/a", Path::new("C:relative"), false),
+                None,
+                "盘符后面没有斜杠：不是绝对路径"
+            );
+            assert_eq!(sftp_put(Path::new(r"x\y"), "/srv", false), None);
+        } else {
+            assert_eq!(
+                sftp_put(Path::new("/tmp/back\\slash"), "/srv", false).as_deref(),
+                Some("put \"/tmp/back\\\\slash\" \"/srv/\"\n")
+            );
+        }
+    }
+
     /// 本地已有同名文件就加序号，不覆盖；序号放在扩展名前面，隐藏文件的点不算扩展名
     #[test]
     fn local_names_never_overwrite() {
@@ -608,7 +792,39 @@ mod tests {
             unique_local(&directory, "noext"),
             directory.join("noext (1)")
         );
+        if cfg!(windows) {
+            assert_eq!(
+                unique_local(&directory, r"..\..\evil.bat"),
+                directory.join(".._.._evil.bat"),
+                "远端的名字跑不出下载目录"
+            );
+        }
         std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// 远端的名字在 Windows 上当本地文件名：分隔符、冒号这类换掉（跑不出下载目录、写不进备用数据流），
+    /// 结尾的点和空格去掉，设备名前面加 `_`；平常的名字原样
+    #[test]
+    fn remote_names_are_made_safe_for_windows() {
+        for (name, expected) in [
+            ("a b.txt", "a b.txt"),
+            ("中文.txt", "中文.txt"),
+            (".env", ".env"),
+            (r"..\..\evil.bat", ".._.._evil.bat"),
+            (r"C:\Windows\x", "C__Windows_x"),
+            ("a:stream", "a_stream"),
+            ("what?<>|*\".txt", "what______.txt"),
+            ("trailing. . ", "trailing"),
+            ("...", "_"),
+            ("con", "_con"),
+            ("NUL.txt", "_NUL.txt"),
+            ("com1.log", "_com1.log"),
+            ("LPT¹", "_LPT¹"),
+            ("console.txt", "console.txt"),
+            ("com10", "com10"),
+        ] {
+            assert_eq!(windows_name(name), expected, "{name:?}");
+        }
     }
 
     #[test]
@@ -787,10 +1003,96 @@ mod tests {
         }
     }
 
-    /// 起始目录的命令：外面 `sh -c` 单引号一层，里面目录再引一层；不是绝对路径、带控制字符的不要。
-    /// 真的用本机的 `sh` 展开一遍，确认怪目录名（空格、引号、美元符）最后到 `cd` 手里的就是原样的目录
+    /// 认得出常见的 shell：带不带目录、`.exe`、大小写都一样；认不出来的按 cmd 的规矩
     #[test]
-    fn the_login_command_survives_two_levels_of_quoting() {
+    fn the_local_shell_is_known_by_its_program_name() {
+        for (program, shell) in [
+            (
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                LocalShell::PowerShell,
+            ),
+            (
+                r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe",
+                LocalShell::PowerShell,
+            ),
+            (
+                "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\"",
+                LocalShell::PowerShell,
+            ),
+            ("pwsh", LocalShell::PowerShell),
+            (r"C:\WINDOWS\system32\cmd.exe", LocalShell::Cmd),
+            ("CMD.EXE", LocalShell::Cmd),
+            (r"C:\Program Files\Git\bin\bash.exe", LocalShell::Sh),
+            ("wsl.exe", LocalShell::Sh),
+            ("/bin/zsh", LocalShell::Sh),
+            ("nu.exe", LocalShell::Cmd),
+        ] {
+            assert_eq!(LocalShell::of_program(program), shell, "{program}");
+        }
+    }
+
+    /// 拖进本机终端的路径：平常的原样；一般的怪名字（空格、括号、`&`、单引号、中文）cmd 和 PowerShell 都写成双引号，
+    /// 两边都对；带 `$`、`%` 这类双引号里会展开的，才按各自的规矩：PowerShell 单引号（弯的单引号也写两遍），cmd 双引号
+    #[test]
+    fn local_paths_are_quoted_for_the_local_shell() {
+        use LocalShell::{Cmd, PowerShell, Sh};
+        for shell in [Cmd, PowerShell] {
+            for (path, expected) in [
+                (r"C:\Users\me\notes.txt", r"C:\Users\me\notes.txt"),
+                (r"\\nas\share\a-b_c+1~2.log", r"\\nas\share\a-b_c+1~2.log"),
+                (
+                    r"C:\Program Files (x86)\a b.txt",
+                    r#""C:\Program Files (x86)\a b.txt""#,
+                ),
+                (r"C:\a&calc.txt", r#""C:\a&calc.txt""#),
+                (r"C:\it's;x,y=z.txt", r#""C:\it's;x,y=z.txt""#),
+                (r"C:\中文\笔记.md", r#""C:\中文\笔记.md""#),
+            ] {
+                assert_eq!(
+                    local_word(path, shell).as_deref(),
+                    Some(expected),
+                    "{shell:?} {path}"
+                );
+            }
+            for bad in ["", "C:\\a\nb", "C:\\a\r", "C:\\a\u{1b}[31m"] {
+                assert_eq!(local_word(bad, shell), None, "{shell:?} {bad:?}");
+            }
+        }
+        assert_eq!(
+            local_word(r"C:\$(calc)`x\100%.txt", PowerShell).as_deref(),
+            Some(r"'C:\$(calc)`x\100%.txt'")
+        );
+        assert_eq!(
+            local_word("C:\\it's $x.txt", PowerShell).as_deref(),
+            Some("'C:\\it''s $x.txt'")
+        );
+        assert_eq!(
+            local_word("C:\\don’t $x.txt", PowerShell).as_deref(),
+            Some("'C:\\don’’t $x.txt'"),
+            "弯的单引号 PowerShell 也认，一样写两遍"
+        );
+        assert_eq!(
+            local_word(r"\\srv\c$\a b", Cmd).as_deref(),
+            Some(r#""\\srv\c$\a b""#)
+        );
+        assert_eq!(
+            local_word(r"C:\100%.txt", Cmd).as_deref(),
+            Some(r#""C:\100%.txt""#)
+        );
+        // `sh` 一系还是 `sh` 的规矩
+        assert_eq!(
+            local_word("/srv/it's", Sh).as_deref(),
+            Some("'/srv/it'\\''s'")
+        );
+        assert_eq!(
+            local_word(r"C:\Users\me", Sh).as_deref(),
+            Some(r"'C:\Users\me'")
+        );
+    }
+
+    /// 起始目录的命令：外面 `sh -c` 单引号一层，里面目录再引一层；不是绝对路径、带控制字符的不要
+    #[test]
+    fn the_login_command_quotes_twice_and_needs_an_absolute_directory() {
         let command = login_command("/srv/my app").expect("能用");
         assert!(
             command.starts_with("sh -c '") && command.ends_with('\''),
@@ -800,6 +1102,13 @@ mod tests {
         assert_eq!(login_command("relative"), None);
         assert_eq!(login_command("/srv/a\nb"), None);
         assert_eq!(login_command("-oProxyCommand=x"), None);
+    }
+
+    /// 真的用本机的 `sh` 展开一遍，确认怪目录名（空格、引号、美元符）最后到 `cd` 手里的就是原样的目录。
+    /// 要本机有 `sh`、目录是 `/` 开头的（命令是给远端的 Unix 用的），所以只在 Unix 上跑
+    #[cfg(unix)]
+    #[test]
+    fn the_login_command_survives_two_levels_of_quoting() {
         // 用 sh 把整条命令当作「登录 shell 收到的一行」再解释一遍：把最后的 exec 换成 pwd，看 cd 进了哪里
         let base = crate::store::tests::scratch("login-command");
         let directory = base.join("it's $(echo x) \"q\" a b");

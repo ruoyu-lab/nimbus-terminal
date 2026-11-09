@@ -193,9 +193,15 @@ fn dropping_files_from_the_desktop_types_their_paths() {
         ],
     );
     harness.advance(secs(1.0));
+    // Windows 上按 cmd、PowerShell 的规矩：这几个两边都写成双引号
+    let expected = if cfg!(windows) {
+        "/tmp/plain.txt \"/tmp/with space.txt\" \"/tmp/it's.txt\" "
+    } else {
+        "/tmp/plain.txt '/tmp/with space.txt' '/tmp/it'\\''s.txt' "
+    };
     assert_eq!(
         fake.pty(0).take(),
-        "/tmp/plain.txt '/tmp/with space.txt' '/tmp/it'\\''s.txt' ",
+        expected,
         "带换行的整个跳过，别的引好、空格隔开、没有回车"
     );
     // 服务器的终端：本机的路径没有意义，不写

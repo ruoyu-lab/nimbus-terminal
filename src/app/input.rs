@@ -93,16 +93,29 @@ impl Session {
         true
     }
 
-    /// 从访达拖来的文件落在这个终端上：把它们的路径写在光标处，按 shell 的规矩引好，空格隔开，不按回车。
-    /// 只有本机的终端写（服务器、容器里没有这些路径）；带控制字符或者不是 UTF-8 的路径跳过。返回写了没有
+    /// 从访达（资源管理器）拖来的文件落在这个终端上：把它们的路径写在光标处，按本机 shell 的规矩引好，空格隔开，不按回车。
+    /// 只有本机的终端写（服务器、容器里没有这些路径）；带控制字符或者不是 UTF-8 的路径跳过。返回写了没有。
+    ///
+    /// macOS、Linux 上是 `sh` 的规矩。Windows 上 cmd、PowerShell 的写法不一样，会话又不记得自己起的是哪个程序，
+    /// 就按设置里新终端用的那个算（设置后来改过、shell 里又开了另一个 shell 时会猜错；
+    /// [`crate::files::local_word`] 尽量写成两边都对的样子，猜错了也只有带 `$`、`%` 这类字的名字受影响）
     pub fn drop_files(&self, paths: &[std::path::PathBuf]) -> bool {
         if !self.local.get() {
             return false;
         }
+        let shell = if cfg!(windows) {
+            let program = (self.form.shell.get_untracked() == crate::settings::ShellKind::Program)
+                .then(|| self.form.shell_program.get_untracked().trim().to_string())
+                .filter(|program| !program.is_empty())
+                .unwrap_or_else(crate::pty::default_shell);
+            crate::files::LocalShell::of_program(&program)
+        } else {
+            crate::files::LocalShell::Sh
+        };
         let words: Vec<String> = paths
             .iter()
             .filter_map(|path| path.to_str())
-            .filter_map(crate::files::shell_word)
+            .filter_map(|path| crate::files::local_word(path, shell))
             .collect();
         if words.is_empty() {
             return false;

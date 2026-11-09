@@ -1,7 +1,11 @@
 //! 终端文字里的链接：⌘ 加点击打开。认两种：网址（`http://`、`https://`）和文件路径（`/…`、`~/…`、`./…`、`../…`，
 //! 后面可以跟 `:行号` 或 `:行号:列号`，编译器和 grep 的输出都是这么写的）。
+//! Windows 上还认 `C:\…`、`C:/…`、`.\…`、`..\…`、`~\…` 和共享路径 `\\服务器\共享\…`；
+//! 别的平台不认这些（macOS 上反斜杠、`C:` 开头的字多半不是路径，认了只会误报）。
 //!
 //! 一次只看一行里的字，折成两行的长网址认不全（和查找一样，终端不记哪些行是同一行折出来的）。
+
+use std::path::{Component, Path, PathBuf, Prefix};
 
 use crate::vt::Cell;
 
@@ -138,7 +142,7 @@ fn token_link(
 }
 
 /// 点一下就用默认应用打开也不要紧的文件：文档、图片、文本、代码。别的（可执行的、安装包）不直接开
-pub fn is_plain_document(path: &std::path::Path) -> bool {
+pub fn is_plain_document(path: &Path) -> bool {
     const PLAIN: [&str; 40] = [
         "txt", "md", "log", "json", "toml", "yaml", "yml", "csv", "pdf", "png", "jpg", "jpeg",
         "gif", "webp", "svg", "html", "htm", "css", "rs", "py", "js", "ts", "tsx", "jsx", "go",
@@ -150,7 +154,80 @@ pub fn is_plain_document(path: &std::path::Path) -> bool {
         .is_some_and(|extension| PLAIN.contains(&extension.to_ascii_lowercase().as_str()))
 }
 
+/// 共享路径 `\\服务器\共享…`：服务器名、共享名都不能是空的。`\\?\…`（原样路径）、`\\.\…`（设备）不算
+fn is_unc(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix(r"\\") else {
+        return false;
+    };
+    let mut parts = rest.split('\\');
+    let (Some(server), Some(share)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    !server.is_empty() && !share.is_empty() && !matches!(server, "?" | ".")
+}
+
+/// 看着像路径：`/…`、`~/…`、`./…`、`../…` 哪个平台都认；`windows` 时再认 `C:\…`、`C:/…`、`.\…`、`..\…`、`~\…`
+/// 和共享路径。盘符后面一定要跟斜杠：`C:foo` 是「C 盘上次待过的目录下的 foo」，`C:` 也可能只是一句话里的冒号
+fn looks_like_path(text: &str, windows: bool) -> bool {
+    if text.starts_with('/')
+        || text.starts_with("~/")
+        || text.starts_with("./")
+        || text.starts_with("../")
+    {
+        return true;
+    }
+    if !windows {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    drive
+        || text.starts_with(".\\")
+        || text.starts_with("..\\")
+        || text.starts_with("~\\")
+        || is_unc(text)
+}
+
+/// 网络上的路径（Windows 的共享路径，开头两个斜杠）：问它在不在要连服务器，连不上时一等就是几十秒，
+/// 不能在主线程上问。只有 Windows 有这种写法
+pub fn is_network_path(path: &str) -> bool {
+    let mut chars = path.chars();
+    cfg!(windows)
+        && matches!(chars.next(), Some('\\' | '/'))
+        && matches!(chars.next(), Some('\\' | '/'))
+}
+
+/// `canonicalize` 在 Windows 上给的是 `\\?\C:\…`、`\\?\UNC\服务器\共享\…` 这种原样路径：交给外壳、给人看之前
+/// 换回平常的 `C:\…`、`\\服务器\共享\…`。没有这种前缀的（别的平台上的路径都是）、卷的编号这类原样返回
+pub fn without_verbatim(path: PathBuf) -> PathBuf {
+    let mut components = path.components();
+    let base = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut unc = std::ffi::OsString::from(r"\\");
+                unc.push(server);
+                unc.push(r"\");
+                unc.push(share);
+                PathBuf::from(unc)
+            }
+            _ => return path,
+        },
+        _ => return path,
+    };
+    // 剩下的从根目录的 `\` 起：接在盘符、共享名后面
+    base.join(components.as_path())
+}
+
 fn classify(text: &str) -> Option<Link> {
+    classify_for(text, cfg!(windows))
+}
+
+/// 一段字是不是链接；`windows` 是连 Windows 的路径写法一起认（测试里两种都要试，所以不直接看平台）
+fn classify_for(text: &str, windows: bool) -> Option<Link> {
     let lower = text.to_ascii_lowercase();
     for scheme in ["http://", "https://"] {
         if lower.starts_with(scheme) {
@@ -158,14 +235,10 @@ fn classify(text: &str) -> Option<Link> {
             return (text.len() > scheme.len()).then(|| Link::Url(text.to_string()));
         }
     }
-    if !(text.starts_with('/')
-        || text.starts_with("~/")
-        || text.starts_with("./")
-        || text.starts_with("../"))
-    {
+    if !looks_like_path(text, windows) {
         return None;
     }
-    // `路径:行号[:列号]`：从后面剥掉纯数字的段
+    // `路径:行号[:列号]`：从后面剥掉纯数字的段。盘符的冒号后面跟着斜杠，那一段不是纯数字，不会被剥掉
     let mut path = text;
     let mut numbers = Vec::new();
     while let Some((head, tail)) = path.rsplit_once(':') {
@@ -176,7 +249,8 @@ fn classify(text: &str) -> Option<Link> {
             break;
         }
     }
-    if path.len() < 2 || path == "//" {
+    // 剥完了还得像路径（`\\服务器\:12` 剥完就只剩 `\\服务器\` 了）
+    if path.len() < 2 || path == "//" || !looks_like_path(path, windows) {
         return None;
     }
     numbers.reverse();
@@ -270,6 +344,133 @@ mod tests {
         // 普通的词、相对路径（没有 ./）、单个斜杠不算
         assert!(at("a/b/c", "a/b", 0).is_none());
         assert!(at("/ alone", "/", 0).is_none());
+    }
+
+    /// Windows 的写法只在 Windows 上认：盘符（两种斜杠）、`.\`、`..\`、`~\`、共享路径；行号照样剥，盘符的冒号留着
+    #[test]
+    fn windows_paths_are_recognized_only_on_windows() {
+        let path = |text: &str, line: Option<u32>| {
+            Some(Link::Path {
+                path: text.into(),
+                line,
+            })
+        };
+        assert_eq!(
+            classify_for(r"C:\src\main.rs:42:7", true),
+            path(r"C:\src\main.rs", Some(42))
+        );
+        assert_eq!(
+            classify_for("c:/Users/me/a.txt", true),
+            path("c:/Users/me/a.txt", None)
+        );
+        assert_eq!(
+            classify_for(r".\src\lib.rs:3", true),
+            path(r".\src\lib.rs", Some(3))
+        );
+        assert_eq!(classify_for(r"..\up.txt", true), path(r"..\up.txt", None));
+        assert_eq!(
+            classify_for(r"~\notes\todo.md", true),
+            path(r"~\notes\todo.md", None)
+        );
+        assert_eq!(
+            classify_for(r"\\nas\share\a.log:10", true),
+            path(r"\\nas\share\a.log", Some(10))
+        );
+        assert_eq!(classify_for(r"C:\", true), path(r"C:\", None));
+        assert_eq!(
+            classify_for("./src/main.rs:1", true),
+            path("./src/main.rs", Some(1)),
+            "Unix 的写法在 Windows 上也认"
+        );
+        // 不是路径：盘符后面没有斜杠、一句话里的冒号、不带 `.\` 的相对路径、原样路径和设备、缺共享名的
+        for text in [
+            "C:foo",
+            "C:",
+            "a:b",
+            r"src\main.rs",
+            r"\x",
+            r"\\?\C:\x",
+            r"\\.\pipe\x",
+            r"\\server",
+            r"\\server\",
+            r"\\server\:12",
+        ] {
+            assert_eq!(classify_for(text, true), None, "{text}");
+        }
+        // 别的平台一个都不认（macOS 上这些多半不是路径）
+        for text in [
+            r"C:\src\main.rs",
+            "C:/Users/me/a.txt",
+            r".\a",
+            r"..\a",
+            r"~\a",
+            r"\\nas\share\a",
+        ] {
+            assert_eq!(classify_for(text, false), None, "{text}");
+        }
+    }
+
+    /// 一行字里的 Windows 路径：列范围包括行号，结尾的冒号不算
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_found_in_a_line() {
+        let (link, start, end) = at(r"error at C:\src\main.rs:42:7: bad", "main", 0).expect("路径");
+        assert_eq!(
+            link,
+            Link::Path {
+                path: r"C:\src\main.rs".into(),
+                line: Some(42)
+            }
+        );
+        assert_eq!((start, end), (9, 28));
+        let (link, ..) = at(r"cd \\nas\share\logs", "nas", 0).expect("共享路径");
+        assert_eq!(
+            link,
+            Link::Path {
+                path: r"\\nas\share\logs".into(),
+                line: None
+            }
+        );
+    }
+
+    /// `canonicalize` 给的 `\\?\` 原样路径换回平常的写法，指的还是同一个地方；没有这种前缀的原样
+    #[test]
+    fn verbatim_prefixes_are_removed() {
+        if cfg!(windows) {
+            assert_eq!(
+                without_verbatim(PathBuf::from(r"\\?\C:\Users\me\a.txt")),
+                PathBuf::from(r"C:\Users\me\a.txt")
+            );
+            assert_eq!(
+                without_verbatim(PathBuf::from(r"\\?\UNC\nas\share\a.txt")),
+                PathBuf::from(r"\\nas\share\a.txt")
+            );
+            assert_eq!(
+                without_verbatim(PathBuf::from(r"C:\plain")),
+                PathBuf::from(r"C:\plain")
+            );
+        }
+        let canonical = std::env::temp_dir().canonicalize().expect("临时目录在");
+        let plain = without_verbatim(canonical.clone());
+        assert!(!plain.to_string_lossy().starts_with(r"\\?\"), "{plain:?}");
+        assert_eq!(
+            plain.canonicalize().ok(),
+            Some(canonical),
+            "指的还是同一个目录"
+        );
+        assert_eq!(
+            without_verbatim(PathBuf::from("/tmp/a")),
+            PathBuf::from("/tmp/a")
+        );
+    }
+
+    /// 网络路径（问一下要连服务器）只有 Windows 有
+    #[test]
+    fn only_windows_has_network_paths() {
+        assert_eq!(is_network_path(r"\\nas\share\a"), cfg!(windows));
+        assert_eq!(is_network_path("//nas/share/a"), cfg!(windows));
+        assert!(!is_network_path(r"C:\a"));
+        assert!(!is_network_path("/tmp/a"));
     }
 
     /// 宽字在前面：列按格子算

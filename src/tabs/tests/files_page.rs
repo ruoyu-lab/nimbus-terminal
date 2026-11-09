@@ -160,9 +160,11 @@ fn downloads_go_to_the_download_folder_and_report_the_result() {
         remote.calls()[1],
         "download /home/deploy/readme.txt dir=false"
     );
+    // 存成的路径按本机的写法显示（Windows 上最后一段前面是反斜杠）
+    let saved = PathBuf::from("/tmp/nimbus-downloads").join("readme.txt");
     assert_eq!(
         files_of(&workspace).transfers[0].state,
-        TransferState::Done("已存到 /tmp/nimbus-downloads/readme.txt".into())
+        TransferState::Done(format!("已存到 {}", saved.display()))
     );
     harness.click_named("download-src");
     settle(&harness, || {
