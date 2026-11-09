@@ -9,7 +9,7 @@ use crate::chrome::sidebar::nav::{NavExt, nav, section_label};
 use crate::chrome::sidebar::targets::{self, Scrolling};
 use crate::chrome::widgets::directory_drop;
 use crate::icons::Icon;
-use crate::tabs::Workspace;
+use crate::tabs::{Shortcut, Workspace};
 use crate::theme::{hover, ink, line};
 
 /// 平时的侧栏：顶上新建、搜索，中间是目标和文件夹，底下设置
@@ -52,13 +52,13 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
                     .child(
                         nav(collapsed, Icon::Plus, "新建会话")
                             .name("nav-new")
-                            .hint(collapsed, "⌘T")
+                            .hint(collapsed, Shortcut::NewTab.keys())
                             .on_click(move || new_tab.new_tab()),
                     )
                     .child(
                         nav(collapsed, Icon::Search, "搜索")
                             .name("nav-search")
-                            .hint(collapsed, "⌘K")
+                            .hint(collapsed, Shortcut::Palette.keys())
                             .on_click(move || search.palette_open.set(true)),
                     )
                     .child(directory_drop(zone, workspace, over)),
@@ -77,7 +77,7 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
                 .child(
                     nav(collapsed, Icon::Sliders, "设置")
                         .name("nav-settings")
-                        .hint(collapsed, "⌘,")
+                        .hint(collapsed, Shortcut::Settings.keys())
                         .on_click(move || settings.open_settings()),
                 ),
         )

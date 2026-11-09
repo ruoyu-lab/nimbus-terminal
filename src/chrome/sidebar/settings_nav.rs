@@ -7,7 +7,7 @@ use aureole::prelude::*;
 use crate::chrome::settings::page_glyph;
 use crate::chrome::sidebar::nav::{NavExt, nav, nav_selected};
 use crate::icons::Icon;
-use crate::tabs::{SettingsPage, Workspace};
+use crate::tabs::{SettingsPage, Shortcut, Workspace};
 use crate::theme::{ink, line};
 
 /// 一行一类，选中的那一类的内容显示在卡片里
@@ -26,7 +26,7 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
                 .child(
                     nav(collapsed, Icon::ChevronLeft, "返回")
                         .name("settings-back")
-                        .hint(collapsed, "⌘,")
+                        .hint(collapsed, Shortcut::Settings.keys())
                         .on_click(move || back.close_settings()),
                 )
                 .child(rect().height(1).background(line()).margin_x(6).margin_y(4)),

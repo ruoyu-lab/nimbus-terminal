@@ -12,7 +12,7 @@ use crate::chrome::menu::with_context_menu;
 use crate::chrome::widgets::{fade_in, icon_button, soft};
 use crate::icons::Icon;
 use crate::pane::Axis;
-use crate::tabs::{TabDrag, Workspace};
+use crate::tabs::{Shortcut, TabDrag, Workspace};
 use crate::theme::{fg, hover, line, mark, tab_selected_bg, text_2};
 
 /// 标签：定宽，高 28，之间 2px；右边关闭按钮 20，所以上、右、下都留 4
@@ -48,7 +48,7 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
         .child(
             icon_button(Icon::Sidebar, 17.0)
                 .name("toggle-sidebar")
-                .tooltip("收起或展开侧栏  ⌘B")
+                .tooltip(format!("收起或展开侧栏  {}", Shortcut::Sidebar.keys()))
                 .on_click(move || toggle.toggle_sidebar()),
         )
         // 设置页里没有标签可言：标签条和新建按钮换成一个标题
@@ -78,13 +78,13 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
                     .child(
                         icon_button(Icon::Columns, 17.0)
                             .name("split-columns")
-                            .tooltip("左右分屏  ⌘D")
+                            .tooltip(format!("左右分屏  {}", Shortcut::SplitColumns.keys()))
                             .on_click(move || columns.split(Axis::Columns)),
                     )
                     .child(
                         icon_button(Icon::Rows, 17.0)
                             .name("split-rows")
-                            .tooltip("上下分屏  ⌘⇧D")
+                            .tooltip(format!("上下分屏  {}", Shortcut::SplitRows.keys()))
                             .on_click(move || rows.split(Axis::Rows)),
                     )
             },
@@ -181,7 +181,7 @@ fn tab_strip(workspace: &Rc<Workspace>) -> Element {
         .child(
             icon_button(Icon::Plus, 17.0)
                 .name("new-tab")
-                .tooltip("新建会话  ⌘T")
+                .tooltip(format!("新建会话  {}", Shortcut::NewTab.keys()))
                 .on_click(move || new_tab.new_tab()),
         )
 }

@@ -6,7 +6,7 @@ use aureole::prelude::*;
 
 use crate::chrome::widgets::{pop, soft};
 use crate::icons::{Icon, icon};
-use crate::tabs::Workspace;
+use crate::tabs::{Shortcut, Workspace};
 use crate::theme::{card_bg, fg, hover, line, popup_shadow, text_2, text_3};
 
 /// 面板里的一条命令
@@ -40,25 +40,25 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
         command(
             "cmd-new-tab",
             "新建会话",
-            "⌘T",
+            Shortcut::NewTab.keys(),
             Rc::new(move || new_tab.new_tab()),
         ),
         command(
             "cmd-close-tab",
             "关闭当前会话",
-            "⌘W",
+            Shortcut::Close.keys(),
             Rc::new(move || close.close_active()),
         ),
         command(
             "cmd-find",
             "在终端中查找",
-            "⌘F",
+            Shortcut::Find.keys(),
             Rc::new(move || find.find_in_terminal()),
         ),
         command(
             "cmd-previous-command",
             "跳到上一条命令",
-            "⌘↑",
+            Shortcut::PreviousCommand.keys(),
             Rc::new(move || {
                 if let Some(session) = previous.focused_session() {
                     session.jump_prompt(true);
@@ -68,7 +68,7 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
         command(
             "cmd-next-command",
             "跳到下一条命令",
-            "⌘↓",
+            Shortcut::NextCommand.keys(),
             Rc::new(move || {
                 if let Some(session) = next.focused_session() {
                     session.jump_prompt(false);
@@ -88,19 +88,19 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
         command(
             "cmd-toggle-sidebar",
             "收起或展开侧栏",
-            "⌘B",
+            Shortcut::Sidebar.keys(),
             Rc::new(move || toggle.toggle_sidebar()),
         ),
         command(
             "cmd-split-columns",
             "左右分屏",
-            "⌘D",
+            Shortcut::SplitColumns.keys(),
             Rc::new(move || columns.split(crate::pane::Axis::Columns)),
         ),
         command(
             "cmd-split-rows",
             "上下分屏",
-            "⌘⇧D",
+            Shortcut::SplitRows.keys(),
             Rc::new(move || rows.split(crate::pane::Axis::Rows)),
         ),
         command(
@@ -112,7 +112,7 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
         command(
             "cmd-settings",
             "打开设置",
-            "⌘,",
+            Shortcut::Settings.keys(),
             Rc::new(move || settings.open_settings()),
         ),
     ];

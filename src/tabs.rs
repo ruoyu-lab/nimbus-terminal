@@ -41,6 +41,7 @@ use history::HISTORY_FILE;
 use panes::{PaneSpec, Restoring};
 pub use persistence::save_on_exit;
 use persistence::{STATE_FILE, Saved, SavedPane, SavedTab, keep_for_exit, output_file};
+pub use shortcuts::Shortcut;
 
 /// 打开窗口时的内容区大小
 pub const WINDOW_SIZE: (u32, u32) = (1040, 680);

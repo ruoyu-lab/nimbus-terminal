@@ -609,15 +609,16 @@ fn shrinking_the_window_keeps_the_card_and_terminal_inside() {
 fn collapsed_sidebar_shows_only_icons() {
     let (harness, workspace) = mounted();
     let shown = |harness: &Harness| format!("{:?}", harness.element_tree());
+    let (new_tab, palette) = (Shortcut::NewTab.keys(), Shortcut::Palette.keys());
     assert!(
-        shown(&harness).contains("⌘T") && shown(&harness).contains("⌘K"),
+        shown(&harness).contains(new_tab) && shown(&harness).contains(palette),
         "展开时有快捷键提示"
     );
     command(&harness, "b");
     harness.advance(secs(1.0));
     let collapsed = shown(&harness);
     assert!(
-        !collapsed.contains("⌘T") && !collapsed.contains("⌘K"),
+        !collapsed.contains(new_tab) && !collapsed.contains(palette),
         "收起后快捷键提示不能露出来"
     );
     assert!(

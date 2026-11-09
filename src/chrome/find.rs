@@ -7,16 +7,26 @@ use aureole::prelude::*;
 use crate::app::Session;
 use crate::chrome::widgets::{icon_button, pop};
 use crate::icons::{Icon, icon};
+use crate::tabs::Shortcut;
 use crate::theme::{card_bg, popup_shadow, text_3};
+
+/// 输入框里 Shift+回车往下（更新的）找：Windows、Linux 的习惯。macOS 上照旧和回车一样（往下是 ⌘⇧G）
+const SHIFT_ENTER_FINDS_NEWER: bool = !Shortcut::MAC;
 
 pub(super) fn bar(session: Rc<Session>) -> Element {
     let (query, status) = (session.find_query(), session.find_status());
-    let (submit, older, newer, close) = (
+    let (submit, shifted, older, newer, close) = (
+        session.clone(),
         session.clone(),
         session.clone(),
         session.clone(),
         session.clone(),
     );
+    let newer_keys = if SHIFT_ENTER_FINDS_NEWER {
+        format!("Shift+回车 / {}", Shortcut::FindNewer.keys())
+    } else {
+        Shortcut::FindNewer.keys().to_string()
+    };
     pop(row()
         .name("find-bar")
         .align(Align::Center)
@@ -42,6 +52,16 @@ pub(super) fn bar(session: Rc<Session>) -> Element {
                 .border(0, Color::TRANSPARENT)
                 .focus_ring(FocusRing::NONE)
                 .font_size(13)
+                .on_key_down(move |event: &KeyEvent| {
+                    let shift_enter = matches!(event.key, Key::Named(NamedKey::Enter))
+                        && event.modifiers == Modifiers::SHIFT;
+                    if SHIFT_ENTER_FINDS_NEWER && shift_enter {
+                        // 不让输入框把它也当回车提交
+                        event.prevent_builtin(Builtin::EDIT);
+                        event.stop_propagation();
+                        shifted.find_step(false);
+                    }
+                })
                 // 回车：往上（更早的）找下一处，和从最新往回找的习惯一致
                 .on_submit(move |_| submit.find_step(true)),
         )
@@ -56,13 +76,13 @@ pub(super) fn bar(session: Rc<Session>) -> Element {
         .child(
             icon_button(Icon::ArrowUp, 15.0)
                 .name("find-older")
-                .tooltip("上一处  回车 / ⌘G")
+                .tooltip(format!("上一处  回车 / {}", Shortcut::FindOlder.keys()))
                 .on_click(move || older.find_step(true)),
         )
         .child(
             icon_button(Icon::ArrowDown, 15.0)
                 .name("find-newer")
-                .tooltip("下一处  ⌘⇧G")
+                .tooltip(format!("下一处  {newer_keys}"))
                 .on_click(move || newer.find_step(false)),
         )
         .child(

@@ -76,32 +76,62 @@ pub enum ThemeChoice {
     System,
 }
 
-/// 终端字体
+/// 终端字体。各平台装着的字体不一样，设置页只列这个平台上有的（[`FontChoice::OFFERED`]）；
+/// 别的平台上存下的（在 Mac 上选的 Menlo 拿到 Windows 上）读进来时换成默认的，见 [`Settings::load`]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FontChoice {
     System,
+    /// macOS
     Menlo,
+    /// macOS
     Monaco,
+    /// Windows 11 自带（Windows Terminal 的默认字体）
+    CascadiaMono,
+    /// Windows
+    Consolas,
     CourierNew,
 }
 
 impl FontChoice {
-    /// 字体族的名字。必须是系统里真有的字体：名字找不到会退到界面字体（不是等宽的），
+    /// 这个平台上能选的，设置页按这个顺序列
+    pub const OFFERED: &[Self] = if cfg!(target_os = "macos") {
+        &[Self::System, Self::Menlo, Self::Monaco, Self::CourierNew]
+    } else if cfg!(windows) {
+        &[
+            Self::System,
+            Self::CascadiaMono,
+            Self::Consolas,
+            Self::CourierNew,
+        ]
+    } else {
+        &[Self::System, Self::CourierNew]
+    };
+
+    /// 字体族的名字（逗号隔开的是前一个没有时用的）。必须是系统里真有的字体：名字找不到会退到界面字体（不是等宽的），
     /// 终端里的字就一个个隔得很开。「系统等宽」按平台挑一个一定装着的等宽字体
     pub fn family(self) -> &'static str {
         match self {
-            Self::System => {
-                if cfg!(target_os = "macos") {
-                    "Menlo"
-                } else if cfg!(windows) {
-                    "Consolas"
-                } else {
-                    "DejaVu Sans Mono"
-                }
-            }
+            Self::System if cfg!(target_os = "macos") => "Menlo",
+            Self::System if cfg!(windows) => Self::CascadiaMono.family(),
+            Self::System => "DejaVu Sans Mono",
             Self::Menlo => "Menlo",
             Self::Monaco => "Monaco",
+            // Windows 10 没有带（装了 Windows Terminal 才有），接着用 Consolas
+            Self::CascadiaMono => "Cascadia Mono, Consolas",
+            Self::Consolas => "Consolas",
+            Self::CourierNew => "Courier New",
+        }
+    }
+
+    /// 设置页里的名字
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "系统等宽",
+            Self::Menlo => "Menlo",
+            Self::Monaco => "Monaco",
+            Self::CascadiaMono => "Cascadia Mono",
+            Self::Consolas => "Consolas",
             Self::CourierNew => "Courier New",
         }
     }
@@ -234,7 +264,7 @@ settings! {
 }
 
 impl Settings {
-    /// 把越界的数字拉回范围（手改了文件、旧版本留下的值）
+    /// 把越界的数字拉回范围（手改了文件、旧版本留下的值），这个平台上没有的字体换成默认的
     fn clamped(mut self) -> Self {
         let clamp = |value: f64, (low, high): (f64, f64), fallback: f64| {
             if value.is_finite() {
@@ -248,6 +278,10 @@ impl Settings {
         self.line_height = clamp(self.line_height, LINE_HEIGHT, default.line_height);
         self.scrollback = clamp(self.scrollback, SCROLLBACK, default.scrollback).round();
         self.wheel = clamp(self.wheel, WHEEL, default.wheel).round();
+        // 设置文件是别的平台上存的（在 Mac 上选的 Menlo）：这里没装，用了会退到不等宽的界面字体
+        if !FontChoice::OFFERED.contains(&self.font) {
+            self.font = default.font;
+        }
         self
     }
 
@@ -333,6 +367,40 @@ mod tests {
             assert_eq!(loaded.font_weight, expected, "{old}");
             assert_eq!(loaded.font_size, 15.0, "别的项也在");
         }
+    }
+
+    /// 别的平台上存的设置（在 Mac 上选了 Menlo，拿到 Windows 上）：读得进来，字体换成默认的，别的项照旧；
+    /// 这个平台上有的字体原样留着
+    #[test]
+    fn fonts_from_another_platform_fall_back_to_the_default() {
+        let directory = crate::store::tests::scratch("settings-fonts");
+        let store = Store::at(&directory);
+        std::fs::create_dir_all(&directory).expect("建得了目录");
+        let mut missing = 0;
+        for (name, font) in [
+            ("system", FontChoice::System),
+            ("menlo", FontChoice::Menlo),
+            ("monaco", FontChoice::Monaco),
+            ("cascadia_mono", FontChoice::CascadiaMono),
+            ("consolas", FontChoice::Consolas),
+            ("courier_new", FontChoice::CourierNew),
+        ] {
+            std::fs::write(
+                directory.join(FILE),
+                format!(r#"{{"font":"{name}","font_size":15}}"#),
+            )
+            .expect("写得进");
+            let loaded = Settings::load(&store);
+            assert_eq!(loaded.font_size, 15.0, "{name}：别的项也在");
+            if FontChoice::OFFERED.contains(&font) {
+                assert_eq!(loaded.font, font, "{name} 这里有，留着");
+            } else {
+                missing += 1;
+                assert_eq!(loaded.font, Settings::default().font, "{name} 这里没有");
+            }
+        }
+        assert!(missing > 0, "每个平台都缺几个别的平台的字体");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

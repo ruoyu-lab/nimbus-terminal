@@ -381,18 +381,14 @@ fn the_status_bar_can_be_turned_off() {
     assert!(harness.bounds("status-target").is_some());
 }
 
-/// 字体：终端里的字是等宽的，一格的宽度大约是字号的 0.6 倍，不是退到界面字体后撑开的两倍宽
+/// 字体：这个平台上能选的每一个，终端里的字都是等宽的，一格的宽度大约是字号的 0.6 倍，
+/// 不是退到界面字体后撑开的两倍宽
 #[test]
 fn the_terminal_font_is_monospace_for_every_choice() {
     use crate::settings::FontChoice;
     let (harness, workspace) = mounted();
     harness.advance(secs(1.0));
-    for font in [
-        FontChoice::System,
-        FontChoice::Menlo,
-        FontChoice::Monaco,
-        FontChoice::CourierNew,
-    ] {
+    for &font in FontChoice::OFFERED {
         workspace.form.font.set(font);
         harness.advance(secs(1.0));
         let grid = harness.bounds("grid").expect("终端在");

@@ -196,3 +196,138 @@ fn command_arrow_keys_jump_between_commands() {
             .is_some_and(|text| text.contains("cmd2"))
     );
 }
+
+/// Windows、Linux：Ctrl+Shift+D 是左右分（Shift 本来就按着，不再算上下分）；Alt+Shift+加号、减号左右分、上下分
+/// （Windows Terminal 的按法）。这几个键一个字节也不写给终端：Ctrl+Shift+D 漏过去就是 Ctrl+D，shell 会退出
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_shift_d_and_alt_shift_plus_minus_split_panes() {
+    let (harness, workspace, fake) = blank(Store::none());
+    workspace.new_tab();
+    harness.frame();
+    let leaves = || {
+        workspace.tabs.get_untracked()[0]
+            .layout
+            .get_untracked()
+            .leaves()
+            .len()
+    };
+    let (ctrl_shift, alt_shift) = (
+        Modifiers::CONTROL | Modifiers::SHIFT,
+        Modifiers::ALT | Modifiers::SHIFT,
+    );
+    harness.key_down_with(Key::Character("D".into()), ctrl_shift);
+    harness.frame();
+    assert_eq!(leaves(), 2);
+    assert!(harness.bounds("pane-divider-columns").is_some(), "左右分");
+    assert!(harness.bounds("pane-divider-rows").is_none());
+    harness.key_down_with(Key::Character("_".into()), alt_shift);
+    harness.frame();
+    assert_eq!(leaves(), 3);
+    assert!(harness.bounds("pane-divider-rows").is_some(), "上下分");
+    harness.key_down_with(Key::Character("+".into()), alt_shift);
+    harness.frame();
+    assert_eq!(leaves(), 4);
+    for index in 0..fake.ptys.borrow().len() {
+        assert_eq!(fake.pty(index).take(), "", "第 {index} 个终端什么也没收到");
+    }
+    // 按着 Ctrl 的不算（AltGr 报上来就是 Ctrl+Alt，那是在打字）
+    harness.key_down_with(
+        Key::Character("+".into()),
+        Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT,
+    );
+    harness.frame();
+    assert_eq!(leaves(), 4);
+}
+
+/// Windows、Linux：查找条开着时 F3 往上（更早的）找、Shift+F3 往下找，输入框里 Shift+回车也往下找；
+/// Ctrl+Shift+G 往上（Shift 本来就按着，不算往下）。查找条关着时 F3 照常交给终端里的程序
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn f3_and_shift_enter_step_through_matches() {
+    let (harness, workspace, fake) = blank(Store::none());
+    workspace.new_tab();
+    harness.frame();
+    let session = workspace.focused_session().expect("有终端");
+    for index in 0..120 {
+        let marker = if matches!(index, 5 | 60 | 115) {
+            "needle"
+        } else {
+            "hay"
+        };
+        session.feed_for_test(&format!("row {index} {marker}\r\n"));
+    }
+    harness.frame();
+    let pty = fake.pty(0);
+    pty.take();
+    harness.key_down(NamedKey::F3);
+    harness.frame();
+    assert_eq!(pty.take(), "\x1bOR", "查找条关着：F3 是给程序的");
+
+    let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
+    harness.key_down_with(Key::Character("F".into()), ctrl_shift);
+    harness.advance(secs(1.0));
+    assert!(
+        harness.bounds("find-bar").is_some(),
+        "Ctrl+Shift+F 打开查找条"
+    );
+    harness.type_text("needle");
+    harness.advance(secs(1.0));
+    let status = |harness: &Harness| harness.text("find-status").unwrap_or_default();
+    assert_eq!(status(&harness), "3/3");
+    let steps: [(Key, Modifiers, &str); 5] = [
+        (Key::Named(NamedKey::F3), Modifiers::empty(), "2/3"),
+        (Key::Named(NamedKey::F3), Modifiers::SHIFT, "3/3"),
+        (Key::Character("G".into()), ctrl_shift, "2/3"),
+        (Key::Named(NamedKey::Enter), Modifiers::SHIFT, "3/3"),
+        (Key::Named(NamedKey::Enter), Modifiers::empty(), "2/3"),
+    ];
+    for (key, modifiers, expected) in steps {
+        let label = format!("{modifiers:?} {key:?}");
+        harness.key_down_with(key, modifiers);
+        harness.advance(secs(1.0));
+        assert_eq!(status(&harness), expected, "{label}");
+    }
+    assert_eq!(pty.take(), "", "查找时一个键也没漏给终端");
+}
+
+/// 提示写的是这个平台的按法：侧栏、命令面板、设置页的快捷键列表都从同一张表来；Windows、Linux 上哪儿都没有 ⌘
+#[test]
+fn shortcut_hints_show_this_platforms_keys() {
+    let (harness, workspace) = mounted();
+    let tree = |harness: &Harness| format!("{:?}", harness.element_tree());
+    let sidebar = tree(&harness);
+    for shortcut in [Shortcut::NewTab, Shortcut::Palette, Shortcut::Settings] {
+        assert!(sidebar.contains(shortcut.keys()), "侧栏里有 {shortcut:?}");
+    }
+    workspace.palette_open.set(true);
+    harness.advance(secs(1.0));
+    let palette = tree(&harness);
+    for shortcut in [Shortcut::SplitColumns, Shortcut::SplitRows, Shortcut::Find] {
+        assert!(
+            palette.contains(shortcut.keys()),
+            "命令面板里有 {shortcut:?}"
+        );
+    }
+    workspace.palette_open.set(false);
+    workspace.open_settings();
+    workspace.settings_page.set(SettingsPage::Shortcuts);
+    harness.advance(secs(1.0));
+    let page = tree(&harness);
+    for shortcut in [
+        Shortcut::SplitColumns,
+        Shortcut::SplitRows,
+        Shortcut::FindOlder,
+        Shortcut::FindNewer,
+        Shortcut::Copy,
+        Shortcut::Paste,
+    ] {
+        assert!(page.contains(shortcut.keys()), "设置页里有 {shortcut:?}");
+    }
+    if !Shortcut::MAC {
+        assert!(
+            !sidebar.contains('⌘') && !palette.contains('⌘') && !page.contains('⌘'),
+            "Windows、Linux 上不出现 ⌘"
+        );
+    }
+}

@@ -1,13 +1,40 @@
-//! 键盘和输入：按键编码、粘贴（含多行确认）、输入法提交、把路径或命令写在提示符处。
+//! 键盘和输入：按键编码、复制、粘贴（含多行确认）、输入法提交、把路径或命令写在提示符处。
 
 use super::*;
 
-/// 粘贴的快捷键：macOS 是 ⌘V，Windows、Linux 是 Ctrl+Shift+V（Ctrl+V 要留给 shell）
+/// Windows、Linux 的那一套剪贴板键（Ctrl+Shift+C、Ctrl+Insert、Shift+Insert）。
+/// macOS 上不认：⌘C、⌘A 由网格自己处理（终端不收 ⌘ 的组合键），Ctrl+Shift+C 照旧交给终端
+const OTHER_CLIPBOARD_KEYS: bool = !cfg!(target_os = "macos");
+
+/// 按的是不是这个字母（大小写都算：按着 Shift 时报上来的是大写）
+fn is_letter(event: &KeyEvent, letter: &str) -> bool {
+    matches!(&event.key, Key::Character(text) if text.as_str().eq_ignore_ascii_case(letter))
+}
+
+/// 按的是不是只带 `modifiers` 这几个修饰键的 Insert
+fn is_insert(event: &KeyEvent, modifiers: Modifiers) -> bool {
+    matches!(event.key, Key::Named(NamedKey::Insert)) && event.modifiers == modifiers
+}
+
+/// 粘贴的快捷键：macOS 是 ⌘V，Windows、Linux 是 Ctrl+Shift+V（Ctrl+V 要留给 shell），还有老习惯的 Shift+Insert
 fn is_paste(event: &KeyEvent) -> bool {
-    let is_v =
-        matches!(&event.key, Key::Character(text) if text.as_str().eq_ignore_ascii_case("v"));
     let modifiers = event.modifiers;
-    is_v && (modifiers.has_super() || (modifiers.has_control() && modifiers.has_shift()))
+    let chord = modifiers.has_super() || (modifiers.has_control() && modifiers.has_shift());
+    (is_letter(event, "v") && chord) || (OTHER_CLIPBOARD_KEYS && is_insert(event, Modifiers::SHIFT))
+}
+
+/// 复制的快捷键（Windows、Linux）：Ctrl+Shift+C，老习惯的 Ctrl+Insert。单独的 Ctrl+C 是给 shell 的中断
+fn is_copy(event: &KeyEvent) -> bool {
+    OTHER_CLIPBOARD_KEYS
+        && ((is_letter(event, "c") && event.modifiers == Modifiers::CONTROL | Modifiers::SHIFT)
+            || is_insert(event, Modifiers::CONTROL))
+}
+
+/// 全选的快捷键（Windows、Linux）：Ctrl+Shift+A。单独的 Ctrl+A 是 shell 里的回到行首
+fn is_select_all(event: &KeyEvent) -> bool {
+    OTHER_CLIPBOARD_KEYS
+        && is_letter(event, "a")
+        && event.modifiers == Modifiers::CONTROL | Modifiers::SHIFT
 }
 
 /// 文字里除了结尾的那个换行之外，还有换行
@@ -18,6 +45,15 @@ pub fn has_inner_newline(text: &str) -> bool {
 impl Session {
     /// 网格有焦点时的按键。返回 `true` 表示终端收下了（不再往外传）
     pub(super) fn key(self: &Rc<Self>, event: &KeyEvent) -> bool {
+        // 复制、全选不碰 pty：连接断了也能复制屏幕上的字（比如出错的原因）
+        if is_copy(event) {
+            self.copy_selection();
+            return true;
+        }
+        if is_select_all(event) {
+            self.select_all();
+            return true;
+        }
         // 连接断了，等着重连：回车重连，别的键都不往已经没有人听的 pty 里写
         if self.waiting.get() && self.reconnect.borrow().is_some() {
             if matches!(event.key, Key::Named(NamedKey::Enter)) {
@@ -36,6 +72,9 @@ impl Session {
         let Some(bytes) = keys::encode(event, keymap) else {
             return false;
         };
+        // 写给 shell 的键，网格自己不再处理：它把主修饰键加 C、A 当复制、全选，Windows、Linux 上主修饰键是 Ctrl，
+        // 而 Ctrl+C、Ctrl+A 是给 shell 的（不拦的话按 Ctrl+A 回行首，整屏也跟着被选中）
+        event.prevent_builtin(Builtin::EDIT);
         // 打字、按方向键都是「继续用 shell 了」：选区作废，回看的话回到最新的输出
         self.grid.set_selection(None);
         self.write(&bytes);

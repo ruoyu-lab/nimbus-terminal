@@ -12,7 +12,7 @@ use crate::settings::{
     LastTab, SCROLLBACK, Settings, ShellKind, SidebarStart, Startup, ThemeChoice, TitleSource,
     WHEEL,
 };
-use crate::tabs::{SettingsPage, Workspace};
+use crate::tabs::{SettingsPage, Shortcut, Workspace};
 use crate::theme::{
     accent, card_bg, fg, hover, ink, line, popup_shadow, selected, text_2, text_3, toggle_off,
 };
@@ -100,10 +100,11 @@ fn general(form: Form) -> Element {
                         ),
                         move || form.shell.get() == ShellKind::Program,
                         move || {
+                            // 占位写的是「系统默认」用的那个，不指定时就是它
                             picker_field(
                                 form.shell_program,
                                 "set-shell-path",
-                                "/bin/zsh",
+                                crate::pty::default_shell(),
                                 Picks::File,
                             )
                         },
@@ -513,7 +514,7 @@ enum Picks {
 fn picker_field(
     value: Signal<String>,
     name: &'static str,
-    placeholder: &'static str,
+    placeholder: impl Into<String>,
     picks: Picks,
 ) -> Element {
     row()
@@ -542,10 +543,14 @@ fn picker_field(
         )
 }
 
-fn path_field(value: Signal<String>, name: &'static str, placeholder: &'static str) -> Element {
+fn path_field(
+    value: Signal<String>,
+    name: &'static str,
+    placeholder: impl Into<String>,
+) -> Element {
     text_field(value)
         .name(name)
-        .placeholder(placeholder)
+        .placeholder(placeholder.into())
         .width(240)
         .height(30)
         .font_size(12)
@@ -557,15 +562,11 @@ fn path_field(value: Signal<String>, name: &'static str, placeholder: &'static s
         .style(&Style::new().focused(|style| style.border_color(ink())))
 }
 
+/// 只列这个平台上装着的字体
 fn font_menu(value: Signal<FontChoice>) -> Element {
     menu(
         value,
-        [
-            (FontChoice::System, "系统等宽"),
-            (FontChoice::Menlo, "Menlo"),
-            (FontChoice::Monaco, "Monaco"),
-            (FontChoice::CourierNew, "Courier New"),
-        ],
+        FontChoice::OFFERED.iter().map(|&font| (font, font.label())),
         "set-font",
         "终端字体",
     )
@@ -719,30 +720,38 @@ fn preview(form: Form) -> Element {
 }
 
 fn shortcuts_page() -> Element {
-    const KEYS: [(&str, &str); 16] = [
-        ("新建会话", "⌘T"),
-        ("左右分屏", "⌘D"),
-        ("上下分屏", "⌘⇧D"),
-        ("关闭当前终端（拆分过的）/ 标签；设置页里是返回", "⌘W"),
-        ("命令面板", "⌘K"),
-        ("在终端中查找", "⌘F"),
-        ("查找：上一处 / 下一处", "⌘G  ⌘⇧G"),
-        ("跳到上一条 / 下一条命令（要命令标记）", "⌘↑  ⌘↓"),
-        ("放大 / 缩小 / 还原字号", "⌘+  ⌘-  ⌘0"),
-        ("收起 / 展开侧栏", "⌘B"),
-        ("打开 / 退出设置", "⌘,"),
-        ("切到第 1 – 8 个标签", "⌘1 – ⌘8"),
-        ("切到最后一个标签", "⌘9"),
-        ("上一个 / 下一个标签", "⌘⇧[  ⌘⇧]"),
-        ("切换标签", "Ctrl+Tab"),
-        ("粘贴", "⌘V"),
+    use Shortcut::*;
+    // 一个动作有几个键的（上一处 / 下一处这种）并排写，中间空两格
+    const KEYS: [(&str, &[Shortcut]); 18] = [
+        ("新建会话", &[NewTab]),
+        ("左右分屏", &[SplitColumns]),
+        ("上下分屏", &[SplitRows]),
+        ("关闭当前终端（拆分过的）/ 标签；设置页里是返回", &[Close]),
+        ("命令面板", &[Palette]),
+        ("在终端中查找", &[Find]),
+        ("查找：上一处 / 下一处", &[FindOlder, FindNewer]),
+        (
+            "跳到上一条 / 下一条命令（要命令标记）",
+            &[PreviousCommand, NextCommand],
+        ),
+        ("放大 / 缩小 / 还原字号", &[ZoomIn, ZoomOut, ZoomReset]),
+        ("收起 / 展开侧栏", &[Sidebar]),
+        ("打开 / 退出设置", &[Settings]),
+        ("切到第 1 – 8 个标签", &[TabNumber]),
+        ("切到最后一个标签", &[LastTab]),
+        ("上一个 / 下一个标签", &[PreviousTab, NextTab]),
+        ("切换标签", &[CycleTabs]),
+        ("复制选中的文字", &[Copy]),
+        ("粘贴", &[Paste]),
+        ("全选", &[SelectAll]),
     ];
     let rows = KEYS
         .iter()
         .map(|&(label, keys)| {
+            let keys: Vec<&str> = keys.iter().map(|key| key.keys()).collect();
             setting(
                 label,
-                text(keys)
+                text(keys.join("  "))
                     .font_size(12)
                     .padding_x(8)
                     .padding_y(3)
@@ -751,11 +760,12 @@ fn shortcuts_page() -> Element {
             )
         })
         .collect();
-    settings_list(
-        "快捷键",
-        "Windows 和 Linux 上用 Ctrl+Shift 代替 ⌘。",
-        stack(rows),
-    )
+    let note = if Shortcut::MAC {
+        "Windows 和 Linux 上大多用 Ctrl+Shift 代替 ⌘。"
+    } else {
+        "单独按 Ctrl 的组合键留给终端里的程序（Ctrl+C 照常是中断），所以快捷键多按一个 Shift。"
+    };
+    settings_list("快捷键", note, stack(rows))
 }
 
 fn about_page(form: Form, location: &str) -> Element {
