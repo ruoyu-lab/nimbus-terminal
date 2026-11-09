@@ -7,6 +7,8 @@ pub(super) struct PaneSpec<'a> {
     pub(super) tab: u64,
     pub(super) folder: Option<u64>,
     pub(super) target: &'a Target,
+    /// 标签指定的 shell 程序（见 [`Tab::shell`]）；`None` 用设置里的
+    pub(super) shell: Option<String>,
     /// 复用连接的套接字（服务器的第一个终端才有）
     pub(super) control: Option<PathBuf>,
     pub(super) directory: Option<PathBuf>,
@@ -22,6 +24,8 @@ pub(super) struct Restoring<'a> {
     pub(super) tab: u64,
     pub(super) folder: Option<u64>,
     pub(super) target: &'a Target,
+    /// 标签指定的 shell 程序，每个终端都用它
+    pub(super) shell: Option<String>,
     pub(super) keep_output: bool,
     /// 复用套接字只给第一个终端
     pub(super) control: Option<PathBuf>,
@@ -44,6 +48,7 @@ impl Workspace {
                     tab: restoring.tab,
                     folder: restoring.folder,
                     target: restoring.target,
+                    shell: restoring.shell.clone(),
                     control: restoring.control.take(),
                     directory: directory.clone(),
                     remote_directory: None,
@@ -78,6 +83,7 @@ impl Workspace {
             tab,
             folder,
             target,
+            shell,
             control,
             directory,
             remote_directory,
@@ -85,9 +91,15 @@ impl Workspace {
             waiting,
         } = spec;
         let (columns, rows) = self.size.get_untracked();
-        let shell = (self.form.shell.get_untracked() == ShellKind::Program)
-            .then(|| self.form.shell_program.get_untracked().trim().to_string())
-            .filter(|program| !program.is_empty());
+        // 标签指定了 shell（新建菜单里选的）就用它，不然看设置
+        let shell = shell.or_else(|| {
+            (self.form.shell.get_untracked() == ShellKind::Program)
+                .then(|| self.form.shell_program.get_untracked().trim().to_string())
+                .filter(|program| !program.is_empty())
+        });
+        // 本机的终端实际起的是哪个程序：标题（Windows 上叫 shell 的名字）、拖文件进来时按哪种 shell 的规矩引路径，都看它
+        let program = matches!(target, Target::Local)
+            .then(|| shell.clone().unwrap_or_else(crate::pty::default_shell));
         let owns_connection = target
             .host()
             .zip(control.clone())
@@ -187,6 +199,7 @@ impl Workspace {
         };
         let session = Session::start(spawned, columns, rows, hooks, self.form, history.as_deref());
         session.set_local(!remote);
+        session.set_shell_program(program);
         if remote {
             // 断线后按回车重连：用当时的大小再起一次 `ssh` / `docker exec`
             let (spawn, this) = (self.spawn.clone(), self.this.clone());
@@ -211,6 +224,7 @@ impl Workspace {
         id: u64,
         folder: Option<u64>,
         target: Target,
+        shell: Option<String>,
         control: Option<PathBuf>,
         layout: Pane,
         focus: u64,
@@ -226,6 +240,7 @@ impl Workspace {
                 target,
                 control,
                 folder,
+                shell,
             })
         });
         self.bar.update(|bar| bar.push(id));
@@ -248,11 +263,12 @@ impl Workspace {
             return;
         };
         let directory = tab.session().working_directory();
-        // 拆出来的终端各连各的，不抢主连接
+        // 拆出来的终端各连各的，不抢主连接；shell 和标签的一样
         let (pane, session) = self.spawn_pane(PaneSpec {
             tab: tab.id,
             folder: tab.folder,
             target: &tab.target,
+            shell: tab.shell.clone(),
             control: None,
             directory,
             remote_directory: None,

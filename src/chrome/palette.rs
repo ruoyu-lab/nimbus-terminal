@@ -116,6 +116,19 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
             Rc::new(move || settings.open_settings()),
         ),
     ];
+    // Windows 上装了的每种 shell 一条：「新建会话：Windows PowerShell」（没装的只在新建的下拉里灰着列出来）
+    for shell in crate::pty::shells()
+        .into_iter()
+        .filter(|shell| shell.installed)
+    {
+        let (owner, program) = (workspace.clone(), shell.program);
+        list.push(command(
+            &format!("cmd-new-tab-{}", shell.id),
+            &format!("新建会话：{}", shell.name),
+            "",
+            Rc::new(move || owner.new_tab_with_shell(&program)),
+        ));
+    }
     if workspace.form.remote.get_untracked() {
         let connect = workspace.clone();
         list.push(command(

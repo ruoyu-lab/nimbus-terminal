@@ -234,12 +234,10 @@ fn paths_open_only_for_local_sessions_and_existing_files() {
 #[cfg(windows)]
 #[test]
 fn dropped_files_are_quoted_for_the_windows_shell() {
-    let settings = crate::settings::Settings {
-        shell: crate::settings::ShellKind::Program,
-        shell_program: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
-        ..Default::default()
-    };
-    let (_harness, recorder, _grid, _cell, session) = mounted_with("", settings);
+    let (_harness, recorder, _grid, _cell, session) =
+        mounted_with("", crate::settings::Settings::default());
+    // 引号按这个终端起的程序算（标签起它的时候记下的）
+    session.set_shell_program(Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into()));
     let files = [
         std::path::PathBuf::from(r"C:\Users\me\a.txt"),
         std::path::PathBuf::from(r"C:\Program Files (x86)\b c.txt"),
@@ -253,10 +251,7 @@ fn dropped_files_are_quoted_for_the_windows_shell() {
         recorder.take(),
         r#"C:\Users\me\a.txt "C:\Program Files (x86)\b c.txt" 'C:\$Recycle\it''s.txt' "#
     );
-    session
-        .form
-        .shell_program
-        .set(r"C:\WINDOWS\system32\cmd.exe".into());
+    session.set_shell_program(Some(r"C:\WINDOWS\system32\cmd.exe".into()));
     assert!(session.drop_files(&files[2..]));
     assert_eq!(recorder.take(), r#""C:\$Recycle\it's.txt" "#);
 }

@@ -115,6 +115,9 @@ pub struct Tab {
     pub control: Option<PathBuf>,
     /// 归在哪个文件夹下面；没有就是直接列在「目标」下
     pub folder: Option<u64>,
+    /// 本机标签起的 shell 程序（新建时选的：命令提示符、Windows PowerShell、PowerShell 7……）；
+    /// `None` 是设置里的默认。拆出来的终端、重启后恢复的都用它
+    pub shell: Option<String>,
 }
 
 impl Tab {
@@ -450,20 +453,39 @@ impl Workspace {
             .iter()
             .find(|tab| tab.id == self.active.get_untracked())
             .and_then(|tab| tab.folder);
-        let id = self.open(folder, Target::Local, None, None, None);
+        let id = self.open(folder, Target::Local, None, None, None, None);
+        self.activate(id);
+    }
+
+    /// 和 [`Self::new_tab`] 一样，但起的是 `program` 这个 shell（Windows 上新建菜单里选的那种），不看设置
+    pub fn new_tab_with_shell(&self, program: &str) {
+        let folder = self
+            .tabs
+            .get_untracked()
+            .iter()
+            .find(|tab| tab.id == self.active.get_untracked())
+            .and_then(|tab| tab.folder);
+        let id = self.open(
+            folder,
+            Target::Local,
+            Some(program.to_string()),
+            None,
+            None,
+            None,
+        );
         self.activate(id);
     }
 
     /// 新开一个不归任何文件夹的终端（直接列在「目标」下），用设置里的起始目录
     pub fn new_tab_loose(&self) {
-        let id = self.open(None, Target::Local, None, None, None);
+        let id = self.open(None, Target::Local, None, None, None, None);
         self.activate(id);
     }
 
     /// 在这个文件夹里新开一个本机终端，并把它展开。文件夹有目录就从那个目录起
     pub fn new_tab_in(&self, folder: u64) {
         self.reveal_folder(folder);
-        let id = self.open(Some(folder), Target::Local, None, None, None);
+        let id = self.open(Some(folder), Target::Local, None, None, None, None);
         self.activate(id);
     }
 
@@ -475,11 +497,13 @@ impl Workspace {
         id
     }
 
-    /// 开一个标签（里面一个终端），放进标签条和侧栏，但不切过去。返回它的 id
+    /// 开一个标签（里面一个终端），放进标签条和侧栏，但不切过去。返回它的 id。
+    /// `shell` 是本机标签指定的 shell 程序，`None` 用设置里的
     fn open(
         &self,
         folder: Option<u64>,
         target: Target,
+        shell: Option<String>,
         directory: Option<PathBuf>,
         remote_directory: Option<String>,
         history: Option<String>,
@@ -490,13 +514,22 @@ impl Workspace {
             tab: id,
             folder,
             target: &target,
+            shell: shell.clone(),
             control: control.clone(),
             directory,
             remote_directory,
             history,
             waiting: false,
         });
-        self.push_tab(id, folder, target, control, Pane::leaf(pane, session), pane);
+        self.push_tab(
+            id,
+            folder,
+            target,
+            shell,
+            control,
+            Pane::leaf(pane, session),
+            pane,
+        );
         id
     }
 
@@ -510,7 +543,8 @@ impl Workspace {
         self.refresh_title(id);
     }
 
-    /// 重新算这个标签显示什么：用户起的名字，其次（设置允许时）程序报告的标题，最后是「终端」
+    /// 重新算这个标签显示什么：用户起的名字，其次（设置允许时）程序报告的标题，
+    /// 最后是目标的名字（主机名、容器名；Windows 上本机的是 shell 的名字）或者「终端」
     fn refresh_title(&self, id: u64) {
         let shown = if let Some(custom) = self.custom_titles.borrow().get(&id) {
             custom.clone()
@@ -524,12 +558,18 @@ impl Workspace {
             if self.form.title.get_untracked() == TitleSource::Reported && !reported.is_empty() {
                 reported
             } else {
-                // 远端的会话默认叫目标的名字（主机名、容器名），一眼分得清是哪个
+                // 远端的会话默认叫目标的名字（主机名、容器名），Windows 上本机的会话叫它起的 shell
+                // （命令提示符、Windows PowerShell……），一眼分得清是哪个
                 self.tabs
                     .get_untracked()
                     .iter()
                     .find(|tab| tab.id == id)
-                    .and_then(|tab| tab.target.remote_name().map(str::to_string))
+                    .and_then(|tab| {
+                        tab.target.remote_name().map(str::to_string).or_else(|| {
+                            let program = tab.session().shell_program()?;
+                            crate::pty::shell_name(&program).map(str::to_string)
+                        })
+                    })
                     .unwrap_or_else(|| DEFAULT_TITLE.to_string())
             }
         };

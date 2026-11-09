@@ -105,6 +105,8 @@ pub struct Session {
     jump_mark: Cell<Option<u64>>,
     /// 这是本机的终端（⌘点击文件路径才打得开：服务器上的路径在本机找不到）
     local: Cell<bool>,
+    /// 本机的终端起的是哪个 shell 程序（标题、拖进来的路径按哪种 shell 的规矩引都看它）；别的终端是 `None`
+    shell_program: RefCell<Option<String>>,
     /// 看得见的图片（界面叠在网格上画）
     images: Signal<Vec<VisibleImage>>,
     /// 每张图的解码来源：同一张图只建一次，换位置不重新解码
@@ -199,6 +201,7 @@ impl Session {
             reconnect: RefCell::new(None),
             waiting: Cell::new(false),
             local: Cell::new(false),
+            shell_program: RefCell::new(None),
             jump_mark: Cell::new(None),
             images: aureole::detached(|| signal(Vec::new())),
             image_sources: RefCell::new(std::collections::HashMap::new()),
@@ -293,6 +296,16 @@ impl Session {
     fn remeasure(&self, current: Rect) {
         self.cell.set(None);
         self.remeasure_from.set(Some(current));
+    }
+
+    /// 记下本机的终端起的是哪个 shell 程序；别的终端给 `None`
+    pub fn set_shell_program(&self, program: Option<String>) {
+        *self.shell_program.borrow_mut() = program;
+    }
+
+    /// 本机的终端起的 shell 程序（起的时候定的，之后在里面又开了别的 shell 也还是它）
+    pub fn shell_program(&self) -> Option<String> {
+        self.shell_program.borrow().clone()
     }
 
     /// shell 现在所在的目录（存下来下次启动在这里开；点相对路径时从这里算）。

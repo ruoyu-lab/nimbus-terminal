@@ -256,6 +256,73 @@ fn action_menu(menu_name: String, open: Signal<bool>, actions: Rc<Vec<Action>>) 
     pop(menu)
 }
 
+/// 新建会话的下拉（Windows）：命令提示符、Windows PowerShell、PowerShell 7 各一项，点了按那个 shell 开新标签。
+/// 没装的灰着、写「未安装」，点不了。点 `element` 弹出，挂在它下面，再点一下收起
+pub(super) fn with_shell_menu(element: Element, workspace: &Rc<Workspace>) -> Element {
+    let open = signal(false);
+    let owner = workspace.clone();
+    element
+        .on_click(move || open.update(|open| *open = !*open))
+        .overlay(
+            open,
+            Overlay::new(move || shell_menu(&owner, open))
+                .placement(Placement::bottom().start())
+                .offset(4)
+                .auto_focus(true)
+                .on_dismiss(move |_| open.set(false)),
+        )
+}
+
+fn shell_menu(workspace: &Rc<Workspace>, open: Signal<bool>) -> Element {
+    let mut menu = column()
+        .name("menu-shells")
+        .width(216)
+        .padding(4)
+        .gap(1)
+        .radius(8)
+        .background(card_bg())
+        .shadow(popup_shadow())
+        .focus_arrows(Direction::Column);
+    for shell in crate::pty::shells() {
+        let item = row()
+            .name(format!("menu-shell-{}", shell.id))
+            .align(Align::Center)
+            .justify(Justify::SpaceBetween)
+            .gap(12)
+            .accessibility_role(Role::MenuItem)
+            .child(text(shell.name));
+        menu = menu.child(if shell.installed {
+            let (owner, program) = (workspace.clone(), shell.program);
+            item.style(&menu_item_style())
+                .focusable(true)
+                .focus_ring(FocusRing::NONE)
+                .on_click(move |event: &ClickEvent| {
+                    event.stop_propagation();
+                    open.set(false);
+                    owner.new_tab_with_shell(&program);
+                })
+        } else {
+            let file = std::path::Path::new(&shell.program)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            item.style(&missing_item_style())
+                .tooltip(format!("没有找到 {file}，装好以后就能用"))
+                .child(text("未安装").font_size(12))
+        });
+    }
+    pop(menu)
+}
+
+/// 菜单里点不了的一项（没装的 shell）：灰字，悬停不变
+fn missing_item_style() -> Style {
+    Style::new()
+        .height(30)
+        .padding_x(10)
+        .radius(5)
+        .color(text_3())
+}
+
 fn menu_item_style() -> Style {
     soft(
         Style::new()

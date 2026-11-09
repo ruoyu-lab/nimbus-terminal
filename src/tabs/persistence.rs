@@ -51,6 +51,8 @@ pub(super) struct SavedTab {
     pub(super) layout: Option<SavedPane>,
     /// 聚焦的是排布里的第几个终端（从 0 数，从左到右、从上到下）
     pub(super) focus: Option<usize>,
+    /// 本机标签指定的 shell 程序（新建菜单里选的）；用设置里的默认就是 `None`。旧文件里没有这一项
+    pub(super) shell: Option<String>,
 }
 
 /// 落盘的排布：一个终端（带关掉时的目录），或者一次拆分
@@ -228,6 +230,7 @@ impl Workspace {
                         directory: tab.session().working_directory(),
                         focus: layout.leaves().iter().position(|(id, _)| *id == focus),
                         layout: Some(SavedPane::of(&layout)),
+                        shell: tab.shell.clone(),
                     }
                 })
                 .collect(),
@@ -337,12 +340,15 @@ impl Workspace {
                 self.remember_container(container);
             }
             let control = target.host().and_then(|_| crate::ssh::control_path(tab_id));
+            // 指定的 shell 只对本机标签有意思
+            let shell = tab.shell.clone().filter(|_| target == Target::Local);
             let pane = self.build_pane(
                 &layout,
                 &mut Restoring {
                     tab: tab_id,
                     folder,
                     target: &target,
+                    shell: shell.clone(),
                     keep_output,
                     control: control.clone(),
                     flat: &mut flat,
@@ -352,7 +358,7 @@ impl Workspace {
                 .focus
                 .and_then(|index| pane.leaves().get(index).map(|(id, _)| *id))
                 .unwrap_or_else(|| pane.first_id());
-            self.push_tab(tab_id, folder, target, control, pane, focus);
+            self.push_tab(tab_id, folder, target, shell, control, pane, focus);
             if let Some(title) = &tab.title {
                 self.rename_tab(tab_id, title);
             }

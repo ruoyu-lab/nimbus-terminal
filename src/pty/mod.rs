@@ -160,6 +160,26 @@ pub struct Shell {
     pub installed: bool,
 }
 
+/// 认得的 shell：标识（也就是程序名，见 [`program_name`]）和给人看的名字
+const SHELL_NAMES: [(&str, &str); 3] = [
+    ("pwsh", "PowerShell 7"),
+    ("powershell", "Windows PowerShell"),
+    ("cmd", "命令提示符"),
+];
+
+/// 这个程序是哪种 shell，给人看的名字（`C:\…\powershell.exe` 是「Windows PowerShell」）。
+/// 只认 Windows 上那三种，别的（包括类 Unix 上的 shell）是 `None`
+pub fn shell_name(program: &str) -> Option<&'static str> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let id = program_name(program)?;
+    SHELL_NAMES
+        .iter()
+        .find(|(known, _)| *known == id)
+        .map(|(_, name)| *name)
+}
+
 /// 这台机器上能选的 shell，按推荐的顺序：PowerShell 7、Windows PowerShell、命令提示符。
 /// 没装的也列出来（`installed` 是假）。类 Unix 上是空的：那里只用 `$SHELL`（见 [`default_shell`]）
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -187,26 +207,23 @@ fn windows_shells() -> Vec<Shell> {
     let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
     let cmd =
         variable("ComSpec").map_or_else(|| system_root.join(r"System32\cmd.exe"), PathBuf::from);
-    let entry = |id, name, program: &Path, installed| Shell {
+    let entry = |id: &'static str, program: &Path, installed| Shell {
         id,
-        name,
+        name: SHELL_NAMES
+            .iter()
+            .find(|(known, _)| *known == id)
+            .map_or(id, |(_, name)| *name),
         program: program.to_string_lossy().into_owned(),
         installed,
     };
     vec![
         entry(
             "pwsh",
-            "PowerShell 7",
             pwsh.as_deref().unwrap_or(&pwsh_default),
             pwsh.is_some(),
         ),
-        entry(
-            "powershell",
-            "Windows PowerShell",
-            &powershell,
-            exists(&powershell),
-        ),
-        entry("cmd", "命令提示符", &cmd, exists(&cmd)),
+        entry("powershell", &powershell, exists(&powershell)),
+        entry("cmd", &cmd, exists(&cmd)),
     ]
 }
 

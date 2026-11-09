@@ -8,7 +8,7 @@ use aureole::prelude::*;
 use aureole::{title_bar_info, window_size};
 
 use crate::chrome::BAR_HEIGHT;
-use crate::chrome::menu::with_context_menu;
+use crate::chrome::menu::{with_context_menu, with_shell_menu};
 use crate::chrome::widgets::{fade_in, icon_button, soft};
 use crate::icons::Icon;
 use crate::pane::Axis;
@@ -118,7 +118,7 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
 /// 标签条加后面的新建按钮
 fn tab_strip(workspace: &Rc<Workspace>) -> Element {
     let (bar, active) = (workspace.bar, workspace.active);
-    let (new_tab, owner) = (workspace.clone(), workspace.clone());
+    let (new_tab, owner, shells_owner) = (workspace.clone(), workspace.clone(), workspace.clone());
     let scroller = ScrollHandle::new();
     // 切到的标签（新开的、点侧栏选的、快捷键切的、刚从设置页回来）在视口外面时，滚到看得见为止。
     // 等一帧再滚：新标签刚挂上，视口还没量到它，现在滚会被夹回旧的末尾
@@ -183,6 +183,19 @@ fn tab_strip(workspace: &Rc<Workspace>) -> Element {
                 .name("new-tab")
                 .tooltip(format!("新建会话  {}", Shortcut::NewTab.keys()))
                 .on_click(move || new_tab.new_tab()),
+        )
+        // Windows 上有几种 shell 可选：加号旁边的小箭头弹出选单（类 Unix 上没有这个列表）
+        .child_when(
+            move || !crate::pty::shells().is_empty(),
+            move || {
+                with_shell_menu(
+                    icon_button(Icon::ChevronDown, 14.0)
+                        .name("new-tab-shells")
+                        .width(20)
+                        .tooltip("选择 shell 新建会话"),
+                    &shells_owner,
+                )
+            },
         )
 }
 

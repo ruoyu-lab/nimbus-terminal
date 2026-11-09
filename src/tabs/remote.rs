@@ -15,7 +15,7 @@ impl Workspace {
             return false;
         };
         self.remember_host(&host);
-        let id = self.open(None, Target::Ssh { host }, None, directory, None);
+        let id = self.open(None, Target::Ssh { host }, None, None, directory, None);
         self.activate(id);
         true
     }
@@ -51,7 +51,14 @@ impl Workspace {
             return false;
         };
         self.remember_container(&container);
-        let id = self.open(None, Target::Docker { container }, None, directory, None);
+        let id = self.open(
+            None,
+            Target::Docker { container },
+            None,
+            None,
+            directory,
+            None,
+        );
         self.activate(id);
         true
     }

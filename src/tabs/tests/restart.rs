@@ -58,7 +58,7 @@ fn folders_and_tabs_survive_a_restart() {
         // 开的先后和标签条一致：原来标签条里第三个（id 3）现在是 1，「构建」（原来的 2）现在是 3
         let titles = workspace.titles.get_untracked();
         assert_eq!(titles[&3].as_str(), "构建", "起过的名字也在");
-        assert_eq!(titles[&1].as_str(), "终端");
+        assert_eq!(titles[&1].as_str(), local_title());
         assert_eq!(workspace.active.get_untracked(), 3, "选中的还是原来那个");
         assert_eq!(
             workspace

@@ -10,6 +10,7 @@ mod restart;
 mod screenshots;
 mod server;
 mod settings;
+mod shells;
 mod side_panel;
 mod split_panes;
 mod tab_strip;
@@ -201,6 +202,13 @@ pub(super) fn right_click_named(harness: &Harness, name: &str) {
     let [x, y] = harness.window_bounds(name).expect("元素在").center();
     harness.right_click(x, y);
     harness.frame();
+}
+
+/// 本机标签没起名、程序也没报标题时叫什么：Windows 上是默认 shell 的名字（Windows PowerShell……），别的平台是「终端」
+pub(super) fn local_title() -> String {
+    crate::pty::shell_name(&crate::pty::default_shell())
+        .unwrap_or(DEFAULT_TITLE)
+        .to_string()
 }
 
 /// 点浮层里的菜单项（浮层里的元素用窗口坐标点）

@@ -8,8 +8,14 @@ fn a_new_terminal_is_named_terminal_by_default() {
     let (harness, workspace) = mounted();
     assert_eq!(ids(&workspace), [1]);
     assert_eq!(workspace.active.get_untracked(), 1);
-    assert_eq!(harness.text("tab-1").as_deref(), Some("终端"));
-    assert_eq!(harness.text("session-1").as_deref(), Some("终端"));
+    assert_eq!(
+        harness.text("tab-1").as_deref(),
+        Some(local_title().as_str())
+    );
+    assert_eq!(
+        harness.text("session-1").as_deref(),
+        Some(local_title().as_str())
+    );
     assert!(harness.bounds("grid").is_some(), "当前标签的终端要挂着");
 }
 
@@ -51,7 +57,11 @@ fn program_titles_show_on_the_tab_only_when_the_setting_asks_for_it() {
     let session = workspace.tabs.get_untracked()[0].session().clone();
     session.feed_for_test("\x1b]0;vim main.rs\x07");
     harness.frame();
-    assert_eq!(harness.text("tab-1").as_deref(), Some("终端"), "默认不跟");
+    assert_eq!(
+        harness.text("tab-1").as_deref(),
+        Some(local_title().as_str()),
+        "默认不跟"
+    );
     workspace.form.title.set(TitleSource::Reported);
     harness.frame();
     assert_eq!(
@@ -61,13 +71,19 @@ fn program_titles_show_on_the_tab_only_when_the_setting_asks_for_it() {
     );
     session.feed_for_test("\x1b]0;\x07");
     harness.frame();
-    assert_eq!(harness.text("tab-1").as_deref(), Some("终端"));
+    assert_eq!(
+        harness.text("tab-1").as_deref(),
+        Some(local_title().as_str())
+    );
     session.feed_for_test("\x1b]0;less log\x07");
     harness.frame();
     assert_eq!(harness.text("tab-1").as_deref(), Some("less log"));
     workspace.form.title.set(TitleSource::Fixed);
     harness.frame();
-    assert_eq!(harness.text("tab-1").as_deref(), Some("终端"));
+    assert_eq!(
+        harness.text("tab-1").as_deref(),
+        Some(local_title().as_str())
+    );
 }
 
 /// 标题栏的空白处按住再动是拖动窗口；双击交给系统（缩放或最小化）
@@ -466,8 +482,9 @@ fn many_tabs_scroll_and_a_drag_area_stays_on_the_right() {
         last.x,
         moved.x
     );
-    // 右边的空白拖动窗口
-    let (x, y) = (plus.x + plus.width + 20.0, 10.0);
+    // 右边的空白拖动窗口（从最后一个按钮量起：Windows 上加号后面还有选 shell 的小箭头）
+    let last_button = harness.window_bounds("new-tab-shells").unwrap_or(plus);
+    let (x, y) = (last_button.x + last_button.width + 20.0, 10.0);
     harness.mouse_down(x, y, MouseButton::Left);
     harness.mouse_move(x - 10.0, y);
     assert_eq!(harness.window_drag_count(), 1, "新建按钮后面的空白能拖窗口");
@@ -750,7 +767,11 @@ fn escape_and_outside_clicks_close_the_menu_and_the_rename_box_without_changes()
     harness.advance(secs(1.0));
     assert_eq!(workspace.renaming.get_untracked(), None);
     assert!(harness.bounds("rename").is_none(), "Esc 关重命名框");
-    assert_eq!(harness.text("tab-2").as_deref(), Some("终端"), "取消不改名");
+    assert_eq!(
+        harness.text("tab-2").as_deref(),
+        Some(local_title().as_str()),
+        "取消不改名"
+    );
 }
 
 /// 有程序在前台跑的标签，关闭前先问（设置里可以关掉这个确认）；shell 在等输入时直接关
