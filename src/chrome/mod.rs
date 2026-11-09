@@ -42,6 +42,9 @@ use crate::theme::{fg, is_dark, scrim, sidebar_bg};
 
 /// 标题栏的最小高度；系统给的更高就用系统的
 pub const BAR_HEIGHT: f32 = 40.0;
+/// 外框（标题栏和侧栏）透出系统的窗口材质。Windows 上先不开：框架为了透出材质把窗口框架扩到整个窗口，
+/// 系统就在右上角再画一套原生的窗口按钮，和自己画的叠在一起。框架那边修好以后去掉这个例外
+pub const WINDOW_MATERIAL: bool = !cfg!(windows);
 /// 侧栏展开时的默认宽度
 pub const SIDEBAR_DEFAULT: f32 = 232.0;
 /// 拖交界处改侧栏宽度时的下限和上限
@@ -124,8 +127,8 @@ fn frame(workspace: Rc<Workspace>) -> Element {
     );
     // 外框（标题栏和侧栏）用系统的窗口材质，这里只盖一层很淡的底，保证字看得清：
     // 浅色系统里材质本身是浅的，几乎不用盖；深色系统里材质是深的，要盖一层浅色，不然深色的字看不见。
-    // 平台不支持材质时退回不透明的底色
-    let has_backdrop = capabilities().supports_window_backdrop;
+    // 平台不支持材质、或者没开（见 [`WINDOW_MATERIAL`]）时退回不透明的底色
+    let has_backdrop = WINDOW_MATERIAL && capabilities().supports_window_backdrop;
     let backdrop = move || {
         if !has_backdrop {
             return sidebar_bg();

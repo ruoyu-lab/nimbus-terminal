@@ -32,8 +32,12 @@
    Ctrl+Shift+D 只能上下分（没有左右分），Ctrl+Shift+G 只能往一个方向跳。复制没有绑键盘（macOS 上的 ⌘C 要确认是谁接的）。
    侧栏、菜单里的提示还写着 ⌘T、⌘K。
 6. **字体**：设置里的 Menlo、Monaco 在 Windows 上没有，要换成 Cascadia Mono、Consolas。
-7. **窗口外观**：`native::keep_window_still_unless_asked`、`set_application_icon` 在非 macOS 上是空的；
-   框架那边标题栏、改大小、输入的 Windows 改进发布以后，升级 `aureole` 的 `rev`。
+7. **窗口外观**：`native::keep_window_still_unless_asked`、`set_application_icon` 在非 macOS 上是空的，要在真机上对一遍。
+   **系统材质先关着**（`chrome::WINDOW_MATERIAL`）：框架为了透出材质把窗口框架扩到整个窗口（`DwmExtendFrameIntoClientArea` 用 -1），
+   窗口又留着标题栏的样式，系统就在右上角画一套原生的最小化、最大化、关闭，和 Nimbus 自己画的叠在一起；
+   框架却报告「Windows 上没有系统按钮」（`title_bar_info().controls` 是 `None`）。框架修好（不让系统画，或者报告它们、让出位置）以后再打开。
+   框架已经用上 Windows 上标题栏、改大小、输入的改进（`windows-first-tier` 分支的 `54913ae`），但那是私有仓库：
+   框架出了带这些的公开版本以后换回公开的依赖，CI 才拉得到。
 8. **显示器信息**：`display::displays` 在非 macOS 上返回空（窗口位置交给系统，只记大小），要接 Win32 的显示器枚举才能记住窗口在哪块屏。
 
 ## 会受影响的功能
@@ -43,7 +47,7 @@
 | 本机终端 | 能用（ConPTY） |
 | 监控、文件页（SSH） | 依赖 OpenSSH 的 `ControlMaster`，Windows 自带的 OpenSSH 不支持；`ssh::control_directory` 在非 Unix 上返回 `None`，所以现在是「终端能连、监控和文件页没有」。要支持得给常驻通道单开一条连接（只能用密钥登录），或者换成 Rust 的 SSH 库 |
 | Docker 目标 | 走 `docker exec -it`，ConPTY 好了以后应该直接能用，没验证 |
-| 后台通知 | 要有应用标识（AppUserModelID），从安装程序建的开始菜单快捷方式启动才行（框架在做由 `cargo bundle` 写进可执行文件） |
+| 后台通知 | 要有应用标识（AppUserModelID）：现在的框架里 `cargo bundle` 会把它写进可执行文件，启动时声明；要先把打包配起来 |
 | 点击路径、拖文件进终端 | `C:\`、`.\`、`~\` 这类路径在 `links` 和 `app::hyperlinks::resolve_path` 里认不出来；拖进来的路径按 `sh` 的规矩加单引号，cmd 不认 |
 | 文件页的上传、下载 | `files::sftp_get`、`sftp_put` 要求本地路径以 `/` 开头，Windows 上一律被拒 |
 | 打包 | `scripts/` 里只有 macOS 的；框架的 `cargo bundle` 能出 NSIS 安装程序，要在 `Cargo.toml` 里写 `[package.metadata.bundle]` |
@@ -54,4 +58,5 @@
 - 在 Windows 上 `cargo test` 还有 19 个失败，都不是 ConPTY 的：调用 `sh` 的（`channel`、`monitor`、`files` 里的，PATH 里有 Git 的 `sh` 时能过）、
   按 macOS 写的（⌘ 点链接、`/tmp` 路径）、依赖 `ControlMaster` 的、上面说的路径和字体。
 - CI 里有 Windows 的编译检查（`cargo check --all-targets`），这些测试修好以后再加 `cargo test`。CI 的 clippy 只在 macOS 上跑，管不到 `pty/windows.rs`。
+  框架依赖是私有仓库的期间，CI 拉不到依赖，两个任务都会在第一步失败。
 - 框架 Aureole 的 Windows 渲染：字形回退、系统材质还要在真机上看。

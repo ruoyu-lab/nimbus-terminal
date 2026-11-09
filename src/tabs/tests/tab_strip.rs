@@ -118,6 +118,33 @@ fn platforms_without_system_buttons_draw_their_own() {
     assert_eq!(harness.window_drag_count(), 0, "窗口按钮上按住不拖窗口");
 }
 
+/// 自己画的窗口按钮按 Windows 的样子：各 46 宽、和标题栏一样高，贴着窗口的右边和上边，
+/// 和前面的分屏按钮隔开（以前是三个小图标挨着分屏按钮，分不清哪个是哪个）
+#[test]
+fn own_window_buttons_look_like_the_systems() {
+    let (harness, _workspace) = mounted_with(aureole::TitleBarInfo {
+        height: 40.0,
+        ..Default::default()
+    });
+    let bounds = |name: &str| harness.bounds(name).expect(name);
+    let (minimize, maximize, close) = (
+        bounds("window-minimize"),
+        bounds("window-maximize"),
+        bounds("window-close"),
+    );
+    for button in [minimize, maximize, close] {
+        assert_eq!((button.width, button.height, button.y), (46.0, 40.0, 0.0));
+    }
+    assert_eq!(close.x + close.width, WINDOW_SIZE.0 as f32, "关闭贴着右边");
+    assert_eq!(maximize.x + maximize.width, close.x);
+    assert_eq!(minimize.x + minimize.width, maximize.x);
+    let split = bounds("split-rows");
+    assert!(
+        minimize.x - (split.x + split.width) >= 8.0,
+        "和分屏按钮隔开：{split:?} {minimize:?}"
+    );
+}
+
 /// 按在标签上拖不动窗口（标签自己要收点击），双击标签也不会缩放窗口
 #[test]
 fn tabs_do_not_drag_the_window() {

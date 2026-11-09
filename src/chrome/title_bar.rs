@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use aureole::prelude::*;
-use aureole::title_bar_info;
+use aureole::{title_bar_info, window_size};
 
 use crate::chrome::BAR_HEIGHT;
 use crate::chrome::menu::with_context_menu;
@@ -13,7 +13,7 @@ use crate::chrome::widgets::{fade_in, icon_button, soft};
 use crate::icons::Icon;
 use crate::pane::Axis;
 use crate::tabs::{TabDrag, Workspace};
-use crate::theme::{fg, hover, mark, tab_selected_bg, text_2};
+use crate::theme::{fg, hover, line, mark, tab_selected_bg, text_2};
 
 /// 标签：定宽，高 28，之间 2px；右边关闭按钮 20，所以上、右、下都留 4
 const TAB_WIDTH: f32 = 140.0;
@@ -100,15 +100,18 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
                     .on_click(move || toggle.toggle_panel())
             },
         )
-        // 系统不留窗口按钮的平台（Windows、Linux）自己画
+        // 系统不留窗口按钮的平台（Windows、Linux）自己画，贴着窗口的右边和上边，和前面的按钮隔开一点
         .child_when(
             move || title_bar_info().controls.is_none(),
-            move || window_buttons(me),
+            move || window_buttons(me).margin_left(8),
         )
-        .child(
-            rect()
-                .width(move || px(title_bar_info().inset_right.max(10.0)))
-                .shrink(0),
+        .child_when(
+            move || title_bar_info().controls.is_some(),
+            || {
+                rect()
+                    .width(move || px(title_bar_info().inset_right.max(10.0)))
+                    .shrink(0)
+            },
         )
 }
 
@@ -314,7 +317,25 @@ fn tab_style() -> Style {
     )
 }
 
-/// Windows、Linux 上自己画的窗口按钮
+/// 窗口按钮的宽：和 Windows 自己的一样
+const CAPTION_WIDTH: f32 = 46.0;
+
+/// 关闭按钮悬停时的红（Windows 11 的）
+const CLOSE_RED: Color = Color::hex(0xc42b1c);
+
+/// 窗口按钮上的图形：10 × 10 的画布、1 像素的细线，和系统的一样（别的图标是 24 的画布、1.6 的线，不混用）
+const MINIMIZE_GLYPH: &str = "M0 5.5h10";
+
+const MAXIMIZE_GLYPH: &str =
+    "M1.5 0.5h7a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z";
+
+/// 还原：前面一个方块，后面露出另一个的上边和右边
+const RESTORE_GLYPH: &str = "M1.5 2.5h5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1h-5a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z M2.5 0.5h6a1 1 0 0 1 1 1v6";
+
+const CLOSE_GLYPH: &str = "M0.5 0.5l9 9 M9.5 0.5l-9 9";
+
+/// Windows、Linux 上自己画的窗口按钮：按 Windows 的样子，46 宽、和标题栏一样高、没有圆角，
+/// 最小化、最大化（最大化着时是还原）、关闭；关闭悬停时变红
 fn window_buttons(window: Option<WindowHandle>) -> Element {
     let minimize = move || {
         if let Some(window) = window {
@@ -331,22 +352,70 @@ fn window_buttons(window: Option<WindowHandle>) -> Element {
             window.close();
         }
     };
+    // 最大化、还原都会改窗口大小：读一下大小，按钮的图形和提示跟着重算
+    let maximized = move || {
+        let _ = window_size();
+        window.is_some_and(|window| window.is_maximized())
+    };
     row()
-        .gap(2)
+        .shrink(0)
         .child(
-            icon_button(Icon::Rows, 14.0)
+            caption_button(false)
+                .name("window-minimize")
                 .tooltip("最小化")
+                .child(caption_glyph(MINIMIZE_GLYPH))
                 .on_click(minimize),
         )
         .child(
-            icon_button(Icon::Sidebar, 14.0)
-                .tooltip("最大化")
+            caption_button(false)
+                .name("window-maximize")
+                .tooltip(move || {
+                    if maximized() {
+                        "向下还原"
+                    } else {
+                        "最大化"
+                    }
+                })
                 .window_maximize_button(true)
+                .child_when(maximized, || caption_glyph(RESTORE_GLYPH))
+                .child_when(move || !maximized(), || caption_glyph(MAXIMIZE_GLYPH))
                 .on_click(maximize),
         )
         .child(
-            icon_button(Icon::Close, 14.0)
+            caption_button(true)
+                .name("window-close")
                 .tooltip("关闭")
+                .child(caption_glyph(CLOSE_GLYPH))
                 .on_click(close),
         )
+}
+
+/// 一个窗口按钮的底：悬停一层淡灰（关闭是红底白字），按下再深一点
+fn caption_button(close: bool) -> Element {
+    let style = Style::new()
+        .width(CAPTION_WIDTH)
+        .color(text_2())
+        .transition(Property::Background, Tween::new(ms(100)).ease_out())
+        .transition(Property::Color, Tween::new(ms(100)).ease_out());
+    let style = if close {
+        style
+            .hovered(|s| s.background(CLOSE_RED).color(Color::WHITE))
+            .pressed(|s| s.background(CLOSE_RED.with_alpha(0.85)).color(Color::WHITE))
+    } else {
+        style
+            .hovered(|s| s.background(hover()).color(fg()))
+            .pressed(|s| s.background(line()).color(fg()))
+    };
+    row()
+        .style(&style)
+        .height(move || px(title_bar_info().height.max(BAR_HEIGHT)))
+        .shrink(0)
+        .align(Align::Center)
+        .justify(Justify::Center)
+}
+
+fn caption_glyph(data: &'static str) -> Element {
+    path(VectorPath::svg(data).view_box(0.0, 0.0, 10.0, 10.0))
+        .size(10.0, 10.0)
+        .stroke(Stroke::new(1.0))
 }
