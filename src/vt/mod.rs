@@ -11,6 +11,8 @@ pub mod mouse;
 mod parser;
 pub mod screen;
 pub mod search;
+pub mod marks;
+pub mod image;
 
 use unicode_width::UnicodeWidthChar;
 
@@ -132,6 +134,18 @@ pub struct Terminal {
     pub bell: u64,
     /// 程序要求弹的系统通知（OSC 9、OSC 777），还没取走的：（标题，正文）。取走前最多留 [`MAX_ALERTS`] 条
     alerts: Vec<(String, String)>,
+    /// 现在写的字挂着哪个超链接（OSC 8）：`link_uris` 里的编号（从 1 起），0 是没有
+    link: u32,
+    /// 出现过的超链接地址，编号是下标加一。只收 `http`、`https`、`mailto`，条数封顶
+    link_uris: Vec<String>,
+    /// 命令标记（OSC 133）：每条命令的位置
+    commands: Vec<marks::Command>,
+    /// 收到过命令标记，说明 shell 集成在工作
+    integrated: bool,
+    /// 结束了、还没被取走的命令
+    finished: Vec<marks::Finished>,
+    /// 屏幕上的图片
+    images: image::Images,
     /// G0、G1 现在指定的字符集，以及 SO / SI 选中了哪一个
     charsets: [Charset; 2],
     active_charset: usize,
@@ -161,6 +175,12 @@ impl Terminal {
             title: String::new(),
             bell: 0,
             alerts: Vec::new(),
+            link: 0,
+            link_uris: Vec::new(),
+            commands: Vec::new(),
+            integrated: false,
+            finished: Vec::new(),
+            images: image::Images::new(),
             charsets: [Charset::Ascii; 2],
             active_charset: 0,
             last_char: None,
@@ -205,8 +225,9 @@ impl Terminal {
         self.alternate.set_history_limit(limit);
     }
 
-    /// 把主屏（历史加现在的屏幕）写成一段能原样喂回终端的文字：带颜色、粗体这些 SGR，行与行之间 `\r\n`。
-    /// 末尾空白的行去掉，最多留最后 `max_lines` 行。副屏（vim、less）是临时画布，不存。
+    /// 把主屏（历史加现在的屏幕）写成一段能原样喂回终端的文字：带颜色、粗体这些 SGR，超链接（OSC 8），
+    /// 命令标记（OSC 133，恢复后还能在命令之间跳、复制输出），行与行之间 `\r\n`。
+    /// 末尾空白的行去掉，最多留最后 `max_lines` 行。副屏（vim、less）是临时画布，不存；图片不存。
     /// 用来关掉应用时存下终端里的内容，下次恢复标签时先喂进去
     pub fn transcript(&self, max_lines: usize) -> String {
         let screen = &self.primary;
@@ -223,34 +244,69 @@ impl Terminal {
         while rows.last().is_some_and(|line| is_blank(line)) {
             rows.pop();
         }
-        let rows = &rows[rows.len().saturating_sub(max_lines)..];
+        // 留下的是第 `first` 行起的（行的下标就是「绝对行」：0 是最老的历史行）
+        let first = rows.len().saturating_sub(max_lines);
+        let marks = self.mark_rows(first, rows.len());
         let mut text = String::new();
-        for (index, line) in rows.iter().enumerate() {
-            if index > 0 {
+        for (index, line) in rows.iter().enumerate().skip(first) {
+            if index > first {
                 text.push_str("\r\n");
             }
-            // 行尾没有样式的空格不写
+            let row_marks = marks.get(&index);
+            if let Some(row_marks) = row_marks {
+                text.push_str(&row_marks.before);
+            }
+            let input = row_marks.and_then(|row_marks| row_marks.input);
+            // 行尾没有样式的空格不写；输入开始的位置（提示符后面那个空格）要写到，不然恢复后位置差一格
             let end = line
                 .iter()
                 .rposition(|cell| *cell != Cell::PLAIN)
-                .map_or(0, |last| last + 1);
+                .map_or(0, |last| last + 1)
+                .max(input.unwrap_or(0));
             let mut pen = Attributes::default();
-            for cell in &line[..end] {
+            let mut link = 0;
+            for (column, cell) in line.iter().enumerate().take(end) {
+                if input == Some(column) {
+                    text.push_str("\x1b]133;B\x07");
+                }
                 // 宽字的右半不带字
                 if cell.width == 0 {
                     continue;
                 }
-                if cell.attrs != pen {
-                    pen = cell.attrs;
+                // 链接不是 SGR 的一部分，单独比
+                let look = Attributes { link: 0, ..cell.attrs };
+                if look != pen {
+                    pen = look;
                     push_sgr(&mut text, pen);
                 }
+                if cell.attrs.link != link {
+                    link = cell.attrs.link;
+                    self.push_link(&mut text, link);
+                }
                 text.push(if cell.ch.is_control() { ' ' } else { cell.ch });
+            }
+            if input.is_some_and(|column| column >= end) {
+                text.push_str("\x1b]133;B\x07");
+            }
+            if link != 0 {
+                self.push_link(&mut text, 0);
             }
             if pen != Attributes::default() {
                 text.push_str("\x1b[0m");
             }
         }
         text
+    }
+
+    /// 写一个 OSC 8：`link` 是链接表的编号，0 是结束
+    fn push_link(&self, text: &mut String, link: u32) {
+        let uri = link
+            .checked_sub(1)
+            .and_then(|index| self.link_uris.get(index as usize))
+            .map_or("", String::as_str);
+        text.push_str("\x1b]8;;");
+        text.push_str(uri);
+        text.push_str("\x1b\\");
     }
 
     /// 主屏一共往历史里放过多少行（只增不减）
@@ -313,6 +369,8 @@ impl Terminal {
                 final_byte,
             } => self.csi(private, intermediates, &params, subparams, final_byte),
             Event::Osc { code, text } => self.osc(code, &text),
+            Event::Apc(content) => self.apc(&content),
+            Event::Dcs(content) => self.dcs(&content),
         }
     }
 
@@ -326,7 +384,11 @@ impl Terminal {
         if width > 2 {
             return;
         }
-        let (pen, wrap) = (self.pen, self.modes.auto_wrap);
+        let pen = Attributes {
+            link: self.link,
+            ..self.pen
+        };
+        let wrap = self.modes.auto_wrap;
         if self.modes.insert_mode {
             self.screen_mut().insert_blanks(width, pen);
         }
@@ -444,6 +506,10 @@ impl Terminal {
                 self.screen_mut().move_to(row, column);
             }
             (None, b'J') => {
+                // 清整屏（2）和连历史一起清（3）：图片也清掉
+                if matches!(value(0, 0), 2 | 3) {
+                    self.clear_images();
+                }
                 let pen = self.pen;
                 self.screen_mut()
                     .erase_display(value(0, 0).max(0) as u8, pen);
@@ -634,6 +700,7 @@ impl Terminal {
     /// DECSTR：软复位。程序退出时没收拾干净的状态（隐藏的光标、卷起的滚动区域）靠它救回来
     fn soft_reset(&mut self) {
         self.pen = Attributes::default();
+        self.link = 0;
         self.modes = Modes::default();
         self.cursor_shape = None;
         self.charsets = [Charset::Ascii; 2];
@@ -651,6 +718,7 @@ impl Terminal {
         self.alternate = Screen::new(columns, rows);
         self.on_alternate = false;
         self.pen = Attributes::default();
+        self.link = 0;
         self.modes = Modes::default();
         self.cursor_shape = None;
         self.charsets = [Charset::Ascii; 2];
@@ -744,6 +812,9 @@ impl Terminal {
     /// 剪贴板（52）、超链接（8）、目录（7）、提示符标记（133）还没做，整条丢掉
     fn osc(&mut self, code: i32, text: &str) {
         match code {
+            8 => self.hyperlink(text),
+            133 => self.semantic_prompt(text),
+            1337 => self.iterm_image(text),
             // iTerm 的写法：`9;正文`。`9;4;…` 是 ConEmu 的进度条，不是通知
             9 if !text.starts_with("4;") => self.push_alert(String::new(), text),
             // `777;notify;标题;正文`（rxvt、Kitty 等）
@@ -769,7 +840,37 @@ impl Terminal {
 /// 一次取走之前最多攒几条通知：程序刷屏式地发通知时不会攒出一大堆
 pub const MAX_ALERTS: usize = 4;
 
+/// 链接表最多这么多条：程序不断换新地址时不会无限涨内存（满了以后新的链接当普通文字）
+const MAX_LINKS: usize = 4096;
+
 impl Terminal {
+    /// OSC 8：`参数;地址`，地址为空是结束这段链接。只认 http、https、mailto：别的协议点一下就交给系统
+    /// 是危险的（`file:`、自定义协议）
+    fn hyperlink(&mut self, text: &str) {
+        let uri = text.split_once(';').map_or("", |(_, uri)| uri);
+        let allowed = ["http://", "https://", "mailto:"].iter().any(|scheme| {
+            uri.get(..scheme.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+        });
+        if uri.is_empty() || !allowed || uri.len() > 2048 || uri.chars().any(char::is_control) {
+            self.link = 0;
+            return;
+        }
+        self.link = match self.link_uris.iter().position(|known| known == uri) {
+            Some(index) => index as u32 + 1,
+            None if self.link_uris.len() < MAX_LINKS => {
+                self.link_uris.push(uri.to_string());
+                self.link_uris.len() as u32
+            }
+            None => 0,
+        };
+    }
+
+    /// 出现过的超链接地址（`Attributes::link` 减一是下标）
+    pub fn link_uris(&self) -> &[String] {
+        &self.link_uris
+    }
+
     fn push_alert(&mut self, title: String, body: &str) {
         // 通知是显示给人看的：控制字符去掉、长度封顶，空的不发
         let clean = |text: &str, limit: usize| -> String {
@@ -984,6 +1085,32 @@ mod tests {
         assert_eq!(term.title, "我的终端");
         term.feed(b"\x1b]2;second\x1b\\");
         assert_eq!(term.title, "second");
+    }
+
+    /// OSC 8：夹在开头和结尾之间的字挂着链接；同一个地址同一个编号；别的协议和控制字符当没有
+    #[test]
+    fn osc_8_attaches_links_to_cells() {
+        let mut term = Terminal::new(40, 2);
+        term.feed(b"a\x1b]8;;https://example.com/x\x07bc\x1b]8;;\x07d");
+        let line = &term.screen().lines[0];
+        assert_eq!(
+            line.iter().take(4).map(|cell| cell.attrs.link).collect::<Vec<_>>(),
+            [0, 1, 1, 0]
+        );
+        assert_eq!(term.link_uris(), ["https://example.com/x"]);
+        // SGR 0 不会把链接关掉，它们互不相干
+        term.feed(b"\x1b]8;id=7;https://example.com/x\x1b\\e\x1b[0mf\x1b]8;;\x1b\\g");
+        let line = &term.screen().lines[0];
+        assert_eq!(line[4].attrs.link, 1, "同一个地址同一个编号");
+        assert_eq!(line[5].attrs.link, 1);
+        assert_eq!(line[6].attrs.link, 0);
+        assert_eq!(term.link_uris().len(), 1);
+        for bad in ["file:///etc/passwd", "javascript:alert(1)", "https://a.b/\u{1}x"] {
+            term.feed(format!("\x1b]8;;{bad}\x07z\x1b]8;;\x07").as_bytes());
+        }
+        assert_eq!(term.link_uris().len(), 1, "不安全的协议不收");
+        term.feed(b"\x1b]8;;mailto:me@example.com\x07m");
+        assert_eq!(term.link_uris().len(), 2);
     }
 
     #[test]

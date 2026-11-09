@@ -197,6 +197,8 @@ pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
         .copied()
         .chain(std::iter::once(color_hint))
         .chain(locale_fallback())
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .chain(config.environment.iter().cloned())
         .map(|(name, value)| {
             (
                 CString::new(name).unwrap_or_default(),
@@ -369,6 +371,7 @@ mod tests {
             rows: 24,
             working_directory: None,
             dark_background: false,
+            environment: Vec::new(),
         }
     }
 
@@ -435,6 +438,7 @@ mod tests {
             rows: 24,
             working_directory: None,
             dark_background: false,
+            environment: Vec::new(),
         };
         let (_pty, queue) = spawn(config).expect("fork 本身是成功的");
         assert_eq!(drain(&queue).1, 127);
@@ -522,6 +526,7 @@ mod tests {
             rows: 24,
             working_directory: None,
             dark_background: false,
+            environment: Vec::new(),
         };
         let (pty, _queue) = spawn(config).expect("起得来");
         // 交互式 shell 才有作业控制，前台进程组才会换成 sleep 的

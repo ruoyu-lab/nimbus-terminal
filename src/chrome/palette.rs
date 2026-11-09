@@ -26,6 +26,7 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
         run,
     };
     let find = workspace.clone();
+    let (previous, next, copy_output) = (workspace.clone(), workspace.clone(), workspace.clone());
     let (new_tab, close, toggle, settings, choose, columns, rows) = (
         workspace.clone(),
         workspace.clone(),
@@ -53,6 +54,36 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
             "在终端中查找",
             "⌘F",
             Rc::new(move || find.find_in_terminal()),
+        ),
+        command(
+            "cmd-previous-command",
+            "跳到上一条命令",
+            "⌘↑",
+            Rc::new(move || {
+                if let Some(session) = previous.focused_session() {
+                    session.jump_prompt(true);
+                }
+            }),
+        ),
+        command(
+            "cmd-next-command",
+            "跳到下一条命令",
+            "⌘↓",
+            Rc::new(move || {
+                if let Some(session) = next.focused_session() {
+                    session.jump_prompt(false);
+                }
+            }),
+        ),
+        command(
+            "cmd-copy-output",
+            "复制上一条命令的输出",
+            "",
+            Rc::new(move || {
+                if let Some(session) = copy_output.focused_session() {
+                    session.copy_last_output();
+                }
+            }),
         ),
         command(
             "cmd-toggle-sidebar",
@@ -131,15 +162,40 @@ pub(super) fn view(workspace: Rc<Workspace>) -> Element {
     let all = commands(&workspace);
     let filter = {
         let all = all.clone();
+        let history_owner = workspace.clone();
         move || {
             let typed = query.get();
             let needle = typed.to_lowercase();
-            all.iter()
+            let mut found: Vec<Command> = all
+                .iter()
                 .filter(|command| {
                     needle.is_empty() || command.label.to_lowercase().contains(&needle)
                 })
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect();
+            // 打了两个字以上：再从跑过的命令里找，选中就写在当前终端的提示符处（不按回车）
+            if typed.trim().chars().count() >= 2 {
+                for (index, command) in history_owner
+                    .history_matches(typed.trim(), 8)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let target = history_owner.clone();
+                    let text = command.clone();
+                    found.push(Command {
+                        id: format!("cmd-history-{index}"),
+                        label: format!("运行过：{command}"),
+                        hint: "",
+                        run: Rc::new(move || {
+                            if let Some(session) = target.focused_session() {
+                                session.insert_command(&text);
+                                session.request_focus();
+                            }
+                        }),
+                    });
+                }
+            }
+            found
         }
     };
     let (first, owner) = (filter.clone(), workspace.clone());
@@ -160,7 +216,7 @@ pub(super) fn view(workspace: Rc<Workspace>) -> Element {
                 .child(icon(Icon::Search, 17.0))
                 .child(
                     text_field(query)
-                        .placeholder("搜索命令和会话…")
+                        .placeholder("搜索命令、会话和跑过的命令…")
                         .grow(1)
                         // 框和焦点环都去掉：整块面板就是输入区，不要再套一层框
                         .background(Color::TRANSPARENT)

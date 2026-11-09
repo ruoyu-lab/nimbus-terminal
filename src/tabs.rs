@@ -35,6 +35,17 @@ pub const CONTROLS_POSITION: (f32, f32) = (16.0, 13.0);
 pub const DEFAULT_TITLE: &str = "终端";
 /// 文件名
 const STATE_FILE: &str = "state.json";
+const HISTORY_FILE: &str = "history.json";
+/// 命令历史最多留这么多条
+const HISTORY_LIMIT: usize = 2000;
+
+/// 等用户确认的一次粘贴
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPaste {
+    pub tab: u64,
+    pub pane: u64,
+    pub text: String,
+}
 /// 每个标签最多存多少行终端内容（文件名是 `output-第几个标签.ansi`）
 const OUTPUT_LINES: usize = 3000;
 
@@ -331,6 +342,10 @@ pub struct Workspace {
     pub renaming: Signal<Option<u64>>,
     /// 确认关闭框开着时，是在关哪个标签（它前台有程序在跑）
     pub closing: Signal<Option<u64>>,
+    /// 要不要把这段多行文字粘贴进去（程序没开括号粘贴时先问）：哪个标签、哪个终端、什么文字
+    pub pending_paste: Signal<Option<PendingPaste>>,
+    /// 跑过的命令（有命令标记才有），从老到新，去重，存在配置目录里
+    history: RefCell<Vec<String>>,
     /// 确认关闭框是只关这个标签里的某个终端（拆分出来的）时，是哪个；`None` 是关整个标签
     closing_pane: Cell<Option<u64>>,
     /// 用户起的名字：有就盖过程序设的标题
@@ -343,6 +358,8 @@ pub struct Workspace {
     spawn: SpawnFn,
     pub window: Option<WindowHandle>,
     store: Store,
+    /// shell 集成脚本放在哪（写不进配置目录时是 `None`）
+    integration: Option<PathBuf>,
     /// 排着一次延后的落盘
     save_pending: Cell<bool>,
     /// 已经写到盘上的终端内容：第几个标签的文件写的是哪个会话的哪一版，没变就不重写
@@ -432,6 +449,8 @@ impl Workspace {
             form: Form::new(&settings),
             renaming: signal(None),
             closing: signal(None),
+            pending_paste: signal(None),
+            history: RefCell::new(store.load(HISTORY_FILE)),
             closing_pane: Cell::new(None),
             custom_titles: RefCell::new(HashMap::new()),
             reported_titles: RefCell::new(HashMap::new()),
@@ -440,6 +459,7 @@ impl Workspace {
             next_folder: Cell::new(next_folder),
             spawn,
             window,
+            integration: crate::shell::install(&store),
             store,
             save_pending: Cell::new(false),
             saved_outputs: RefCell::new(HashMap::new()),
@@ -1176,6 +1196,12 @@ impl Workspace {
             dark_background: crate::theme::dark().get_untracked(),
             control,
             remote_directory,
+            integration: self
+                .form
+                .shell_integration
+                .get_untracked()
+                .then(|| self.integration.clone())
+                .flatten(),
         };
         let remote = target.remote_name().is_some();
         let restoring = remote && waiting;
@@ -1191,7 +1217,8 @@ impl Workspace {
         };
         let pane = self.next_pane.get();
         self.next_pane.set(pane + 1);
-        let for_alert = self.this.clone();
+        let (for_alert, for_paste, for_record) =
+            (self.this.clone(), self.this.clone(), self.this.clone());
         let (for_title, for_size, for_exit, for_activity) = (
             self.this.clone(),
             self.this.clone(),
@@ -1222,6 +1249,16 @@ impl Workspace {
                     workspace.close_pane(tab, pane);
                 }
             }),
+            confirm_paste: Some(Rc::new(move |text| {
+                if let Some(workspace) = for_paste.upgrade() {
+                    workspace.pending_paste.set(Some(PendingPaste { tab, pane, text }));
+                }
+            })),
+            record: Some(Rc::new(move |command| {
+                if let Some(workspace) = for_record.upgrade() {
+                    workspace.record_command(&command);
+                }
+            })),
             alert: Rc::new(move |alert| {
                 if let Some(workspace) = for_alert.upgrade() {
                     workspace.alert(tab, pane, alert);
@@ -1571,6 +1608,55 @@ impl Workspace {
         tab.layout.get_untracked().session(tab.focus.get_untracked())
     }
 
+    /// 记下跑过的一条命令（和上一条一样的不重复记；已有的挪到最新）
+    fn record_command(&self, command: &str) {
+        let command = command.trim();
+        // 多行的（粘贴的几行、here-doc）不进历史：写回提示符时换行没法原样还原，改成空格会变成另一条命令
+        if command.is_empty() || command.contains(['\n', '\r']) {
+            return;
+        }
+        {
+            let mut history = self.history.borrow_mut();
+            history.retain(|known| known != command);
+            history.push(command.to_string());
+            let excess = history.len().saturating_sub(HISTORY_LIMIT);
+            history.drain(..excess);
+        }
+        self.store.save(HISTORY_FILE, &*self.history.borrow());
+    }
+
+    /// 命令历史里包含 `query` 的（不分大小写），最近的在前，最多 `limit` 条
+    pub fn history_matches(&self, query: &str, limit: usize) -> Vec<String> {
+        let needle = query.to_lowercase();
+        self.history
+            .borrow()
+            .iter()
+            .rev()
+            .filter(|command| !command.contains(['\n', '\r']))
+            .filter(|command| command.to_lowercase().contains(&needle))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// 确认框里点了「粘贴」：照原样粘贴进它问的那个终端
+    pub fn confirm_paste(&self) {
+        let Some(pending) = self.pending_paste.get_untracked() else {
+            return;
+        };
+        self.pending_paste.set(None);
+        let session = self
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == pending.tab)
+            .and_then(|tab| tab.layout.get_untracked().session(pending.pane));
+        if let Some(session) = session {
+            session.paste_text(&pending.text);
+            session.request_focus();
+        }
+    }
+
     /// 用户这会儿正看着这个终端吗：窗口在前台、标签是当前的、拆分过的话它是聚焦的那个
     fn watching(&self, tab: u64, pane: u64) -> bool {
         let window_front = self.window.is_none_or(|window| window.is_focused());
@@ -1599,10 +1685,14 @@ impl Workspace {
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| "终端".to_string());
         let (title, body) = match alert {
-            Alert::Finished { seconds } => (
-                "命令已完成".to_string(),
-                format!("{name} · 用时 {}", elapsed_text(seconds)),
-            ),
+            Alert::Finished { seconds, exit, command } => {
+                let title = match exit {
+                    Some(code) if code != 0 => format!("命令失败（退出码 {code}）"),
+                    _ => "命令已完成".to_string(),
+                };
+                let what = if command.is_empty() { name } else { command };
+                (title, format!("{what} · 用时 {}", elapsed_text(seconds)))
+            }
             Alert::Message { title, body } if title.is_empty() => (name, body),
             Alert::Message { title, body } => (format!("{name} · {title}"), body),
         };
@@ -2170,6 +2260,12 @@ impl Workspace {
         };
         if !command {
             return false;
+        }
+        // ⌘↑ / ⌘↓：跳到上一条 / 下一条命令（要 shell 集成发的命令标记；没有时让按键照常交给终端）
+        if let Key::Named(named @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) = event.key {
+            return self
+                .focused_session()
+                .is_some_and(|session| session.jump_prompt(named == NamedKey::ArrowUp));
         }
         let Key::Character(text) = &event.base else {
             return false;

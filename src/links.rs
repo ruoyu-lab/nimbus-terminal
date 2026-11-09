@@ -22,8 +22,10 @@ fn is_break(ch: char) -> bool {
         )
 }
 
-/// 一行里所有的链接，连同各自占的列范围（含头不含尾）
-pub fn scan(line: &[Cell]) -> Vec<(Link, usize, usize)> {
+/// 一行里所有的链接，连同各自占的列范围（含头不含尾）。`uris` 是终端的超链接表（OSC 8）：
+/// 程序明说是链接的那一段先算，里面的字不再当网址、路径另外去猜
+pub fn scan(line: &[Cell], uris: &[String]) -> Vec<(Link, usize, usize)> {
+    let mut found = explicit_links(line, uris);
     // 宽字的右半不带字：记下每个字从第几列开始、占几列
     let chars: Vec<(char, usize, usize)> = line
         .iter()
@@ -31,7 +33,6 @@ pub fn scan(line: &[Cell]) -> Vec<(Link, usize, usize)> {
         .filter(|(_, cell)| cell.width != 0)
         .map(|(index, cell)| (cell.ch, index, usize::from(cell.width.max(1))))
         .collect();
-    let mut found = Vec::new();
     let mut index = 0;
     while index < chars.len() {
         if is_break(chars[index].0) {
@@ -42,17 +43,41 @@ pub fn scan(line: &[Cell]) -> Vec<(Link, usize, usize)> {
         while last + 1 < chars.len() && !is_break(chars[last + 1].0) {
             last += 1;
         }
-        if let Some(hit) = token_link(&chars, index, last) {
+        if let Some(hit) = token_link(&chars, index, last)
+            && !found.iter().any(|(_, start, end)| hit.1 < *end && *start < hit.2)
+        {
             found.push(hit);
         }
         index = last + 1;
+    }
+    found.sort_by_key(|(_, start, _)| *start);
+    found
+}
+
+/// OSC 8 超链接：连续的、挂着同一个链接编号的格子是一段
+fn explicit_links(line: &[Cell], uris: &[String]) -> Vec<(Link, usize, usize)> {
+    let mut found = Vec::new();
+    let mut column = 0;
+    while column < line.len() {
+        let id = line[column].attrs.link;
+        if id == 0 {
+            column += 1;
+            continue;
+        }
+        let start = column;
+        while column < line.len() && line[column].attrs.link == id {
+            column += 1;
+        }
+        if let Some(uri) = uris.get(id as usize - 1) {
+            found.push((Link::Url(uri.clone()), start, column));
+        }
     }
     found
 }
 
 /// 第 `column` 列上的链接，连同它占的列范围
-pub fn link_at(line: &[Cell], column: usize) -> Option<(Link, usize, usize)> {
-    scan(line)
+pub fn link_at(line: &[Cell], column: usize, uris: &[String]) -> Option<(Link, usize, usize)> {
+    scan(line, uris)
         .into_iter()
         .find(|(_, start, end)| (*start..*end).contains(&column))
 }
@@ -153,7 +178,7 @@ mod tests {
     fn at(text: &str, needle: &str, offset: usize) -> Option<(Link, usize, usize)> {
         let line = line_of(text);
         let column = text.find(needle).expect("有这段字") + offset;
-        link_at(&line, column)
+        link_at(&line, column, &[])
     }
 
     #[test]
@@ -207,10 +232,10 @@ mod tests {
     #[test]
     fn columns_count_wide_characters() {
         let line = line_of("你好 https://a.cn/x");
-        let (link, start, end) = link_at(&line, 6).expect("链接");
+        let (link, start, end) = link_at(&line, 6, &[]).expect("链接");
         assert_eq!(link, Link::Url("https://a.cn/x".into()));
         assert_eq!((start, end), (5, 19));
         // 点在宽字上不是链接
-        assert!(link_at(&line, 1).is_none());
+        assert!(link_at(&line, 1, &[]).is_none());
     }
 }

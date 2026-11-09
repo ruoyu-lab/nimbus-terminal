@@ -75,6 +75,8 @@ pub struct Config {
     pub working_directory: Option<PathBuf>,
     /// 终端的底色是深色：通过 `COLORFGBG` 告诉程序，vim、bat 这类靠它挑配色
     pub dark_background: bool,
+    /// 额外的环境变量（shell 集成靠它让 zsh 加载脚本）
+    pub environment: Vec<(String, String)>,
 }
 
 impl Config {
@@ -92,6 +94,7 @@ impl Config {
             rows,
             working_directory: home_directory(),
             dark_background: false,
+            environment: Vec::new(),
         }
     }
 

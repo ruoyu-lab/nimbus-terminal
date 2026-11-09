@@ -26,6 +26,7 @@ mod product;
 mod pty;
 mod remote;
 mod settings;
+mod shell;
 mod ssh;
 mod store;
 mod tabs;

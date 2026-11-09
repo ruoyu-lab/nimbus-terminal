@@ -230,6 +230,7 @@ pub fn paint(
                 source_line(terminal, row, offset),
                 &marks,
                 hover.filter(|hover| hover.row == row),
+                terminal.link_uris(),
             );
         }
     } else if offset == 0 && shown_offset == 0 {
@@ -244,6 +245,7 @@ pub fn paint(
                 terminal.screen().lines.get(row).map(|line| line.as_slice()),
                 &[],
                 hover.filter(|hover| hover.row == row),
+                terminal.link_uris(),
             );
         }
     } else if offset != shown_offset || !damage.rows.is_empty() || damage.scrolled_out > 0 {
@@ -255,6 +257,7 @@ pub fn paint(
                 source_line(terminal, row, offset),
                 &[],
                 hover.filter(|hover| hover.row == row),
+                terminal.link_uris(),
             );
         }
     }
@@ -272,11 +275,12 @@ fn paint_row(
     line: Option<&[Cell]>,
     marks: &[(usize, usize, bool)],
     hover: Option<Hover>,
+    uris: &[String],
 ) {
     grid.clear_row(row, CharCellStyle::default());
     let Some(line) = line else { return };
     // 网址一直是链接的颜色；指针停着的那个（网址或文件路径）加下划线
-    let mut spans: Vec<(usize, usize, bool)> = crate::links::scan(line)
+    let mut spans: Vec<(usize, usize, bool)> = crate::links::scan(line, uris)
         .into_iter()
         .filter(|(link, ..)| matches!(link, crate::links::Link::Url(_)))
         .map(|(_, start, end)| (start, end, false))

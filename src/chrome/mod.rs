@@ -110,6 +110,8 @@ fn frame(workspace: Rc<Workspace>) -> Element {
         workspace.clone(),
         workspace.clone(),
     );
+    let paste_owner = workspace.clone();
+    let pending_paste = workspace.pending_paste;
     let connect_owner = workspace.clone();
     let connect_prompt = workspace.connect_prompt;
     let docker_owner = workspace.clone();
@@ -199,6 +201,15 @@ fn frame(workspace: Rc<Workspace>) -> Element {
                 .backdrop(scrim())
                 .backdrop_transition(Tween::new(ms(160)).ease_out())
                 .on_dismiss(move |_| docker_prompt.set(false)),
+        )
+        .overlay(
+            move || pending_paste.get().is_some(),
+            Overlay::new(move || menu::paste_dialog(paste_owner.clone()))
+                .centered(true)
+                .modal(true)
+                .backdrop(scrim())
+                .backdrop_transition(Tween::new(ms(160)).ease_out())
+                .on_dismiss(move |_| pending_paste.set(None)),
         )
         .overlay(
             move || closing.get().is_some(),

@@ -724,6 +724,7 @@ mod real {
             return;
         }
         let spawned = spawn(&Launch {
+            integration: None,
             target: Target::Ssh {
                 host: "nimbus-test.invalid".into(),
             },

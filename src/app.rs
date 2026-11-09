@@ -22,6 +22,7 @@ use crate::target::Target;
 use crate::links;
 use crate::view;
 use crate::vt::mouse::{Action, Button, Report};
+use crate::vt::image::Pixels;
 use crate::vt::search::{self, Match};
 use crate::vt::{MouseMode, Terminal, keys, mouse};
 
@@ -43,13 +44,24 @@ pub struct Hooks {
     pub activity: Rc<dyn Fn()>,
     /// 值得叫人回来看一眼的事（命令跑完了、程序要求弹通知）。弹不弹、弹给谁由外面决定
     pub alert: Rc<dyn Fn(Alert)>,
+    /// 要粘贴多行文字、程序又没开括号粘贴时调用：外面问用户，确认了再调 [`Session::paste_text`]。
+    /// 没有就直接粘贴
+    pub confirm_paste: Option<Rc<dyn Fn(String)>>,
+    /// 跑完了一条命令（有命令标记才有），带上敲的命令：命令历史靠它
+    pub record: Option<Rc<dyn Fn(String)>>,
 }
 
 /// 会话想提醒用户的事
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Alert {
     /// 前台的命令（任何 shell 之外的程序）跑了这么久，现在结束了
-    Finished { seconds: u64 },
+    Finished {
+        seconds: u64,
+        /// 退出码（有命令标记才知道）
+        exit: Option<i32>,
+        /// 敲的命令（有命令标记才知道，没有是空的）
+        command: String,
+    },
     /// 程序自己要求的通知（OSC 9、OSC 777），或者前台程序响了铃（`title` 是空的）
     Message { title: String, body: String },
 }
@@ -69,6 +81,8 @@ impl Hooks {
             exited: Rc::new(|_| {}),
             activity: Rc::new(|| {}),
             alert: Rc::new(|_| {}),
+            confirm_paste: None,
+            record: None,
         }
     }
 }
@@ -96,6 +110,8 @@ pub struct Launch {
     pub control: Option<std::path::PathBuf>,
     /// 远端会话（SSH、容器）一开始进哪个目录（绝对路径）；`None` 是主目录
     pub remote_directory: Option<String>,
+    /// shell 集成脚本所在的目录；`None` 是不用（设置里关了、写不进配置目录）
+    pub integration: Option<std::path::PathBuf>,
 }
 
 /// 起一个会话：本机是登录 shell，服务器是 `ssh`，容器是 `docker exec`
@@ -145,6 +161,9 @@ pub fn spawn(launch: &Launch) -> Spawned {
         config.working_directory = Some(directory.clone());
     }
     config.dark_background = launch.dark_background;
+    if let (Target::Local, Some(directory)) = (&launch.target, &launch.integration) {
+        config.environment = crate::shell::environment(directory, &config.program);
+    }
     match pty::spawn(config).map_err(|error| error.to_string()) {
         Ok((pty, queue)) => Spawned {
             pty: Some(pty),
@@ -157,6 +176,36 @@ pub fn spawn(launch: &Launch) -> Spawned {
             error: Some(error),
         },
     }
+}
+
+/// 屏幕上现在看得见的一张图：在终端区域里的位置和大小（逻辑像素），和它的像素来源
+#[derive(Clone)]
+pub struct VisibleImage {
+    pub id: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    source: ImageSource,
+}
+
+impl PartialEq for VisibleImage {
+    /// 来源按图的编号认：同一张图只要位置、大小没变就是没变
+    fn eq(&self, other: &Self) -> bool {
+        (self.id, self.x, self.y, self.width, self.height)
+            == (other.id, other.x, other.y, other.width, other.height)
+    }
+}
+
+impl VisibleImage {
+    pub fn source(&self) -> ImageSource {
+        self.source.clone()
+    }
+}
+
+/// 文字里除了结尾的那个换行之外，还有换行
+pub fn has_inner_newline(text: &str) -> bool {
+    text.trim_end_matches(['\n', '\r']).contains(['\n', '\r'])
 }
 
 /// 一个终端会话在主线程上的全部状态
@@ -206,8 +255,14 @@ pub struct Session {
     waiting: Cell<bool>,
     /// 终端内查找（⌘F）
     find: Find,
+    /// 在命令之间跳到了哪一条（提示符的行编号）；打字、回到最新输出时清掉
+    jump_mark: Cell<Option<u64>>,
     /// 这是本机的终端（⌘点击文件路径才打得开：服务器上的路径在本机找不到）
     local: Cell<bool>,
+    /// 看得见的图片（界面叠在网格上画）
+    images: Signal<Vec<VisibleImage>>,
+    /// 每张图的解码来源：同一张图只建一次，换位置不重新解码
+    image_sources: RefCell<std::collections::HashMap<u64, ImageSource>>,
     /// 指针现在在哪一格（不在终端上是 `None`）
     pointer_cell: Cell<Option<(usize, usize)>>,
     /// 右键点在哪个链接上（菜单里的「打开链接」「复制链接」用）：点的时候记下，没点在链接上是 `None`
@@ -263,6 +318,7 @@ impl Session {
             terminal.set_scrollback_limit(form.scrollback_lines());
             terminal.feed(history.as_bytes());
             terminal.feed(b"\x1b[0m\r\n");
+            terminal.finish_restore();
         }
         if let Some(error) = &spawned.error {
             terminal.feed(format!("起不了会话：{error}\r\n").as_bytes());
@@ -318,6 +374,9 @@ impl Session {
             reconnect: RefCell::new(None),
             waiting: Cell::new(false),
             local: Cell::new(false),
+            jump_mark: Cell::new(None),
+            images: aureole::detached(|| signal(Vec::new())),
+            image_sources: RefCell::new(std::collections::HashMap::new()),
             context_link: RefCell::new(None),
             pointer_cell: Cell::new(None),
             hover: Cell::new(None),
@@ -399,13 +458,22 @@ impl Session {
 
     /// 前台命令的状态变了：从闲到忙记下时间，从忙到闲时跑得够久就报「跑完了」
     fn watch_busy(&self, busy: bool, now: std::time::Instant) {
+        // 有命令标记时靠标记报（知道退出码和命令），这里不再重复
+        if self.terminal.borrow().has_command_marks() {
+            self.busy_since.set(None);
+            return;
+        }
         match (busy, self.busy_since.get()) {
             (true, None) => self.busy_since.set(Some(now)),
             (false, Some(since)) => {
                 self.busy_since.set(None);
                 let ran = now.saturating_duration_since(since);
                 if ran >= FINISHED_AFTER {
-                    (self.hooks.alert)(Alert::Finished { seconds: ran.as_secs() });
+                    (self.hooks.alert)(Alert::Finished {
+                        seconds: ran.as_secs(),
+                        exit: None,
+                        command: String::new(),
+                    });
                 }
             }
             _ => {}
@@ -511,7 +579,7 @@ impl Session {
 
     /// 仿真层攒下的东西送出去：给 shell 的应答、窗口标题、屏幕的改动
     fn flush(&self) {
-        let (reply, title, history, total, alternate, bell, alerts) = {
+        let (reply, title, history, total, alternate, bell, alerts, finished) = {
             let mut terminal = self.terminal.borrow_mut();
             (
                 terminal.take_output(),
@@ -521,8 +589,23 @@ impl Session {
                 terminal.on_alternate,
                 terminal.bell,
                 terminal.take_alerts(),
+                terminal.take_finished(),
             )
         };
+        for done in finished {
+            if let Some(record) = &self.hooks.record
+                && !done.text.is_empty()
+            {
+                record(done.text.clone());
+            }
+            if done.seconds >= FINISHED_AFTER.as_secs() {
+                (self.hooks.alert)(Alert::Finished {
+                    seconds: done.seconds,
+                    exit: done.exit,
+                    command: done.text,
+                });
+            }
+        }
         let now = std::time::Instant::now();
         for (title, body) in alerts {
             self.alert_message(title, body, now);
@@ -577,6 +660,7 @@ impl Session {
             self.hover.get(),
         );
         drop(matches);
+        self.refresh_images(offset);
         self.shown_offset.set(offset);
     }
 
@@ -729,6 +813,143 @@ impl Session {
         self.grid.set_selection(None);
     }
 
+    /// 看得见的图片有变化就更新界面用的那份清单
+    fn refresh_images(&self, offset: usize) {
+        let (cell_width, cell_height) = self.cell.get().unwrap_or((8.0, 16.0));
+        let visible: Vec<VisibleImage> = {
+            let mut terminal = self.terminal.borrow_mut();
+            if terminal.placements().is_empty() {
+                Vec::new()
+            } else {
+                terminal.prune_images();
+                let history = terminal.scrollback_len();
+                let top = history.saturating_sub(offset) as isize;
+                let rows = terminal.size().1 as isize;
+                let mut sources = self.image_sources.borrow_mut();
+                let alive: std::collections::HashSet<u64> =
+                    terminal.placements().iter().map(|placement| placement.id).collect();
+                sources.retain(|id, _| alive.contains(id));
+                let mut visible = Vec::new();
+                for placement in terminal.placements() {
+                    let Some(line) = terminal.absolute_line(placement.line) else {
+                        continue;
+                    };
+                    let row = line as isize - top;
+                    if terminal.on_alternate || row + placement.rows as isize <= 0 || row >= rows {
+                        continue;
+                    }
+                    let source = sources
+                        .entry(placement.id)
+                        .or_insert_with(|| match &placement.data.pixels {
+                            Pixels::Encoded(bytes) => ImageSource::bytes(bytes.clone()),
+                            Pixels::Rgba(bytes) => ImageSource::rgba(
+                                placement.data.width,
+                                placement.data.height,
+                                bytes.clone(),
+                            ),
+                        })
+                        .clone();
+                    visible.push(VisibleImage {
+                        id: placement.id,
+                        x: placement.column as f32 * cell_width,
+                        y: row as f32 * cell_height,
+                        width: placement.cols as f32 * cell_width,
+                        height: placement.rows as f32 * cell_height,
+                        source,
+                    });
+                }
+                visible
+            }
+        };
+        if self.images.get_untracked() != visible {
+            self.images.set(visible);
+        }
+    }
+
+    /// 在命令之间跳：`older` 是上一条，否则是下一条。跳到的那条命令（提示符加它的输出）会被选中高亮，
+    /// 看得见就不滚动，在历史里就翻回去让它出现在最上面；选中之后 ⌘C 直接复制它。
+    /// 一直往下跳，过了最新的一条就回到最新的输出。没有命令标记、副屏里、没有可去的地方返回 `false`
+    pub fn jump_prompt(&self, older: bool) -> bool {
+        // 跑过的命令：（提示符的行编号，输出结束的行编号）
+        let ran: Vec<(u64, u64)> = {
+            let terminal = self.terminal.borrow();
+            if terminal.on_alternate {
+                return false;
+            }
+            terminal
+                .commands()
+                .iter()
+                .filter(|command| command.output_start.is_some() && terminal.absolute_line(command.prompt).is_some())
+                .map(|command| (command.prompt, command.output_end.unwrap_or(command.prompt + 1)))
+                .collect()
+        };
+        let current = self.jump_mark.get();
+        let target = match (older, current) {
+            (true, None) => ran.last().copied(),
+            (true, Some(mark)) => ran.iter().rev().find(|(prompt, _)| *prompt < mark).copied(),
+            (false, None) => return false,
+            (false, Some(mark)) => ran.iter().find(|(prompt, _)| *prompt > mark).copied(),
+        };
+        let Some((prompt, end)) = target else {
+            if older {
+                return false;
+            }
+            // 过了最新的一条：回到最新的输出，取消选中
+            self.snap_to_bottom();
+            self.grid.set_selection(None);
+            return true;
+        };
+        self.jump_mark.set(Some(prompt));
+        let (history, rows, line) = {
+            let terminal = self.terminal.borrow();
+            (
+                terminal.scrollback_len(),
+                terminal.size().1,
+                terminal.absolute_line(prompt).unwrap_or(0),
+            )
+        };
+        // 不在看得见的范围里才滚：在历史里就翻回去，让它出现在最上面
+        let top = history.saturating_sub(self.offset.get());
+        if line < top || line >= top + rows {
+            self.offset.set(history.saturating_sub(line.min(history)));
+        }
+        self.flush();
+        // 选中这条命令：从提示符那一行到输出的最后一行，超出看得见的部分截掉
+        let top = history.saturating_sub(self.offset.get());
+        let columns = self.grid.size()[0];
+        let last = self
+            .terminal
+            .borrow()
+            .absolute_line(end.saturating_sub(1).max(prompt))
+            .unwrap_or(line);
+        let first_row = line.saturating_sub(top).min(rows - 1);
+        let last_row = last.saturating_sub(top).min(rows - 1);
+        self.grid.set_selection(Some((
+            CharGridPosition::new(first_row, 0),
+            CharGridPosition::new(last_row, columns),
+        )));
+        true
+    }
+
+    /// 最近一条跑完、有输出的命令的输出
+    pub fn last_command_output(&self) -> Option<String> {
+        let terminal = self.terminal.borrow();
+        (0..terminal.commands().len())
+            .rev()
+            .find_map(|index| terminal.command_output(index).filter(|text| !text.is_empty()))
+    }
+
+    /// 把上一条命令的输出放进剪贴板
+    pub fn copy_last_output(&self) -> bool {
+        match self.last_command_output() {
+            Some(text) => {
+                aureole::clipboard::write_text(text);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// 往历史里翻：`lines` 为正是往更早的方向，为负是往最新的方向。到头了就停
     fn scroll_back(&self, lines: isize) {
         let history = self.terminal.borrow().scrollback_len() as isize;
@@ -744,6 +965,7 @@ impl Session {
 
     /// 回到最新的输出
     fn snap_to_bottom(&self) {
+        self.jump_mark.set(None);
         self.scroll_back(isize::MIN / 2);
     }
 
@@ -794,7 +1016,7 @@ impl Session {
         let found = {
             let terminal = self.terminal.borrow();
             view::source_line(&terminal, row, offset)
-                .and_then(|line| links::link_at(line, column))
+                .and_then(|line| links::link_at(line, column, terminal.link_uris()))
         };
         let (link, start, end) = found?;
         let hover = view::Hover { row, start, end };
@@ -851,7 +1073,7 @@ impl Session {
         let link = {
             let terminal = self.terminal.borrow();
             view::source_line(&terminal, row, self.offset.get())
-                .and_then(|line| links::link_at(line, column))
+                .and_then(|line| links::link_at(line, column, terminal.link_uris()))
         };
         let Some((link, ..)) = link else {
             return false;
@@ -1030,6 +1252,8 @@ impl Session {
             self.cell.set(view::measure(shown, columns, rows));
         }
         let Some(cell) = self.cell.get() else { return };
+        // 图片按一格多大换算成占几行几列
+        self.terminal.borrow_mut().set_cell_pixels(cell.0, cell.1);
         let (new_columns, new_rows) = view::fit(
             viewport.width - 2.0 * PADDING,
             viewport.height - 2.0 * PADDING,
@@ -1113,7 +1337,7 @@ impl Session {
         let link = self.cell_at(position).and_then(|(row, column)| {
             let terminal = self.terminal.borrow();
             view::source_line(&terminal, row, self.offset.get())
-                .and_then(|line| links::link_at(line, column))
+                .and_then(|line| links::link_at(line, column, terminal.link_uris()))
         });
         let link = link.map(|(link, ..)| link).filter(|link| match link {
             links::Link::Url(_) => true,
@@ -1171,7 +1395,35 @@ impl Session {
             return;
         };
         let bracketed = self.terminal.borrow().modes.bracketed_paste;
-        self.write(&keys::paste_bytes(&text, bracketed));
+        // 没开括号粘贴时，shell 会把每一行都当成命令立刻执行：多行的先问一下
+        if !bracketed
+            && self.form.confirm_paste.get_untracked()
+            && has_inner_newline(&text)
+            && let Some(confirm) = &self.hooks.confirm_paste
+        {
+            confirm(text);
+            return;
+        }
+        self.paste_text(&text);
+    }
+
+    /// 把 `text` 当粘贴的内容写给程序（括号粘贴、换行、控制字符都照粘贴的规矩处理）
+    pub fn paste_text(&self, text: &str) {
+        let bracketed = self.terminal.borrow().modes.bracketed_paste;
+        self.write(&keys::paste_bytes(text, bracketed));
+        self.snap_to_bottom();
+    }
+
+    /// 把一条命令写在提示符处（命令历史里选中的）：不按回车，由用户决定要不要改、要不要执行
+    pub fn insert_command(&self, command: &str) {
+        let bracketed = self.terminal.borrow().modes.bracketed_paste;
+        // 换行换成空格：历史里的多行命令别一粘贴就执行
+        let single: String = command
+            .chars()
+            .map(|ch| if matches!(ch, '\n' | '\r') { ' ' } else { ch })
+            .collect();
+        self.grid.set_selection(None);
+        self.write(&keys::paste_bytes(&single, bracketed));
         self.snap_to_bottom();
     }
 
@@ -1352,12 +1604,14 @@ pub fn view(
             focus.focus();
         }
     });
-    let (keys_session, ime_session, wheel_session, leave_session) = (
+    let (keys_session, ime_session, wheel_session, leave_session, image_wheel_session) = (
+        session.clone(),
         session.clone(),
         session.clone(),
         session.clone(),
         session.clone(),
     );
+    let images = session.images;
     let hovering = session.hovering_link;
     let (down_session, up_session, move_session, focus_session, click_session) = (
         session.clone(),
@@ -1391,50 +1645,94 @@ pub fn view(
             }
         })
         .child(
-            char_grid(&grid)
-                .name("grid")
+            // 网格和叠在它上面的图片放在同一个容器里：图片按格子算位置，和网格的左上角对齐
+            column()
                 .align_self(Align::Start)
-                .focus_handle(focus)
-                // 键盘切标签后终端拿到焦点：整块终端就是输入区，不在外面画框
-                .focus_ring(FocusRing::NONE)
-                .report_bounds(shown)
-                .on_secondary_click(move |event: &ClickEvent| {
-                    if click_session.secondary_click(event.position, event.modifiers) {
-                        event.stop_propagation();
-                        on_menu(event.window_position);
-                    }
-                })
-                .font_weight(move || form.font_weight.get().value())
-                .font_size(move || form.font_size.get() as f32)
-                .line_height(move || form.line_height.get() as f32)
-                .font_family(move || form.font.get().family().to_string())
-                .on_key_down(move |event: &KeyEvent| {
-                    if keys_session.key(event) {
-                        event.stop_propagation();
-                    }
-                })
-                // 程序要鼠标时（vim、htop、tmux）把指针事件编码了写给它；不要时这几个处理器什么都不做，
-                // 选字、复制照旧由网格自己处理
-                .on_pointer_down(move |event: &PointerEvent| down_session.pointer_down(event))
-                .on_pointer_up(move |event: &PointerEvent| up_session.pointer_up(event))
-                .on_pointer_move(move |event: &PointerEvent| move_session.pointer_move(event))
-                .on_pointer_leave(move |_: &PointerEvent| leave_session.pointer_over(None))
-                // 指针在链接上是手指，别处是文字光标
-                .cursor(move || {
-                    if hovering.get() {
-                        Cursor::Pointer
-                    } else {
-                        Cursor::Text
-                    }
-                })
-                .on_keyboard_focus(move |focused: bool| focus_session.focus_changed(focused))
+                // 鼠标在图片上滚也要滚终端（图片不是网格，滚轮事件到不了网格那儿）
                 .on_wheel(move |event: &WheelEvent| {
-                    wheel_session.wheel(event);
+                    image_wheel_session.wheel(event);
                     event.stop_propagation();
                 })
-                // 输入法：预编辑画在插入点处，提交的字原样写给 shell
-                .on_text_insert(move |text: String| ime_session.commit_text(&text)),
+                .child(
+            char_grid(&grid)
+                        .name("grid")
+                        .align_self(Align::Start)
+                        .focus_handle(focus)
+                        // 键盘切标签后终端拿到焦点：整块终端就是输入区，不在外面画框
+                        .focus_ring(FocusRing::NONE)
+                        .report_bounds(shown)
+                        .on_secondary_click(move |event: &ClickEvent| {
+                            if click_session.secondary_click(event.position, event.modifiers) {
+                                event.stop_propagation();
+                                on_menu(event.window_position);
+                            }
+                        })
+                        .font_weight(move || form.font_weight.get().value())
+                        .font_size(move || form.font_size.get() as f32)
+                        .line_height(move || form.line_height.get() as f32)
+                        .font_family(move || form.font.get().family().to_string())
+                        .on_key_down(move |event: &KeyEvent| {
+                            if keys_session.key(event) {
+                                event.stop_propagation();
+                            }
+                        })
+                        // 程序要鼠标时（vim、htop、tmux）把指针事件编码了写给它；不要时这几个处理器什么都不做，
+                        // 选字、复制照旧由网格自己处理
+                        .on_pointer_down(move |event: &PointerEvent| down_session.pointer_down(event))
+                        .on_pointer_up(move |event: &PointerEvent| up_session.pointer_up(event))
+                        .on_pointer_move(move |event: &PointerEvent| move_session.pointer_move(event))
+                        .on_pointer_leave(move |_: &PointerEvent| leave_session.pointer_over(None))
+                        // 指针在链接上是手指，别处是文字光标
+                        .cursor(move || {
+                            if hovering.get() {
+                                Cursor::Pointer
+                            } else {
+                                Cursor::Text
+                            }
+                        })
+                        .on_keyboard_focus(move |focused: bool| focus_session.focus_changed(focused))
+                        .on_wheel(move |event: &WheelEvent| {
+                            wheel_session.wheel(event);
+                            event.stop_propagation();
+                        })
+                        // 输入法：预编辑画在插入点处，提交的字原样写给 shell
+                        .on_text_insert(move |text: String| ime_session.commit_text(&text)),
+                )
+                // 图片直接是容器的子元素（各自按位置摆）：不铺一层盖满网格的东西，它会挡住网格上的鼠标事件
+                .clip(true)
+                .each(
+                    move || images.get().into_iter().map(|image| image.id).collect::<Vec<_>>(),
+                    |id| *id,
+                    move |id| terminal_image(images, id),
+                ),
         )
+}
+
+/// 叠在网格上的一张图：按终端算好的位置和大小摆，位置变了（滚动）跟着变
+fn terminal_image(images: Signal<Vec<VisibleImage>>, id: u64) -> Element {
+    let field = move |read: fn(&VisibleImage) -> f32| {
+        move || {
+            images
+                .get()
+                .iter()
+                .find(|image| image.id == id)
+                .map_or(0.0, read)
+        }
+    };
+    let source = images
+        .get_untracked()
+        .into_iter()
+        .find(|image| image.id == id)
+        .map(|image| image.source());
+    match source {
+        Some(source) => image(source)
+            .name(format!("terminal-image-{id}"))
+            .fit(ImageFit::Stretch)
+            .position(field(|image| image.x), field(|image| image.y))
+            .width(field(|image| image.width))
+            .height(field(|image| image.height)),
+        None => column(),
+    }
 }
 
 #[cfg(test)]
@@ -1560,6 +1858,99 @@ mod tests {
         )
     }
 
+    /// 重启后恢复的内容带着命令标记：能在旧命令之间跳、复制输出；恢复的命令不会重新记进命令历史
+    #[test]
+    fn restored_sessions_keep_their_command_marks() {
+        let old = session_with_commands(4);
+        let saved = old.transcript(1000);
+        let recorded = Rc::new(RefCell::new(Vec::<String>::new()));
+        let mut hooks = Hooks::none();
+        let sink = recorded.clone();
+        hooks.record = Some(Rc::new(move |command| sink.borrow_mut().push(command)));
+        let session = Session::start(
+            Spawned { pty: None, queue: None, error: None },
+            40,
+            5,
+            hooks,
+            Form::new(&crate::settings::Settings::default()),
+            Some(&saved),
+        );
+        assert!(recorded.borrow().is_empty(), "恢复的命令不进历史");
+        assert!(session.jump_prompt(true));
+        assert!(session.selected_text().is_some_and(|text| text.contains("cmd3") && text.contains("out3")));
+        assert!(session.jump_prompt(true));
+        assert!(session.selected_text().is_some_and(|text| text.contains("cmd2")));
+        assert_eq!(session.last_command_output().as_deref(), Some("out3"));
+    }
+
+    /// 给一个会话喂几条带命令标记的命令
+    fn session_with_commands(count: usize) -> Rc<Session> {
+        let session = Session::new(
+            Terminal::new(40, 5),
+            CharGrid::new(40, 5),
+            None,
+            Hooks::none(),
+            Form::new(&crate::settings::Settings::default()),
+        );
+        for index in 0..count {
+            session.feed_for_test(&format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07cmd{index}\r\n\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+            ));
+        }
+        session.feed_for_test("\x1b]133;A\x07$ \x1b]133;B\x07");
+        session
+    }
+
+    /// 在命令之间跳：每次选中一条命令（提示符加输出），一路往上到最老，再往下回到最新；命令都在一屏里时也看得见
+    #[test]
+    fn jumping_between_commands() {
+        // 命令都在一屏里：不滚动，但选中的是那条命令
+        let session = session_with_commands(2);
+        assert!(session.jump_prompt(true));
+        assert_eq!(session.offset.get(), 0);
+        let selected = session.selected_text().expect("选中了命令");
+        assert!(selected.contains("cmd1") && selected.contains("out1"), "{selected:?}");
+        assert!(!selected.contains("cmd0"));
+        assert!(session.jump_prompt(true));
+        let selected = session.selected_text().expect("选中了上一条");
+        assert!(selected.contains("cmd0") && selected.contains("out0"), "{selected:?}");
+        assert!(!session.jump_prompt(true), "最老的那条之前没有了");
+        // 往下：回到后面一条，再往下就回到最新并取消选中
+        assert!(session.jump_prompt(false));
+        assert!(session.selected_text().is_some_and(|text| text.contains("cmd1")));
+        assert!(session.jump_prompt(false));
+        assert!(session.selected_text().is_none());
+        assert!(!session.jump_prompt(false), "已经在最新的了");
+
+        // 命令多得滚进了历史：要翻回去
+        let session = session_with_commands(8);
+        assert!(session.jump_prompt(true));
+        let mut jumps = 1;
+        while session.jump_prompt(true) {
+            jumps += 1;
+            assert!(jumps < 20, "停得下来");
+        }
+        assert_eq!(jumps, 8, "八条命令都跳到过");
+        assert!(session.offset.get() > 0, "翻回历史了");
+        assert!(session.selected_text().is_some_and(|text| text.contains("cmd0")));
+        while session.jump_prompt(false) {}
+        assert_eq!(session.offset.get(), 0);
+        // 没有命令标记：什么都不做，按键该交给终端
+        let (plain, _alerts) = session_with_alerts();
+        plain.feed_for_test("hello\r\n");
+        assert!(!plain.jump_prompt(true));
+    }
+
+    #[test]
+    fn copies_the_last_commands_output() {
+        let session = session_with_commands(3);
+        assert_eq!(session.last_command_output().as_deref(), Some("out2"));
+        assert!(session.copy_last_output());
+        assert_eq!(aureole::clipboard::read_text().as_deref(), Some("out2"));
+        let (plain, _alerts) = session_with_alerts();
+        assert!(!plain.copy_last_output());
+    }
+
     fn session_with_alerts() -> (Rc<Session>, Rc<RefCell<Vec<Alert>>>) {
         let alerts = Rc::new(RefCell::new(Vec::new()));
         let mut hooks = Hooks::none();
@@ -1588,7 +1979,7 @@ mod tests {
         session.watch_busy(true, after(15));
         assert!(alerts.borrow().is_empty(), "还在跑");
         session.watch_busy(false, after(22));
-        assert_eq!(*alerts.borrow(), [Alert::Finished { seconds: 12 }]);
+        assert_eq!(*alerts.borrow(), [Alert::Finished { seconds: 12, exit: None, command: String::new() }]);
         session.watch_busy(false, after(30));
         assert_eq!(alerts.borrow().len(), 1, "没有命令在跑时不重复提醒");
     }
@@ -1686,6 +2077,61 @@ mod tests {
         assert!(!style_at(missing).underline);
         std::fs::remove_file(&short).ok();
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// 内联图片叠在网格上：位置和大小按格子算，跟着行滚；滚出屏幕就撤下来，回看时又出现
+    #[test]
+    fn inline_images_sit_on_their_cells_and_scroll_with_them() {
+        // 1×1 的 PNG：真能解码
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let setup = format!("line0\r\n\x1b]1337;File=inline=1;width=10;height=3:{PNG}\x07done\r\n");
+        let (harness, _recorder, grid, cell, session) =
+            mounted_with(&setup, crate::settings::Settings::default());
+        harness.frame();
+        let image = harness.window_bounds("terminal-image-0").expect("图片在元素树里");
+        assert!((image.x - grid.x).abs() < 0.5, "左对齐网格");
+        assert!((image.y - (grid.y + cell.1)).abs() < 0.5, "在第 1 行（第 0 行写了 line0）");
+        assert!((image.width - 10.0 * cell.0).abs() < 0.5);
+        assert!((image.height - 3.0 * cell.1).abs() < 0.5);
+        // 再写够把屏幕写满再多一行：整屏往上滚一行，图跟着往上一格
+        let screen_rows = session.grid_size_for_test()[1];
+        session.feed_for_test(&lines(screen_rows - 5));
+        harness.frame();
+        let scrolled = harness.window_bounds("terminal-image-0").expect("还在屏幕上").y;
+        assert!((image.y - scrolled - cell.1).abs() < 0.5, "往上移了一格");
+        // 滚到屏幕外：撤下来；往回翻又回来
+        session.feed_for_test(&lines(40));
+        harness.frame();
+        assert!(harness.window_bounds("terminal-image-0").is_none(), "滚出屏幕了");
+        session.scroll_back(1000);
+        harness.frame();
+        assert!(harness.window_bounds("terminal-image-0").is_some(), "往回翻看得见");
+        // 清屏：图片清掉
+        session.snap_to_bottom();
+        session.feed_for_test("\x1b[2J");
+        harness.frame();
+        assert!(harness.window_bounds("terminal-image-0").is_none());
+    }
+
+    /// OSC 8 超链接：显示的字不是网址也能点、也有链接色和悬停下划线，点开的是背后的地址
+    #[test]
+    fn osc_8_links_open_their_target() {
+        let (harness, _recorder, grid, cell, session) = mounted_with(
+            "read \x1b]8;;https://example.com/real\x07the docs\x1b]8;;\x07 now\r\n",
+            crate::settings::Settings::default(),
+        );
+        let link_color = view::colors(crate::theme::is_dark()).link;
+        let style_at = |column: usize| session.grid.cell(0, column).expect("有格子").style;
+        assert_eq!(style_at(6).foreground, Some(link_color), "常显链接色");
+        assert_ne!(style_at(0).foreground, Some(link_color));
+        let (x, y) = center(grid, cell, 0, 8);
+        harness.mouse_move(x, y);
+        harness.frame();
+        assert_eq!(harness.cursor(), Cursor::Pointer);
+        assert!(style_at(5).underline && style_at(12).underline);
+        assert!(!style_at(14).underline, "链接外面的字没有");
+        harness.click_with(x, y, Modifiers::SUPER);
+        assert_eq!(harness.opened_urls(), ["https://example.com/real"]);
     }
 
     /// ⌘ 加点击打开终端里的网址；不按 ⌘ 点、点在别处都不开；程序抓着鼠标时 ⌘ 点链接也归链接

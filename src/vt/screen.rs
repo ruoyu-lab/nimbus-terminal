@@ -41,6 +41,9 @@ pub struct Attributes {
     /// SGR 8：看不见（画成空格）
     pub hidden: bool,
     pub strikethrough: bool,
+    /// OSC 8 超链接：`Terminal` 里链接表的编号（从 1 起），0 是没有链接。它不是 SGR 的一部分，
+    /// 写字的时候才从终端当前的链接贴上去
+    pub link: u32,
 }
 
 impl Attributes {
@@ -78,6 +81,7 @@ impl Cell {
             inverse: false,
             hidden: false,
             strikethrough: false,
+            link: 0,
         },
     };
 

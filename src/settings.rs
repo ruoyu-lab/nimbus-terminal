@@ -224,7 +224,11 @@ settings! {
     wheel: f64 = 3.0,
     copy_on_select: bool = false,
     right_click_paste: bool = false,
+    /// 程序没开括号粘贴时，粘贴多行文字先问一下（每一行都会当成命令立刻执行）
+    confirm_paste: bool = true,
     bell: Bell = Bell::Off,
+    /// 本机的 zsh 自动加载 shell 集成（OSC 133 命令标记）：跳转命令、复制输出、命令历史
+    shell_integration: bool = true,
     /// 窗口在后台时，命令跑完、程序要求弹的通知用系统通知提醒
     notifications: bool = true,
 }

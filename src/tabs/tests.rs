@@ -5171,9 +5171,9 @@ fn background_notifications_go_to_the_tab_you_are_not_looking_at() {
             .get_untracked()
             .first_id()
     };
-    workspace.alert(second, pane(second), Alert::Finished { seconds: 75 });
+    workspace.alert(second, pane(second), Alert::Finished { seconds: 75, exit: None, command: String::new() });
     assert!(harness.notifications().is_empty(), "正看着的不弹");
-    workspace.alert(first, pane(first), Alert::Finished { seconds: 75 });
+    workspace.alert(first, pane(first), Alert::Finished { seconds: 75, exit: None, command: String::new() });
     let shown = harness.notifications();
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0].title, "命令已完成");
@@ -5195,7 +5195,7 @@ fn background_notifications_go_to_the_tab_you_are_not_looking_at() {
     // 设置里关了：不弹
     let before = harness.notifications().len();
     workspace.form.notifications.set(false);
-    workspace.alert(first, pane(first), Alert::Finished { seconds: 99 });
+    workspace.alert(first, pane(first), Alert::Finished { seconds: 99, exit: None, command: String::new() });
     assert_eq!(harness.notifications().len(), before);
 }
 
@@ -5239,4 +5239,135 @@ fn right_clicking_a_link_offers_open_and_copy() {
     harness.click(mx, my);
     harness.advance(secs(1.0));
     assert_eq!(harness.opened_urls(), ["https://example.com/x"]);
+}
+
+/// 程序没开括号粘贴时粘贴多行文字：先弹确认框，点「粘贴」才写进去，点「取消」就不写；单行、开了括号粘贴的不问
+#[test]
+fn multiline_paste_asks_first_unless_bracketed() {
+    let fake = Fake::default();
+    let workspace = Workspace::new(fake.spawn(), None, Store::none());
+    workspace.new_tab();
+    let harness = Harness::new(
+        WINDOW_SIZE.0 as f32,
+        WINDOW_SIZE.1 as f32,
+        chrome::build(workspace.clone()),
+    );
+    harness.set_title_bar_info(title_bar());
+    harness.frame();
+    let session = workspace.focused_session().expect("有终端");
+    aureole::clipboard::write_text("echo one\necho two\n".to_string());
+    session.paste();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("paste-dialog").is_some(), "多行要先问");
+    assert_eq!(fake.pty(0).take(), "", "还没写进去");
+    let [x, y] = harness.window_bounds("paste-cancel").expect("按钮在").center();
+    harness.click(x, y);
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("paste-dialog").is_none());
+    assert_eq!(fake.pty(0).take(), "", "取消就不写");
+    session.paste();
+    harness.advance(secs(1.0));
+    let [x, y] = harness.window_bounds("paste-confirm").expect("按钮在").center();
+    harness.click(x, y);
+    harness.advance(secs(1.0));
+    assert_eq!(fake.pty(0).take(), "echo one\recho two\r", "确认后照常粘贴");
+    // 单行（只有结尾的换行）不问
+    aureole::clipboard::write_text("echo one\n".to_string());
+    session.paste();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("paste-dialog").is_none());
+    assert_eq!(fake.pty(0).take(), "echo one\r");
+    // 程序开了括号粘贴：多行也不问
+    session.feed_for_test("\x1b[?2004h");
+    aureole::clipboard::write_text("a\nb".to_string());
+    session.paste();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("paste-dialog").is_none());
+    assert_eq!(fake.pty(0).take(), "\x1b[200~a\nb\x1b[201~");
+    // 设置里关了：不问
+    session.feed_for_test("\x1b[?2004l");
+    workspace.form.confirm_paste.set(false);
+    aureole::clipboard::write_text("x\ny".to_string());
+    session.paste();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("paste-dialog").is_none());
+    assert_eq!(fake.pty(0).take(), "x\ry");
+}
+
+/// 命令历史：跑完的命令（有命令标记）记下来、存盘；命令面板里打字能搜到，选中写在提示符处但不按回车
+#[test]
+fn finished_commands_become_searchable_history() {
+    let directory = directory("history");
+    let fake = Fake::default();
+    let workspace = Workspace::new(fake.spawn(), None, Store::at(&directory));
+    workspace.new_tab();
+    let harness = Harness::new(
+        WINDOW_SIZE.0 as f32,
+        WINDOW_SIZE.1 as f32,
+        chrome::build(workspace.clone()),
+    );
+    harness.set_title_bar_info(title_bar());
+    harness.frame();
+    let session = workspace.focused_session().expect("有终端");
+    for command in ["git status", "cargo test --release", "git status"] {
+        session.feed_for_test(&format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07"
+        ));
+    }
+    assert_eq!(
+        workspace.history_matches("git", 10),
+        ["git status"],
+        "重复的只留一条"
+    );
+    assert_eq!(workspace.history_matches("CARGO", 10), ["cargo test --release"], "不分大小写");
+    // 存了盘：重开还在
+    let reopened = Workspace::new(Fake::default().spawn(), None, Store::at(&directory));
+    assert_eq!(reopened.history_matches("", 10), ["git status", "cargo test --release"]);
+    // 命令面板里搜
+    command(&harness, "k");
+    harness.type_text("cargo");
+    harness.advance(secs(1.0));
+    let [x, y] = harness
+        .window_bounds("cmd-history-0")
+        .expect("历史里的命令出现在面板里")
+        .center();
+    harness.click(x, y);
+    harness.advance(secs(1.0));
+    assert_eq!(fake.pty(0).take(), "cargo test --release", "写在提示符处，没有回车");
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+/// ⌘↑ / ⌘↓ 在命令之间跳：有命令标记时选中那条命令；没有标记时按键不被吞掉，照常交给终端
+#[test]
+fn command_arrow_keys_jump_between_commands() {
+    let fake = Fake::default();
+    let workspace = Workspace::new(fake.spawn(), None, Store::none());
+    workspace.new_tab();
+    let harness = Harness::new(
+        WINDOW_SIZE.0 as f32,
+        WINDOW_SIZE.1 as f32,
+        chrome::build(workspace.clone()),
+    );
+    harness.set_title_bar_info(title_bar());
+    harness.frame();
+    let session = workspace.focused_session().expect("有终端");
+    // 没有命令标记：⌘↑ 没人处理，终端收到它（编码成方向键）
+    harness.key_down_with(Key::Named(NamedKey::ArrowUp), Modifiers::SUPER);
+    harness.frame();
+    assert!(session.selected_text().is_none());
+    for index in 0..3 {
+        session.feed_for_test(&format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07cmd{index}\r\n\x1b]133;C\x07out{index}\r\n\x1b]133;D;0\x07"
+        ));
+    }
+    session.feed_for_test("\x1b]133;A\x07$ \x1b]133;B\x07");
+    harness.key_down_with(Key::Named(NamedKey::ArrowUp), Modifiers::SUPER);
+    harness.frame();
+    assert!(session.selected_text().is_some_and(|text| text.contains("cmd2") && text.contains("out2")));
+    harness.key_down_with(Key::Named(NamedKey::ArrowUp), Modifiers::SUPER);
+    harness.frame();
+    assert!(session.selected_text().is_some_and(|text| text.contains("cmd1")));
+    harness.key_down_with(Key::Named(NamedKey::ArrowDown), Modifiers::SUPER);
+    harness.frame();
+    assert!(session.selected_text().is_some_and(|text| text.contains("cmd2")));
 }

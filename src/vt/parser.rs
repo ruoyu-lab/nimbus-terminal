@@ -31,6 +31,10 @@ pub enum Event {
     },
     /// `OSC`：编号和数据，比如 `OSC 0 ; 标题 BEL`
     Osc { code: i32, text: String },
+    /// `APC`（`ESC _ … ST`）的内容。Kitty 的图片协议走这里
+    Apc(Vec<u8>),
+    /// `DCS`（`ESC P … ST`）的内容，包括开头的参数和终结字节。Sixel 图片走这里
+    Dcs(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,14 +50,22 @@ enum State {
     Osc,
     /// OSC 里看到一个 `ESC`，可能是 `ESC \` 收尾
     OscEscape,
-    /// DCS、SOS、PM、APC：内容整条丢掉（做 sixel 时要在这里分叉出去）
+    /// SOS、PM：内容整条丢掉
     Ignore,
+    /// APC 的内容，攒到 `ESC \` 为止
+    Apc,
+    ApcEscape,
+    /// DCS 的内容，攒到 `ESC \` 为止
+    Dcs,
+    DcsEscape,
     IgnoreEscape,
 }
 
 /// 一条序列最多留多少个参数、多长字符串（防止有人拿 `CSI 1;1;1;...` 撑爆内存）
 const MAX_PARAMS: usize = 32;
-const MAX_STRING: usize = 4096;
+/// OSC、APC、DCS 的内容最长这么多字节：图片（iTerm2 的 OSC 1337、Kitty 的 APC、Sixel 的 DCS）一条序列就是几兆，
+/// 太长的整条丢掉（不能只留前半截，半张图解出来是乱的）
+const MAX_STRING: usize = 32 * 1024 * 1024;
 
 pub struct Parser {
     state: State,
@@ -67,6 +79,8 @@ pub struct Parser {
     private: Option<u8>,
     intermediates: Vec<u8>,
     string: Vec<u8>,
+    /// 这条字符串序列超过了 [`MAX_STRING`]：结束时整条丢掉
+    string_overflow: bool,
     /// 攒了一半的 UTF-8
     utf8: [u8; 4],
     utf8_len: usize,
@@ -89,6 +103,7 @@ impl Parser {
             private: None,
             intermediates: Vec::new(),
             string: Vec::new(),
+            string_overflow: false,
             utf8: [0; 4],
             utf8_len: 0,
         }
@@ -141,17 +156,39 @@ impl Parser {
                 0x07 => self.finish_osc(out),
                 0x1b => self.state = State::OscEscape,
                 0x08 => {}
-                _ => {
-                    if self.string.len() < MAX_STRING {
-                        self.string.push(byte);
-                    }
-                }
+                _ => self.push_string(byte),
             },
             State::OscEscape => {
                 self.finish_osc(out);
                 if byte == b'\\' {
                     self.state = State::Ground;
                 } else {
+                    self.escape(byte, out);
+                }
+            }
+            State::Apc => match byte {
+                0x1b => self.state = State::ApcEscape,
+                0x18 | 0x9c => self.state = State::Ground,
+                _ => self.push_string(byte),
+            },
+            State::ApcEscape => {
+                if byte == b'\\' {
+                    self.finish_string(out, Event::Apc);
+                } else {
+                    self.state = State::Ground;
+                    self.escape(byte, out);
+                }
+            }
+            State::Dcs => match byte {
+                0x1b => self.state = State::DcsEscape,
+                0x18 | 0x9c => self.state = State::Ground,
+                _ => self.push_string(byte),
+            },
+            State::DcsEscape => {
+                if byte == b'\\' {
+                    self.finish_string(out, Event::Dcs);
+                } else {
+                    self.state = State::Ground;
                     self.escape(byte, out);
                 }
             }
@@ -229,7 +266,9 @@ impl Parser {
             match code {
                 0x9b => self.begin_escape_csi(),
                 0x9d => self.begin_osc(),
-                0x90 | 0x98 | 0x9e | 0x9f => self.state = State::Ignore,
+                0x90 => self.begin_string(State::Dcs),
+                0x9f => self.begin_string(State::Apc),
+                0x98 | 0x9e => self.state = State::Ignore,
                 _ => {}
             }
             return;
@@ -253,16 +292,41 @@ impl Parser {
     }
 
     fn begin_osc(&mut self) {
+        self.begin_string(State::Osc);
+    }
+
+    /// 开始攒一条字符串序列（OSC、APC、DCS）
+    fn begin_string(&mut self, state: State) {
         self.begin_escape();
-        self.state = State::Osc;
+        self.state = state;
         self.string.clear();
+        self.string_overflow = false;
+    }
+
+    fn push_string(&mut self, byte: u8) {
+        if self.string.len() < MAX_STRING {
+            self.string.push(byte);
+        } else {
+            self.string_overflow = true;
+        }
+    }
+
+    /// APC、DCS 结束：交出内容（超长的整条丢掉）
+    fn finish_string(&mut self, out: &mut Vec<Event>, make: fn(Vec<u8>) -> Event) {
+        let content = std::mem::take(&mut self.string);
+        if !self.string_overflow {
+            out.push(make(content));
+        }
+        self.state = State::Ground;
     }
 
     fn escape(&mut self, byte: u8, out: &mut Vec<Event>) {
         match byte {
             b'[' => self.begin_escape_csi(),
             b']' => self.begin_osc(),
-            b'P' | b'X' | b'^' | b'_' => self.state = State::Ignore,
+            b'P' => self.begin_string(State::Dcs),
+            b'_' => self.begin_string(State::Apc),
+            b'X' | b'^' => self.state = State::Ignore,
             0x20..=0x2f => {
                 self.push_intermediate(byte);
                 self.state = State::EscapeIntermediate;
@@ -341,6 +405,11 @@ impl Parser {
     }
 
     fn finish_osc(&mut self, out: &mut Vec<Event>) {
+        if self.string_overflow {
+            self.string.clear();
+            self.state = State::Ground;
+            return;
+        }
         let text = String::from_utf8_lossy(&std::mem::take(&mut self.string)).into_owned();
         let (code, rest) = match text.split_once(';') {
             Some((code, rest)) => (code.parse::<i32>().unwrap_or(-1), rest.to_string()),
@@ -468,12 +537,22 @@ mod tests {
     }
 
     #[test]
-    fn dcs_is_swallowed_whole() {
-        // 没实现的 DCS（这里是 DECUDAK）整条吃掉，后面的字照样是字
+    fn dcs_and_apc_are_collected_whole() {
+        // DCS、APC 整条收下交给上层（没人认的就丢掉），后面的字照样是字
         assert_eq!(
             events(&["\x1bP1$z\x1b\\x".as_bytes()]),
-            vec![Event::Print('x')]
+            vec![Event::Dcs(b"1$z".to_vec()), Event::Print('x')]
         );
+        assert_eq!(
+            events(&["\x1b_Gi=1;QUJD\x1b\\y".as_bytes()]),
+            vec![Event::Apc(b"Gi=1;QUJD".to_vec()), Event::Print('y')]
+        );
+        // 分成几次读到也一样；被 CAN 打断的整条丢掉
+        assert_eq!(
+            events(&["\x1b_Gi=".as_bytes(), "1\x1b".as_bytes(), "\\".as_bytes()]),
+            vec![Event::Apc(b"Gi=1".to_vec())]
+        );
+        assert_eq!(events(&["\x1b_Gabc\x18z".as_bytes()]), vec![Event::Print('z')]);
     }
 
     #[test]

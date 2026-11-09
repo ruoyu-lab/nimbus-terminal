@@ -320,10 +320,21 @@ fn terminal(form: Form) -> Element {
                         toggle(form.copy_on_select, "set-copy-on-select", "选中后自动复制"),
                     ),
                     setting(
+                        "粘贴多行文字前先确认（程序没开括号粘贴时）",
+                        toggle(form.confirm_paste, "set-confirm-paste", "粘贴前确认"),
+                    ),
+                    setting(
                         "右键直接粘贴（关着就弹菜单）",
                         toggle(form.right_click_paste, "set-right-click", "右键粘贴"),
                     ),
                 ],
+            ),
+            (
+                "命令标记",
+                vec![setting(
+                    "本机 zsh 自动启用命令标记（跳转命令、复制输出、命令历史）；新开的终端生效",
+                    toggle(form.shell_integration, "set-shell-integration", "命令标记"),
+                )],
             ),
             (
                 "通知",
@@ -708,7 +719,7 @@ fn preview(form: Form) -> Element {
 }
 
 fn shortcuts_page() -> Element {
-    const KEYS: [(&str, &str); 15] = [
+    const KEYS: [(&str, &str); 16] = [
         ("新建会话", "⌘T"),
         ("左右分屏", "⌘D"),
         ("上下分屏", "⌘⇧D"),
@@ -716,6 +727,7 @@ fn shortcuts_page() -> Element {
         ("命令面板", "⌘K"),
         ("在终端中查找", "⌘F"),
         ("查找：上一处 / 下一处", "⌘G  ⌘⇧G"),
+        ("跳到上一条 / 下一条命令（要命令标记）", "⌘↑  ⌘↓"),
         ("放大 / 缩小 / 还原字号", "⌘+  ⌘-  ⌘0"),
         ("收起 / 展开侧栏", "⌘B"),
         ("打开 / 退出设置", "⌘,"),

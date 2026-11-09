@@ -180,6 +180,16 @@ fn pane_actions(workspace: &Rc<Workspace>, tab_id: u64, pane: u64) -> Vec<Action
             Rc::new(move || copy.copy_selection()),
         ));
     }
+    if session.last_command_output().is_some() {
+        let copy = session.clone();
+        actions.push(action(
+            "copy-output",
+            "复制上一条命令的输出",
+            Rc::new(move || {
+                copy.copy_last_output();
+            }),
+        ));
+    }
     let (paste, select, clear) = (session.clone(), session.clone(), session);
     actions.push(action("paste", "粘贴", Rc::new(move || paste.paste())));
     actions.push(action(
@@ -218,7 +228,7 @@ fn pane_actions(workspace: &Rc<Workspace>, tab_id: u64, pane: u64) -> Vec<Action
 fn action_menu(menu_name: String, open: Signal<bool>, actions: Rc<Vec<Action>>) -> Element {
     let mut menu = column()
         .name(menu_name)
-        .width(148)
+        .width(176)
         .padding(4)
         .gap(1)
         .radius(8)
@@ -526,6 +536,81 @@ pub(super) fn close_dialog(workspace: Rc<Workspace>) -> Element {
                                 .color(Color::WHITE),
                         )
                         .on_click(move || confirm.confirm_close()),
+                ),
+        ))
+}
+
+/// 粘贴多行文字之前问一下：给出前几行、一共几行。回车或点「粘贴」才粘贴，Esc、点外面、点「取消」都不粘贴
+pub(super) fn paste_dialog(workspace: Rc<Workspace>) -> Element {
+    let Some(pending) = workspace.pending_paste.get_untracked() else {
+        return column();
+    };
+    let lines: Vec<&str> = pending.text.lines().collect();
+    let preview: String = lines
+        .iter()
+        .take(6)
+        .map(|line| {
+            let short: String = line.chars().take(60).collect();
+            if line.chars().count() > 60 { format!("{short}…") } else { short }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = lines.len().saturating_sub(6);
+    let (confirm, cancel) = (workspace.clone(), workspace.clone());
+    let button = |label: &'static str, id: &'static str| {
+        row()
+            .name(id)
+            .style(&dialog_button_style())
+            .align(Align::Center)
+            .justify(Justify::Center)
+            .accessibility_role(Role::Button)
+            .focusable(true)
+            .focus_ring(FocusRing::NONE)
+            .child(text(label))
+    };
+    pop(column()
+        .name("paste-dialog")
+        .width(420)
+        .radius(10)
+        .background(card_bg())
+        .shadow(popup_shadow())
+        .padding(16)
+        .gap(6)
+        .child(text(format!("粘贴 {} 行文字？", lines.len())).font_size(15))
+        .child(
+            text("终端没有开括号粘贴，每一行都会当成命令立刻执行。")
+                .font_size(12)
+                .color(text_3()),
+        )
+        .child(
+            column()
+                .name("paste-preview")
+                .margin_top(4)
+                .padding(8)
+                .radius(6)
+                .background(hover())
+                .child(text(preview).font_size(12).font_family("monospace"))
+                .child_when(
+                    move || more > 0,
+                    move || text(format!("… 还有 {more} 行")).font_size(12).color(text_3()),
+                ),
+        )
+        .child(
+            row()
+                .justify(Justify::End)
+                .gap(8)
+                .margin_top(10)
+                .child(button("取消", "paste-cancel").on_click(move || {
+                    cancel.pending_paste.set(None);
+                }))
+                .child(
+                    button("粘贴", "paste-confirm")
+                        .style(
+                            &dialog_button_style()
+                                .background(accent())
+                                .color(Color::WHITE),
+                        )
+                        .on_click(move || confirm.confirm_paste()),
                 ),
         ))
 }
