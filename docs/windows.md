@@ -17,7 +17,7 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 | 路径 | 认 `C:\…`、`C:/…`、`.\…`、`..\…`、`~\…`、`\\服务器\共享\…`；拖进来的路径按这个终端起的 shell 引（PowerShell 单引号、cmd 双引号，能两边都对时用双引号）；文件页的上传下载换成 `C:/…` 交给 `sftp`；远端文件名里 Windows 不能有的字换成 `_`，跑不出下载目录 |
 | 字体 | 系统等宽（Cascadia Mono，Windows 10 上退到 Consolas）、Cascadia Mono、Consolas、Courier New |
 | 图片 | iTerm2 内联图片能用；Kitty（APC）、Sixel（DCS）被系统的 ConPTY 整段吃掉（测试标了 `#[ignore]`）。要支持得像 WezTerm 那样随包带新版的 `conpty.dll` 和 `OpenConsole.exe` |
-| 窗口 | 窗口按钮按 Windows 的样子自己画；侧栏透出系统材质（Mica，框架 `c2728f4` 起开着材质也不会多出系统的窗口按钮）。窗口位置按显示器记（Win32 枚举显示器） |
+| 窗口 | 窗口按钮按 Windows 的样子自己画；侧栏透出系统材质（Mica，框架 `c2728f4` 起开着材质也不会多出系统的窗口按钮）；深浅和系统一致时外框不盖底色，和资源管理器、Windows Terminal 一样直接露出 Mica。Mica 只带桌面壁纸的颜色、不透出后面的窗口，窗口不在前台、或者系统设置里关了「透明效果」时是纯色。窗口位置按显示器记（Win32 枚举显示器） |
 | 打包 | `scripts\bundle-windows.ps1`：默认出 NSIS 安装程序（先要 `cargo install cargo-packager --version 0.11.8 --locked`，第一次还会下载 NSIS）；`-Format installer` 用框架自己的安装程序，不用下载。编译时（`build.rs`）就把图标和应用标识写进可执行文件 |
 | 通知 | 应用标识 `com.ruoyu-lab.nimbus` 在启动时声明；Windows 要先登记过这个标识才显示通知，安装程序建开始菜单快捷方式时会登记 |
 | Docker 目标 | 代码在 Windows 上编译、子进程不弹窗口；这台机器没装 Docker，没验证 |

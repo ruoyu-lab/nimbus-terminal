@@ -124,7 +124,8 @@ fn frame(workspace: Rc<Workspace>) -> Element {
     );
     // 外框（标题栏和侧栏）用系统的窗口材质，这里只盖一层很淡的底，保证字看得清：
     // 浅色系统里材质本身是浅的，几乎不用盖；深色系统里材质是深的，要盖一层浅色，不然深色的字看不见。
-    // 平台不支持材质时退回不透明的底色
+    // Windows 的 Mica 本来就是给窗口当底的（资源管理器、Windows Terminal 上面都不再盖东西），深浅一致时不盖：
+    // 盖了材质就看不出来（深色时盖 84% 只剩一点点）。平台不支持材质时退回不透明的底色
     let has_backdrop = capabilities().supports_window_backdrop;
     let backdrop = move || {
         if !has_backdrop {
@@ -132,6 +133,7 @@ fn frame(workspace: Rc<Workspace>) -> Element {
         }
         let system_dark = system_appearance() == Appearance::Dark;
         match (is_dark(), system_dark) {
+            (dark, system) if cfg!(windows) && dark == system => Color::TRANSPARENT,
             (false, false) => Color::WHITE.with_alpha(0.28),
             (true, true) => sidebar_bg().with_alpha(0.84),
             // 界面和系统的深浅不一样：系统的材质是另一种颜色，要盖得厚一点才看不出来
