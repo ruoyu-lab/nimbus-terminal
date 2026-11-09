@@ -267,10 +267,16 @@ fn appearance(form: Form) -> Element {
             ),
             (
                 "界面",
-                vec![setting(
-                    "底部状态条",
-                    toggle(form.status_bar, "set-status", "显示底部状态条"),
-                )],
+                vec![
+                    setting(
+                        "底部状态条",
+                        toggle(form.status_bar, "set-status", "显示底部状态条"),
+                    ),
+                    setting(
+                        "远程功能",
+                        toggle(form.remote, "set-remote", "连到服务器时显示监控和文件面板"),
+                    ),
+                ],
             ),
         ]));
     settings_list(

@@ -25,6 +25,7 @@
 mod card;
 mod menu;
 mod palette;
+mod panel;
 mod settings;
 mod sidebar;
 mod title_bar;
@@ -35,7 +36,7 @@ use std::rc::Rc;
 use aureole::prelude::*;
 use aureole::{Appearance, capabilities, system_appearance};
 
-use crate::tabs::Workspace;
+use crate::tabs::{FolderId, Workspace};
 use crate::theme::{fg, is_dark, scrim, sidebar_bg};
 
 /// 标题栏的最小高度；系统给的更高就用系统的
@@ -45,6 +46,10 @@ pub const SIDEBAR_DEFAULT: f32 = 232.0;
 /// 拖交界处改侧栏宽度时的下限和上限
 pub const SIDEBAR_MIN: f32 = 176.0;
 pub const SIDEBAR_MAX: f32 = 360.0;
+/// 右侧面板的默认宽度和拖动范围
+pub const PANEL_DEFAULT: f32 = 280.0;
+pub const PANEL_MIN: f32 = 220.0;
+pub const PANEL_MAX: f32 = 520.0;
 const STATUS_HEIGHT: f32 = 34.0;
 /// 主卡片离窗口右边、下边的空隙
 const GUTTER: f32 = 8.0;
@@ -97,12 +102,15 @@ pub fn build(workspace: Rc<Workspace>) -> Element {
 
 /// 一套深浅色下的整个窗口
 fn frame(workspace: Rc<Workspace>) -> Element {
+    let folder_dropper = workspace.clone();
     let (palette_owner, rename_owner, folder_owner, closing_owner) = (
         workspace.clone(),
         workspace.clone(),
         workspace.clone(),
         workspace.clone(),
     );
+    let connect_owner = workspace.clone();
+    let connect_prompt = workspace.connect_prompt;
     let (palette_open, renaming, folder_prompt, closing) = (
         workspace.palette_open,
         workspace.renaming,
@@ -132,13 +140,17 @@ fn frame(workspace: Rc<Workspace>) -> Element {
         .font_size(13)
         .color(fg())
         .background(backdrop)
+        // 拖着文件夹放在窗口里的哪儿都算放下（换顺序按被拖的文件夹自己的位置算）
+        .accepts_drop(|_: &FolderId| true)
+        .on_drop(move |id: FolderId, _: &DropEvent| folder_dropper.drop_folder(id.0))
         .child(title_bar::view(&workspace))
         .child(
             row()
                 .grow(1)
                 .min_height(0)
                 .child(sidebar::view(&workspace))
-                .child(card::view(&workspace)),
+                .child(card::view(&workspace))
+                .child(panel::view(&workspace)),
         )
         .overlay(
             palette_open,
@@ -166,6 +178,15 @@ fn frame(workspace: Rc<Workspace>) -> Element {
                 .backdrop(scrim())
                 .backdrop_transition(Tween::new(ms(160)).ease_out())
                 .on_dismiss(move |_| folder_prompt.set(None)),
+        )
+        .overlay(
+            connect_prompt,
+            Overlay::new(move || menu::connect_dialog(connect_owner.clone()))
+                .centered(true)
+                .modal(true)
+                .backdrop(scrim())
+                .backdrop_transition(Tween::new(ms(160)).ease_out())
+                .on_dismiss(move |_| connect_prompt.set(false)),
         )
         .overlay(
             move || closing.get().is_some(),

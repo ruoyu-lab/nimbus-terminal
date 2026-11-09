@@ -10,7 +10,9 @@ pub enum Icon {
     Search,
     Terminal,
     Sidebar,
+    PanelRight,
     Laptop,
+    Server,
     Folder,
     Sliders,
     Columns,
@@ -35,6 +37,12 @@ impl Icon {
             }
             Icon::Sidebar => {
                 "M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z M9 4v16"
+            }
+            Icon::PanelRight => {
+                "M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z M15 4v16"
+            }
+            Icon::Server => {
+                "M5 4h14a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z M5 13h14a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z M8 7.5h.01 M8 16.5h.01"
             }
             Icon::Laptop => "M5 6h14a1 1 0 0 1 1 1v9H4V7a1 1 0 0 1 1-1z M2.5 19h19",
             Icon::Folder => {

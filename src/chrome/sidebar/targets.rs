@@ -5,13 +5,16 @@ use std::rc::Rc;
 use aureole::prelude::*;
 
 use crate::chrome::menu::{Action, with_actions, with_context_menu};
+use crate::chrome::sidebar::nav::{nav_named, section_label};
 use crate::chrome::widgets::{appear, soft};
 use crate::icons::{Icon, icon};
-use crate::tabs::{Folder, FolderPrompt, Tab, Workspace};
+use crate::tabs::{Folder, FolderDrag, FolderId, FolderPrompt, Tab, Workspace};
 use crate::theme::{fg, hover, mark, selected, text_2, text_3};
 
 /// 文件夹里面的会话，图标缩进到文件夹名字的那一列（没归进文件夹的会话的图标和文件夹的图标对齐，不缩进）
 const FOLDER_SESSION_INDENT: f32 = 23.0;
+/// 拖的时候所有文件夹都收成一行（28 高加 2 的间距），相邻两个文件夹的间隔就是这个
+const FOLDER_STRIDE: f32 = 30.0;
 
 /// 中间那段滚动的句柄和内容的位置：切到的会话在视口外面时靠它们滚进来
 #[derive(Clone, Copy)]
@@ -30,7 +33,7 @@ pub(super) fn list(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
         .child(sessions(
             &loose,
             scrolling,
-            |tab| tab.folder.is_none(),
+            |tab| tab.folder.is_none() && tab.target.host().is_none(),
             None,
         ))
         .child(column().gap(2).each(
@@ -40,10 +43,121 @@ pub(super) fn list(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
         ))
 }
 
+/// 「远程」：`~/.ssh/config` 里的和手动连过的服务器。没有服务器、或者设置里关了「远程功能」时整块不存在。
+/// 点一个主机：它已经有会话就切过去，没有就连上去；右键可以再开一个会话。主机下面列它的会话
+pub(super) fn remote(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
+    let (hosts, form, collapsed) = (workspace.hosts, workspace.form, workspace.collapsed);
+    let owner = workspace.clone();
+    column().child_when(
+        move || form.remote.get() && !hosts.get().is_empty(),
+        move || {
+            let owner = owner.clone();
+            column()
+                .name("remote")
+                .gap(2)
+                .child(section_label(collapsed, "远程"))
+                .child(column().gap(2).each(
+                    move || hosts.get(),
+                    |host: &String| host.clone(),
+                    move |host| host_block(&owner, host, scrolling),
+                ))
+        },
+    )
+}
+
+fn host_block(workspace: &Rc<Workspace>, host: String, scrolling: Scrolling) -> Element {
+    let (collapsed, tabs) = (workspace.collapsed, workspace.tabs);
+    let (open, connect, again) = (workspace.clone(), workspace.clone(), workspace.clone());
+    let (name, menu_host, owner) = (host.clone(), host.clone(), workspace.clone());
+    let (online, belongs) = (host.clone(), host.clone());
+    let row = nav_named(collapsed, Icon::Server, host.clone())
+        .name(format!("host-{host}"))
+        .child_when(
+            move || {
+                !collapsed.get()
+                    && tabs
+                        .get()
+                        .iter()
+                        .any(|tab| tab.target.host() == Some(online.as_str()))
+            },
+            || rect().size(7, 7).radius(4).background(mark()),
+        )
+        .on_click(move || {
+            let existing = open
+                .tabs
+                .get_untracked()
+                .iter()
+                .find(|tab| tab.target.host() == Some(name.as_str()))
+                .map(|tab| tab.id);
+            match existing {
+                Some(id) => open.select(id),
+                None => {
+                    connect.new_tab_ssh(&name);
+                }
+            }
+        });
+    let row = with_actions(
+        row,
+        format!("menu-host-{host}"),
+        vec![Action {
+            id: format!("new-session-host-{host}"),
+            label: "新建会话".to_string(),
+            // 等菜单卸掉再开，原因同文件夹菜单里的「创建会话」
+            run: Rc::new(move || {
+                let (workspace, host) = (again.clone(), menu_host.clone());
+                aureole::detached(|| {
+                    aureole::spawn_local(async move {
+                        aureole::sleep(ms(1)).await;
+                        workspace.new_tab_ssh(&host);
+                    })
+                });
+            }),
+        }],
+    );
+    column().gap(1).child(row).child_when(
+        move || !collapsed.get(),
+        move || {
+            let belongs = belongs.clone();
+            sessions(
+                &owner,
+                scrolling,
+                move |tab| tab.target.host() == Some(belongs.as_str()),
+                Some(FOLDER_SESSION_INDENT),
+            )
+        },
+    )
+}
+
 fn folder_block(workspace: &Rc<Workspace>, id: u64, scrolling: Scrolling) -> Element {
     let (collapsed, toggle) = (workspace.collapsed, workspace.clone());
     let (label, expanded, collapsed_mark) =
         (workspace.folders, workspace.folders, workspace.folders);
+    let (drag, reorder) = (workspace.folder_drag, workspace.clone());
+    let (order, expanded_drag) = (workspace.folders, workspace.folder_drag);
+    // 拖的时候所有文件夹收成一行，才好按固定的间隔让位；松手后各自恢复原来的展开
+    let open_now = move |folders: Signal<Vec<Folder>>| {
+        expanded_drag.get().is_none() && folder_open(folders, id)
+    };
+    // 这个文件夹该往哪边挪一格：被拖的从上往下越过它，它往上让；从下往上越过，它往下让。
+    // 被拖的这个自己不挪：它在合成层上被框架拖着，松手后框架从指针处把它落进新的格子
+    let shift = move || -> f32 {
+        let Some(dragged) = drag.get() else {
+            return 0.0;
+        };
+        if dragged.id == id {
+            return 0.0;
+        }
+        let Some(index) = order.get().iter().position(|folder| folder.id == id) else {
+            return 0.0;
+        };
+        if dragged.from < dragged.to && index > dragged.from && index <= dragged.to {
+            -FOLDER_STRIDE
+        } else if dragged.to < dragged.from && index >= dragged.to && index < dragged.from {
+            FOLDER_STRIDE
+        } else {
+            0.0
+        }
+    };
     // 对应磁盘目录的文件夹，悬停时看得到路径
     let path = workspace
         .folders
@@ -56,11 +170,40 @@ fn folder_block(workspace: &Rc<Workspace>, id: u64, scrolling: Scrolling) -> Ele
         .style(&folder_style())
         .align(Align::Center)
         .gap(8)
+        .translation_y(shift)
+        .transition(Property::TranslationY, Spring::snappy())
         .on_click(move || {
             if collapsed.get_untracked() {
                 toggle.collapsed.set(false);
             } else {
                 toggle.toggle_folder(id);
+            }
+        })
+        .draggable(move || FolderId(id))
+        // 被拖的文件夹由框架在合成层上跟着指针走：只沿纵向
+        .drag_preview(DragPreview::Lift)
+        .drag_preview_axis(Direction::Column)
+        .on_drag(move |event: &DragEvent| match event.phase {
+            GesturePhase::Start => {
+                let from = reorder.folder_index(id).unwrap_or(0);
+                drag.set(Some(FolderDrag { id, from, to: from }));
+            }
+            // 放下时顺序已经换好、状态已经清掉；取消（Esc、拖出窗口）时落回原来的格子
+            GesturePhase::End | GesturePhase::Cancel => {
+                if drag.get_untracked().is_some() {
+                    drag.set(None);
+                }
+            }
+            GesturePhase::Move => {
+                let Some(dragged) = drag.get_untracked() else {
+                    return;
+                };
+                let last = reorder.folders.get_untracked().len().saturating_sub(1) as f32;
+                let moved = dragged.from as f32 * FOLDER_STRIDE + event.translation[1];
+                let to = (moved.clamp(0.0, last * FOLDER_STRIDE) / FOLDER_STRIDE).round() as usize;
+                if dragged.to != to {
+                    drag.set(Some(FolderDrag { to, ..dragged }));
+                }
             }
         })
         .child(
@@ -73,11 +216,11 @@ fn folder_block(workspace: &Rc<Workspace>, id: u64, scrolling: Scrolling) -> Ele
             move || text(move || folder_name(label, id)).grow(1).max_lines(1),
         )
         .child_when(
-            move || !collapsed.get() && folder_open(expanded, id),
+            move || !collapsed.get() && open_now(expanded),
             || icon(Icon::ChevronDown, 14.0).color(text_3()),
         )
         .child_when(
-            move || !collapsed.get() && !folder_open(collapsed_mark, id),
+            move || !collapsed.get() && !open_now(collapsed_mark),
             || icon(Icon::ChevronRight, 14.0).color(text_3()),
         );
     if let Some(path) = path {
@@ -89,7 +232,7 @@ fn folder_block(workspace: &Rc<Workspace>, id: u64, scrolling: Scrolling) -> Ele
         .gap(1)
         .child(folder_menu(row, workspace, id))
         .child_when(
-            move || !collapsed.get() && folder_open(shown, id),
+            move || !collapsed.get() && open_now(shown),
             move || {
                 sessions(
                     &owner,

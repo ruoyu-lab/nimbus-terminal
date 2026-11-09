@@ -32,6 +32,7 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
     let settings_open = workspace.settings_open;
     let (toggle, strip_owner) = (workspace.clone(), workspace.clone());
     let (split_columns, split_rows) = (workspace.clone(), workspace.clone());
+    let (panel_toggle, panel_available) = (workspace.clone(), workspace.clone());
     row()
         .window_drag_area(true) // 按住空白处拖动窗口，双击按系统设置缩放
         .height(move || px(title_bar_info().height.max(BAR_HEIGHT)))
@@ -86,6 +87,17 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
                             .tooltip("上下分屏  ⌘⇧D")
                             .on_click(move || rows.split(Axis::Rows)),
                     )
+            },
+        )
+        // 右侧面板的开关：只有当前会话的目标带面板（连到服务器）时才出现，本机永远没有
+        .child_when(
+            move || !settings_open.get() && panel_available.has_panels(),
+            move || {
+                let toggle = panel_toggle.clone();
+                icon_button(Icon::PanelRight, 17.0)
+                    .name("toggle-panel")
+                    .tooltip("显示或隐藏右侧面板")
+                    .on_click(move || toggle.toggle_panel())
             },
         )
         // 系统不留窗口按钮的平台（Windows、Linux）自己画

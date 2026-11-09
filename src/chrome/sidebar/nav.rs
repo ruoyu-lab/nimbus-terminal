@@ -21,7 +21,14 @@ pub(super) fn nav_selected(
     nav_row(collapsed, glyph, label).style_with(&nav_style(), &States::new().selected(is_selected))
 }
 
-fn nav_row(collapsed: Signal<bool>, glyph: Icon, label: &'static str) -> Element {
+/// 名字是运行时才知道的一行（服务器的主机名）
+pub(super) fn nav_named(collapsed: Signal<bool>, glyph: Icon, label: String) -> Element {
+    nav_row(collapsed, glyph, label).style(&nav_style())
+}
+
+fn nav_row(collapsed: Signal<bool>, glyph: Icon, label: impl Into<String>) -> Element {
+    let label: String = label.into();
+    let (tip, shown) = (label.clone(), label);
     row()
         .padding_x(move || if collapsed.get() { 0.0 } else { 10.0 })
         .align(Align::Center)
@@ -33,11 +40,11 @@ fn nav_row(collapsed: Signal<bool>, glyph: Icon, label: &'static str) -> Element
                 Justify::Start
             }
         })
-        .tooltip(label)
+        .tooltip(tip)
         .child(icon(glyph, 17.0))
         .child_when(
             move || !collapsed.get(),
-            move || text(label).grow(1).max_lines(1),
+            move || text(shown.clone()).grow(1).max_lines(1),
         )
 }
 

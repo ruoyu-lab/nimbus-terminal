@@ -23,6 +23,10 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
         workspace.form,
     );
     let status_owner = workspace.clone();
+    let panel_shown = {
+        let workspace = workspace.clone();
+        move || workspace.panel_shown()
+    };
     // 状态条说的是会话（在哪个目标、跑什么、多大）：设置页里没有这些，设置里关掉了也不显示
     let status_shown =
         move || !settings_open.get() && session_open(tabs, active) && form.status_bar.get();
@@ -32,7 +36,8 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
         .grow(1)
         .min_width(0)
         .min_height(0)
-        .margin_right(GUTTER)
+        // 右边有面板时，两张卡片之间的空隙是面板左边那条拖动条，不再另留
+        .margin_right(move || if panel_shown() { 0.0 } else { GUTTER })
         .margin_bottom(GUTTER)
         .radius(10)
         .background(card_bg())
@@ -296,7 +301,17 @@ fn status_bar(workspace: &Rc<Workspace>) -> Element {
         .padding_x(14)
         .align(Align::Center)
         .gap(18)
-        .child(chip(Icon::Laptop).child(text(move || target().label()).name("status-target")))
+        .child(
+            row()
+                .align(Align::Center)
+                .gap(6)
+                .color(text_2())
+                .font_size(12)
+                // 本机是笔记本，服务器是机柜
+                .child_when(move || target().host().is_none(), || icon(Icon::Laptop, 14.0))
+                .child_when(move || target().host().is_some(), || icon(Icon::Server, 14.0))
+                .child(text(move || target().label()).name("status-target")),
+        )
         .child(chip(Icon::Terminal).child(text(move || {
             titles.get().get(&active.get()).cloned().unwrap_or_default()
         })))

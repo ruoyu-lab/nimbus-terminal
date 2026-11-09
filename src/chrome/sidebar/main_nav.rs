@@ -35,6 +35,7 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
         .transition(Property::Background, Tween::new(ms(120)).ease_out())
         .child(section_label(collapsed, "目标"))
         .child(targets::list(workspace, scrolling))
+        .child(targets::remote(workspace, scrolling))
         .child(targets::blank(workspace));
     column()
         .grow(1)

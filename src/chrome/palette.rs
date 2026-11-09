@@ -78,6 +78,25 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
             Rc::new(move || settings.open_settings()),
         ),
     ];
+    if workspace.form.remote.get_untracked() {
+        let connect = workspace.clone();
+        list.push(command(
+            "cmd-connect",
+            "连接到服务器…",
+            "",
+            Rc::new(move || connect.connect_prompt.set(true)),
+        ));
+    }
+    // 只有当前会话的目标带面板（连到服务器）时才有这一条
+    if workspace.has_panels() {
+        let panel = workspace.clone();
+        list.push(command(
+            "cmd-toggle-panel",
+            "显示或隐藏右侧面板",
+            "",
+            Rc::new(move || panel.toggle_panel()),
+        ));
+    }
     let titles = workspace.titles.get_untracked();
     for tab in workspace.tabs.get_untracked() {
         let select = workspace.clone();

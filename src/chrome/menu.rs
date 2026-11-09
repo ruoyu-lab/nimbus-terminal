@@ -351,6 +351,54 @@ pub(super) fn folder_dialog(workspace: Rc<Workspace>) -> Element {
         ))
 }
 
+/// 「连接到服务器」：填一个主机名（`~/.ssh/config` 里的名字，或者 `user@host`），回车就连。
+/// 主机名不能用（空的、以 `-` 开头、带空白）就留在这里，写明原因
+pub(super) fn connect_dialog(workspace: Rc<Workspace>) -> Element {
+    let host = signal(String::new());
+    let error = signal(None::<&'static str>);
+    let prompt = workspace.connect_prompt;
+    pop(column()
+        .name("connect-dialog")
+        .width(380)
+        .radius(10)
+        .background(card_bg())
+        .shadow(popup_shadow())
+        .child(
+            text("连接到服务器")
+                .font_size(12)
+                .color(text_3())
+                .padding_x(16)
+                .margin_top(12),
+        )
+        .child(
+            text_field(host)
+                .name("connect-field")
+                .placeholder("prod-hk 或 user@host")
+                .background(Color::TRANSPARENT)
+                .border(0, Color::TRANSPARENT)
+                .focus_ring(FocusRing::NONE)
+                .font_size(15)
+                .padding_x(16)
+                .padding_y(8)
+                .on_submit(move |value: String| {
+                    if workspace.new_tab_ssh(&value) {
+                        prompt.set(false);
+                    } else {
+                        error.set(Some("主机名不能用：只能是字母、数字和 . _ - @ :，不能以 - 开头"));
+                    }
+                }),
+        )
+        .child(rect().height(1).background(line()))
+        .child(
+            text(move || error.get().unwrap_or("回车连接 · Esc 取消"))
+                .name("connect-hint")
+                .font_size(11)
+                .color(text_3())
+                .padding_x(16)
+                .padding_y(8),
+        ))
+}
+
 /// 关一个前台有程序在跑的标签之前问一下。回车或点「关闭」才关，Esc、点外面、点「取消」都不关
 pub(super) fn close_dialog(workspace: Rc<Workspace>) -> Element {
     let Some(id) = workspace.closing.get_untracked() else {

@@ -73,17 +73,37 @@ pub struct Launch {
     pub shell: Option<String>,
     /// 终端底色是深色
     pub dark_background: bool,
+    /// 服务器会话的连接复用套接字（监控借它）；本机、或者目录不可用时是 `None`
+    pub control: Option<std::path::PathBuf>,
 }
 
-/// 起一个本机会话
+/// 起一个会话：本机是登录 shell，服务器是 `ssh`
 pub fn spawn(launch: &Launch) -> Spawned {
-    let Target::Local = launch.target;
     let (columns, rows) = (launch.columns as u16, launch.rows as u16);
-    let mut config = match &launch.shell {
-        Some(program) => pty::Config::shell(program, columns, rows),
-        None => pty::Config::login_shell(columns, rows),
+    let mut config = match &launch.target {
+        Target::Local => match &launch.shell {
+            Some(program) => pty::Config::shell(program, columns, rows),
+            None => pty::Config::login_shell(columns, rows),
+        },
+        Target::Ssh { host } => {
+            // 界面那边已经验过一次；这里再验一次，主机名绝不能被 `ssh` 当成选项
+            if !crate::ssh::is_valid_host(host) {
+                return Spawned {
+                    pty: None,
+                    queue: None,
+                    error: Some(format!("主机名不能用：{host}")),
+                };
+            }
+            // 套接字目录不可用（权限不对）就不开复用：终端照常连，只是没有监控
+            let control = launch
+                .control
+                .as_deref()
+                .filter(|path| crate::ssh::control_ready(path));
+            crate::ssh::config(host, columns, rows, control)
+        }
     };
-    if let Some(directory) = &launch.directory {
+    // 起始目录只对本机有意思：服务器上没有这个目录
+    if let (Target::Local, Some(directory)) = (&launch.target, &launch.directory) {
         config.working_directory = Some(directory.clone());
     }
     config.dark_background = launch.dark_background;
@@ -138,6 +158,10 @@ pub struct Session {
     remeasure_from: Cell<Option<Rect>>,
     /// 屏幕内容每变一次加一：存终端内容时靠它知道这个会话自上次存以后有没有新输出
     output_version: Cell<u64>,
+    /// 连接断了以后怎么重连（服务器的会话才有）。本机的会话没有：shell 退出了就是退出了
+    reconnect: RefCell<Option<Rc<dyn Fn() -> Spawned>>>,
+    /// 现在没有进程在跑，等用户按回车重连
+    waiting: Cell<bool>,
 }
 
 impl Session {
@@ -170,11 +194,7 @@ impl Session {
         session.apply_scrollback();
         session.flush();
         if let Some(queue) = spawned.queue {
-            // 挂在一个不随界面卸载的作用域上。从文件夹右键菜单里创建时，菜单的作用域马上就释放，
-            // 读任务要是记在菜单上，会被一起取消：shell 已经起来（光标在闪），提示符却永远到不了屏幕
-            let reading = session.clone();
-            let task = session_scope().run(|| aureole::spawn_local(pump(reading, queue)));
-            *session.pump.borrow_mut() = Some(task);
+            session.start_pump(queue);
         }
         session
     }
@@ -210,7 +230,55 @@ impl Session {
             repaint_all: Cell::new(false),
             remeasure_from: Cell::new(None),
             output_version: Cell::new(0),
+            reconnect: RefCell::new(None),
+            waiting: Cell::new(false),
         })
+    }
+
+    /// 让这个会话能在断线后重连：`respawn` 每次返回一个新的连接
+    pub fn set_reconnect(&self, respawn: Rc<dyn Fn() -> Spawned>) {
+        *self.reconnect.borrow_mut() = Some(respawn);
+    }
+
+    /// 不连，先停在「已断开」：重启后恢复的服务器会话是这样的，连不连由用户按回车决定
+    /// （悄悄连上去会在启动时就弹密码、host key 的提示）
+    pub fn wait_for_reconnect(&self, message: &str) {
+        self.terminal
+            .borrow_mut()
+            .feed(format!("\x1b[0m{message}\r\n").as_bytes());
+        self.output_version.set(self.output_version.get() + 1);
+        self.waiting.set(true);
+        self.flush();
+    }
+
+    /// 按回车重连：起一个新的连接接到同一个屏幕上，之前的输出留在上面
+    fn reconnect_now(self: &Rc<Self>) {
+        let Some(respawn) = self.reconnect.borrow().clone() else {
+            return;
+        };
+        let spawned = respawn();
+        self.waiting.set(false);
+        self.terminal.borrow_mut().feed(b"\x1b[0m\r\n");
+        if let Some(error) = &spawned.error {
+            self.terminal
+                .borrow_mut()
+                .feed(format!("起不了会话：{error}\r\n").as_bytes());
+            self.waiting.set(true);
+        }
+        *self.pty.borrow_mut() = spawned.pty;
+        if let Some(queue) = spawned.queue {
+            self.start_pump(queue);
+        }
+        self.output_version.set(self.output_version.get() + 1);
+        self.flush();
+    }
+
+    /// 挂在一个不随界面卸载的作用域上。从文件夹右键菜单里创建时，菜单的作用域马上就释放，
+    /// 读任务要是记在菜单上，会被一起取消：shell 已经起来（光标在闪），提示符却永远到不了屏幕
+    fn start_pump(self: &Rc<Self>, queue: ByteQueue) {
+        let reading = self.clone();
+        let task = session_scope().run(|| aureole::spawn_local(pump(reading, queue)));
+        *self.pump.borrow_mut() = Some(task);
     }
 
     /// 现在画屏幕用的配色和光标
@@ -542,7 +610,14 @@ impl Session {
     }
 
     /// 网格有焦点时的按键。返回 `true` 表示终端收下了（不再往外传）
-    fn key(&self, event: &KeyEvent) -> bool {
+    fn key(self: &Rc<Self>, event: &KeyEvent) -> bool {
+        // 连接断了，等着重连：回车重连，别的键都不往已经没有人听的 pty 里写
+        if self.waiting.get() && self.reconnect.borrow().is_some() {
+            if matches!(event.key, Key::Named(NamedKey::Enter)) {
+                self.reconnect_now();
+            }
+            return true;
+        }
         if is_paste(event) {
             self.paste();
             return true;
@@ -650,9 +725,13 @@ impl Session {
             return;
         }
         if code != 0 {
-            self.terminal
-                .borrow_mut()
-                .feed(format!("\r\n[进程已退出，退出码 {code}]\r\n").as_bytes());
+            let message = if self.reconnect.borrow().is_some() {
+                self.waiting.set(true);
+                format!("\r\n[连接已断开，退出码 {code}。按回车重新连接]\r\n")
+            } else {
+                format!("\r\n[进程已退出，退出码 {code}]\r\n")
+            };
+            self.terminal.borrow_mut().feed(message.as_bytes());
             self.output_version.set(self.output_version.get() + 1);
             self.flush();
         }

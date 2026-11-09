@@ -3017,3 +3017,631 @@ fn tilde_expands_to_the_home_directory_with_either_separator() {
         Some(std::path::PathBuf::from("/tmp"))
     );
 }
+
+fn folder_names(workspace: &Workspace) -> Vec<String> {
+    workspace
+        .folders
+        .get_untracked()
+        .iter()
+        .map(|folder| folder.name.clone())
+        .collect()
+}
+
+/// 按住文件夹上下拖过相邻的文件夹就换位；拖的时候所有文件夹收成一行，松手后各自恢复展开
+#[test]
+fn dragging_a_folder_reorders_it() {
+    let (harness, workspace) = mounted();
+    for name in ["甲", "乙", "丙"] {
+        workspace.create_folder(name);
+    }
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert_eq!(folder_names(&workspace), ["甲", "乙", "丙"]);
+    let first = workspace.folders.get_untracked()[0].id;
+    let [x, y] = harness.bounds(&format!("folder-{first}")).expect("文件夹在").center();
+    harness.mouse_down(x, y, MouseButton::Left);
+    harness.mouse_move(x, y + 20.0);
+    harness.mouse_move(x, y + 64.0);
+    assert!(workspace.folder_drag.get_untracked().is_some(), "拖动开始了");
+    harness.mouse_up(MouseButton::Left);
+    harness.frame();
+    assert_eq!(folder_names(&workspace), ["乙", "丙", "甲"], "向下拖了两格");
+    assert!(workspace.folder_drag.get_untracked().is_none());
+    assert_eq!(harness.window_drag_count(), 0);
+    // 点一下不拖：只是展开收起，顺序不变
+    harness.advance(secs(1.0));
+    let [x, y] = harness.bounds(&format!("folder-{first}")).expect("文件夹在").center();
+    harness.click(x, y);
+    assert_eq!(folder_names(&workspace), ["乙", "丙", "甲"]);
+}
+
+/// 顺序是存下来的：重启后文件夹还是拖过之后的顺序
+#[test]
+fn the_folder_order_survives_a_restart() {
+    let directory = directory("folder-order");
+    let store = Store::at(directory.clone());
+    {
+        let workspace = Workspace::new(Fake::default().spawn(), None, store.clone());
+        for name in ["甲", "乙", "丙"] {
+            workspace.create_folder(name);
+        }
+        let last = workspace.folders.get_untracked()[2].id;
+        workspace.move_folder(last, 0);
+        workspace.save_now();
+    }
+    let workspace = Workspace::new(Fake::default().spawn(), None, store);
+    assert_eq!(folder_names(&workspace), ["丙", "甲", "乙"]);
+    std::fs::remove_dir_all(directory).ok();
+}
+
+/// 把一个标签的目标换成服务器（连接还没做，面板只看目标的声明）
+fn make_remote(workspace: &Workspace, id: u64) {
+    workspace.tabs.update(|tabs| {
+        if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.target = crate::target::Target::Ssh { host: "prod-hk".into() };
+        }
+    });
+}
+
+/// 只用本机的人：没有右侧面板，标题栏上也没有它的开关，命令面板里没有这条命令
+#[test]
+fn local_sessions_have_no_right_panel_at_all() {
+    let (harness, workspace) = mounted();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel").is_none());
+    assert!(harness.bounds("toggle-panel").is_none());
+    assert!(!workspace.has_panels());
+}
+
+/// 连到服务器的会话：面板自己出现，可以收起、拖宽；换回本机的标签它就消失
+#[test]
+fn a_remote_session_shows_the_panel_and_a_local_one_hides_it() {
+    let (harness, workspace) = mounted();
+    workspace.new_tab();
+    make_remote(&workspace, 2);
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel").is_some(), "服务器会话有面板");
+    assert!(harness.bounds("toggle-panel").is_some());
+    assert!(harness.bounds("panel-tab-monitor").is_some() && harness.bounds("panel-tab-files").is_some());
+    // 卡片和面板都在窗口里，互不压住
+    let (card, panel) = (harness.bounds("card").unwrap(), harness.bounds("panel").unwrap());
+    let panel_card = harness.bounds("panel-card").unwrap();
+    assert!(
+        (panel_card.x + panel_card.width - (WINDOW_SIZE.0 as f32 - 8.0)).abs() < 0.5,
+        "面板卡片离窗口右边留 8：{panel_card:?}"
+    );
+    assert!(card.x + card.width <= panel.x + 0.5, "主卡片 {card:?} 不能压到面板 {panel:?}");
+    assert!(panel.x + panel.width <= WINDOW_SIZE.0 as f32 + 0.5);
+    // 换回本机标签
+    workspace.select(1);
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel").is_none(), "本机标签没有面板");
+    // 再切回来，面板又出现（开关几次都没事）
+    workspace.select(2);
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel").is_some());
+    harness.click_named("toggle-panel");
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel").is_none(), "点开关收起");
+    harness.click_named("toggle-panel");
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel").is_some(), "再点展开");
+}
+
+/// 按住面板左边的空隙往左拖，面板变宽；拖不过范围；宽度会存下来
+#[test]
+fn dragging_the_panel_edge_resizes_it_within_limits() {
+    let (harness, workspace) = mounted();
+    make_remote(&workspace, 1);
+    harness.frame();
+    harness.advance(secs(1.0));
+    let before = workspace.panel_width.get_untracked();
+    let [x, y] = harness.bounds("panel-resize").expect("拖动条在").center();
+    harness.mouse_move(x, y);
+    assert_eq!(harness.cursor(), Cursor::ResizeHorizontal);
+    harness.mouse_down(x, y, MouseButton::Left);
+    harness.mouse_move(x - 40.0, y);
+    harness.mouse_up(MouseButton::Left);
+    harness.frame();
+    assert!((workspace.panel_width.get_untracked() - (before + 40.0)).abs() < 1.0, "往左拖 40，宽了 40");
+    harness.mouse_down(x - 40.0, y, MouseButton::Left);
+    harness.mouse_move(x - 900.0, y);
+    harness.mouse_up(MouseButton::Left);
+    assert_eq!(workspace.panel_width.get_untracked(), crate::chrome::PANEL_MAX);
+    assert_eq!(harness.window_drag_count(), 0);
+}
+
+/// 设置里关掉「远程功能」：服务器会话也不显示面板和开关
+#[test]
+fn turning_off_remote_features_hides_the_panel_everywhere() {
+    let (harness, workspace) = mounted();
+    make_remote(&workspace, 1);
+    harness.frame();
+    assert!(harness.bounds("panel").is_some());
+    workspace.form.remote.set(false);
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel").is_none());
+    assert!(harness.bounds("toggle-panel").is_none());
+}
+
+/// 面板宽度重启后还在
+#[test]
+fn the_panel_width_survives_a_restart() {
+    let directory = directory("panel-width");
+    let store = Store::at(directory.clone());
+    {
+        let workspace = Workspace::new(Fake::default().spawn(), None, store.clone());
+        workspace.panel_width.set(400.0);
+        workspace.save_now();
+    }
+    let workspace = Workspace::new(Fake::default().spawn(), None, store);
+    assert_eq!(workspace.panel_width.get_untracked(), 400.0);
+    std::fs::remove_dir_all(directory).ok();
+}
+
+/// 评审右侧面板：`UI_SHOTS=目录 cargo test screenshots_for_panel -- --ignored`
+#[test]
+#[ignore = "出图用，不是检查"]
+fn screenshots_for_panel() {
+    let Ok(directory) = std::env::var("UI_SHOTS") else {
+        return;
+    };
+    let (harness, workspace) = mounted();
+    harness.set_scale_factor(2.0);
+    for name in ["项目", "临时"] {
+        workspace.create_folder(name);
+    }
+    workspace.new_tab();
+    make_remote(&workspace, 2);
+    harness.frame();
+    harness.advance(secs(1.0));
+    harness
+        .screenshot()
+        .save_png(PathBuf::from(directory).join("panel.png"))
+        .expect("存得下 PNG");
+}
+
+// ---- SSH 目标 ----
+
+use crate::target::Target;
+
+fn ssh_host(workspace: &Workspace, id: u64) -> Option<String> {
+    workspace
+        .tabs
+        .get_untracked()
+        .iter()
+        .find(|tab| tab.id == id)
+        .and_then(|tab| tab.target.host().map(str::to_string))
+}
+
+/// 开一个服务器标签：按 ssh 起（没有本机的起始目录），标签叫主机名，右侧面板自己出现
+#[test]
+fn opening_a_server_tab_connects_names_the_tab_and_shows_the_panel() {
+    let (harness, workspace, fake) = blank_with_traffic_lights(Store::none());
+    assert!(workspace.new_tab_ssh("  prod-hk "));
+    harness.frame();
+    harness.advance(secs(1.0));
+    let launch = fake.launch(0);
+    assert_eq!(launch.target, Target::Ssh { host: "prod-hk".into() });
+    assert_eq!(launch.directory, None, "服务器上没有本机的目录");
+    assert_eq!(workspace.titles.get_untracked().get(&1).map(String::as_str), Some("prod-hk"));
+    assert_eq!(harness.text("status-target").as_deref(), Some("prod-hk"));
+    assert!(harness.bounds("panel").is_some(), "连到服务器的会话有面板");
+    // 本机标签不受影响
+    workspace.new_tab();
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert_eq!(fake.launch(1).target, Target::Local);
+    assert!(harness.bounds("panel").is_none());
+}
+
+/// 主机名不能被 ssh 当成选项：不开标签，也不起任何进程
+#[test]
+fn a_host_that_looks_like_an_option_is_refused() {
+    let (_harness, workspace, fake) = blank_with_traffic_lights(Store::none());
+    for host in ["-oProxyCommand=x", "", "a b", "a;b", "$(id)"] {
+        assert!(!workspace.new_tab_ssh(host), "{host:?}");
+    }
+    assert!(ids(&workspace).is_empty());
+    assert!(fake.launches.borrow().is_empty());
+}
+
+/// 侧栏的「远程」：没有服务器时不存在；有了才出现；点主机连上去，再点就切过去不重复开
+#[test]
+fn the_remote_group_appears_only_when_there_are_servers() {
+    let (harness, workspace) = mounted();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("remote").is_none(), "没有服务器就没有「远程」");
+    workspace.add_config_hosts(vec!["prod-hk".into(), "staging".into(), "prod-hk".into()]);
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("remote").is_some());
+    assert_eq!(workspace.hosts.get_untracked(), ["prod-hk", "staging"], "去重");
+    harness.click_named("host-prod-hk");
+    harness.advance(secs(1.0));
+    assert_eq!(ssh_host(&workspace, 2).as_deref(), Some("prod-hk"));
+    workspace.select(1);
+    harness.click_named("host-prod-hk");
+    harness.advance(secs(1.0));
+    assert_eq!(ids(&workspace), [1, 2], "已经有会话就切过去，不重复开");
+    assert_eq!(workspace.active.get_untracked(), 2);
+    // 设置里关了「远程功能」：整组消失
+    workspace.form.remote.set(false);
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("remote").is_none());
+}
+
+/// 服务器会话断线（ssh 非 0 退出）：写明原因，等回车重连；回车之后用同一个主机再起一次，别的键不往死连接里写
+#[test]
+fn a_dropped_connection_waits_for_enter_and_reconnects() {
+    let (harness, workspace, fake) = blank_with_traffic_lights(Store::none());
+    workspace.new_tab_ssh("prod-hk");
+    harness.frame();
+    let session = workspace.tabs.get_untracked()[0].session();
+    session.exited_for_test(255);
+    harness.frame();
+    assert!(
+        session.screen_text_for_test().replace('\0', "").contains("连接已断开，退出码 255")
+    );
+    assert_eq!(ids(&workspace), [1], "断线不关标签");
+    harness.type_text("ls");
+    assert_eq!(fake.pty(0).take(), "", "没有人听的连接里不写字");
+    assert_eq!(fake.launches.borrow().len(), 1);
+    harness.key_down(NamedKey::Enter);
+    harness.frame();
+    assert_eq!(fake.launches.borrow().len(), 2, "回车重连");
+    assert_eq!(fake.launch(1).target, Target::Ssh { host: "prod-hk".into() });
+    // 重连之后又能打字了，写进新的连接
+    harness.type_text("ls");
+    assert_eq!(fake.pty(1).take(), "ls");
+}
+
+/// 服务器上正常退出（`exit`）标签关掉；本机的会话出错退出不提示重连
+#[test]
+fn a_clean_exit_closes_a_server_tab_and_local_failures_do_not_offer_reconnect() {
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.new_tab_ssh("prod-hk");
+    workspace.new_tab();
+    harness.frame();
+    let tabs = workspace.tabs.get_untracked();
+    tabs[1].session().exited_for_test(3);
+    assert!(
+        !tabs[1].session().screen_text_for_test().replace('\0', "").contains("重新连接")
+    );
+    tabs[0].session().exited_for_test(0);
+    harness.frame();
+    assert_eq!(ids(&workspace), [2]);
+}
+
+/// 重启后服务器的标签回来，但不自己连（不在启动时弹密码、host key 的提示）：停在「已断开」，按回车才连；
+/// 手动连过的主机也记住了，`~/.ssh/config` 里的不存
+#[test]
+fn server_tabs_come_back_disconnected_and_wait_for_enter() {
+    let root = directory("ssh-restore");
+    let store = Store::at(root.join("config"));
+    {
+        let (_harness, workspace, _fake) = blank_with_traffic_lights(store.clone());
+        workspace.new_tab_ssh("prod-hk");
+        workspace.new_tab();
+        workspace.add_config_hosts(vec!["from-config".into()]);
+        workspace.save_now();
+    }
+    let (harness, workspace, fake) = blank_with_traffic_lights(store);
+    assert_eq!(workspace.hosts.get_untracked(), ["prod-hk"], "只有手动连过的存下来了");
+    assert_eq!(workspace.restore(), 2);
+    harness.frame();
+    assert_eq!(ssh_host(&workspace, 1).as_deref(), Some("prod-hk"));
+    assert_eq!(fake.launches.borrow().len(), 1, "只有本机的标签起了进程，服务器的没连");
+    assert_eq!(fake.launch(0).target, Target::Local);
+    workspace.select(1);
+    harness.frame();
+    let session = workspace.tabs.get_untracked()[0].session();
+    assert!(
+        session.screen_text_for_test().replace('\0', "").contains("已断开 prod-hk")
+    );
+    harness.key_down(NamedKey::Enter);
+    harness.frame();
+    assert_eq!(fake.launches.borrow().len(), 2);
+    assert_eq!(fake.launch(1).target, Target::Ssh { host: "prod-hk".into() });
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// 命令面板里「连接到服务器…」：开输入框，填不能用的名字留在原地并写明原因，填对了就连
+#[test]
+fn the_connect_dialog_refuses_bad_names_and_connects_good_ones() {
+    let (harness, workspace) = mounted();
+    workspace.connect_prompt.set(true);
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert_eq!(harness.focused_name().as_deref(), Some("connect-field"));
+    harness.type_text("-oProxyCommand=x");
+    harness.key_down(NamedKey::Enter);
+    harness.advance(secs(1.0));
+    assert!(workspace.connect_prompt.get_untracked(), "名字不能用，框还开着");
+    assert!(harness.text("connect-hint").unwrap_or_default().contains("不能用"));
+    assert_eq!(ids(&workspace), [1]);
+    harness.key_down_with(Key::Character("a".into()), Modifiers::SUPER);
+    harness.type_text("prod-hk");
+    harness.key_down(NamedKey::Enter);
+    harness.advance(secs(1.0));
+    assert!(!workspace.connect_prompt.get_untracked());
+    assert_eq!(ssh_host(&workspace, 2).as_deref(), Some("prod-hk"));
+}
+
+/// 评审服务器相关界面：`UI_SHOTS=目录 cargo test screenshots_for_remote -- --ignored`
+#[test]
+#[ignore = "出图用，不是检查"]
+fn screenshots_for_remote() {
+    let Ok(directory) = std::env::var("UI_SHOTS") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    harness.set_scale_factor(2.0);
+    workspace.new_tab();
+    workspace.add_config_hosts(vec!["prod-hk".into(), "staging".into()]);
+    workspace.new_tab_ssh("prod-hk");
+    harness.frame();
+    harness.advance(secs(1.0));
+    harness.screenshot().save_png(directory.join("remote.png")).expect("存得下 PNG");
+    workspace.connect_prompt.set(true);
+    harness.advance(secs(1.0));
+    harness.screenshot().save_png(directory.join("connect.png")).expect("存得下 PNG");
+}
+
+// ---- 监控 ----
+
+use crate::monitor::{CpuTimes, Failure, Reading, Status};
+
+fn reading(busy: u64, total: u64) -> Reading {
+    Reading {
+        cpu: CpuTimes { busy, total },
+        mem_total: 16_384_000,
+        mem_available: 8_192_000,
+        disk_total: 102_400_000,
+        disk_used: 40_960_000,
+        load: [0.52, 0.61, 0.7],
+        uptime: 273_600,
+    }
+}
+
+/// 本机标签没有监控的对象；服务器标签有（带复用套接字，监控借终端的连接）
+#[test]
+fn only_server_tabs_have_something_to_monitor() {
+    let (_harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.new_tab();
+    assert_eq!(workspace.monitor_plan(), None);
+    workspace.new_tab_ssh("prod-hk");
+    let (tab, host, control) = workspace.monitor_plan().expect("服务器标签要监控");
+    assert_eq!((tab, host.as_str()), (2, "prod-hk"));
+    assert!(control.to_string_lossy().contains("nimbus-"), "{control:?}");
+}
+
+/// 服务器标签的 ssh 带复用选项（终端当主连接）；拆出来的终端和本机的都不带，不抢主连接
+#[test]
+fn only_the_first_terminal_of_a_server_tab_owns_the_control_socket() {
+    let (_harness, workspace, fake) = blank_with_traffic_lights(Store::none());
+    workspace.new_tab_ssh("prod-hk");
+    workspace.split(Axis::Columns);
+    workspace.new_tab();
+    assert!(fake.launch(0).control.is_some(), "第一个终端是主连接");
+    assert_eq!(fake.launch(1).control, None, "拆出来的各连各的");
+    assert_eq!(fake.launch(2).control, None, "本机没有");
+}
+
+/// 读数进来，监控页上就有了：运行时间、内存、磁盘、负载；第二次读数才有 CPU
+#[test]
+fn readings_show_up_on_the_monitor_page() {
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.polling.set(true); // 不让页面挂上时真的去取数：这里只测读数怎么显示
+    workspace.new_tab_ssh("prod-hk");
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("monitor").is_some(), "服务器标签的面板默认是监控页");
+    assert_eq!(harness.text("monitor-status").as_deref(), Some("正在读取…"));
+    workspace.apply_reading(1, Ok(reading(0, 100)));
+    workspace.apply_reading(1, Ok(reading(50, 200)));
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert_eq!(harness.text("monitor-status").as_deref(), Some("运行了 3 天 4 小时"));
+    assert!(harness.bounds("monitor-memory-bar").is_some() && harness.bounds("monitor-disk-bar").is_some());
+    assert!(harness.bounds("monitor-cpu-line").is_some());
+    let page = harness.element_tree().to_string();
+    for expected in ["50%", "15.6 GB / 7.8 GB".replace("15.6 GB / 7.8 GB", "7.8 GB / 15.6 GB").as_str(), "0.52  0.61  0.70"] {
+        assert!(page.contains(expected), "监控页上要有 {expected}：{page}");
+    }
+}
+
+/// 失败时写明原因，数字留着；断线、不支持各有各的说法
+#[test]
+fn failures_are_explained_on_the_page() {
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.polling.set(true);
+    workspace.new_tab_ssh("prod-hk");
+    workspace.apply_reading(1, Ok(reading(0, 100)));
+    for (failure, expected) in [
+        (Failure::NotConnected, "未连接"),
+        (Failure::Unsupported, "暂不支持监控"),
+        (Failure::Failed("超时".into()), "读取失败：超时"),
+    ] {
+        workspace.apply_reading(1, Err(failure));
+        harness.frame();
+        harness.advance(secs(1.0));
+        assert!(harness.text("monitor-status").unwrap_or_default().contains(expected), "{expected}");
+    }
+    assert!(workspace.monitors.get_untracked()[&1].latest.is_some(), "最后的数字还在");
+    assert_eq!(workspace.monitors.get_untracked()[&1].status, Status::Failed("超时".into()));
+}
+
+/// 标签关了，它的监控数据跟着清掉；已经关了的标签迟到的读数丢掉
+#[test]
+fn closing_a_tab_drops_its_monitor_data() {
+    let (_harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.new_tab_ssh("prod-hk");
+    workspace.new_tab();
+    workspace.apply_reading(1, Ok(reading(0, 100)));
+    assert!(workspace.monitors.get_untracked().contains_key(&1));
+    workspace.close_tab(1);
+    assert!(workspace.monitors.get_untracked().is_empty());
+    workspace.apply_reading(1, Ok(reading(1, 200)));
+    assert!(workspace.monitors.get_untracked().is_empty(), "关了的标签不收读数");
+}
+
+/// 真的走一遍取数：后台线程里借套接字跑 ssh，套接字不在（测试里没有真连接）就是「未连接」，
+/// 结果回到主线程写进状态；取数没回来之前不叠着发
+#[test]
+fn polling_runs_in_the_background_and_reports_not_connected_without_a_connection() {
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.new_tab_ssh("prod-hk");
+    workspace.poll_monitor();
+    workspace.poll_monitor();
+    for _ in 0..50 {
+        harness.advance(ms(50));
+        if workspace.monitors.get_untracked().contains_key(&1) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(workspace.monitors.get_untracked()[&1].status, Status::NotConnected);
+    // 本机标签：什么也不发，也不会卡在「取数中」
+    workspace.new_tab();
+    workspace.poll_monitor();
+    workspace.poll_monitor();
+    assert!(workspace.monitors.get_untracked().get(&2).is_none());
+}
+
+/// 设置里关了远程功能：不取数
+#[test]
+fn nothing_is_polled_when_remote_features_are_off() {
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.form.remote.set(false);
+    workspace.new_tab_ssh("prod-hk");
+    workspace.poll_monitor();
+    for _ in 0..5 {
+        harness.advance(ms(50));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(workspace.monitors.get_untracked().is_empty());
+}
+
+/// 评审监控页：`UI_SHOTS=目录 cargo test screenshots_for_monitor -- --ignored`
+#[test]
+#[ignore = "出图用，不是检查"]
+fn screenshots_for_monitor() {
+    let Ok(directory) = std::env::var("UI_SHOTS") else {
+        return;
+    };
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    harness.set_scale_factor(2.0);
+    workspace.polling.set(true);
+    workspace.new_tab_ssh("prod-hk");
+    let (mut busy, mut total) = (0u64, 0u64);
+    for step in 0..60u64 {
+        total += 200;
+        busy += (60.0 + 35.0 * (step as f64 * 0.35).sin()) as u64 * 2;
+        workspace.apply_reading(1, Ok(reading(busy, total)));
+        if step == 7 {
+            // 刚连上不久：只有几个采样
+            harness.frame();
+            harness.advance(secs(1.0));
+            harness
+                .screenshot()
+                .save_png(PathBuf::from(&directory).join("monitor-short.png"))
+                .expect("存得下 PNG");
+        }
+    }
+    harness.frame();
+    harness.advance(secs(1.0));
+    harness.screenshot().save_png(PathBuf::from(directory).join("monitor.png")).expect("存得下 PNG");
+}
+
+/// 取数在途的时候监控页卸掉了（关了标签、收起面板、换页）：任务不能跟着被取消，
+/// 否则「取数中」的标记永远是真，重新打开以后一直停在「正在读取」
+#[test]
+fn a_poll_in_flight_survives_the_monitor_page_unmounting() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    // 一个卡住的取数（真的 ssh 要几秒）：放行之前不返回
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    *workspace.fetch.borrow_mut() = Arc::new(move |_, _| {
+        while !gate.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err(Failure::NotConnected)
+    });
+    workspace.new_tab_ssh("prod-hk");
+    for _ in 0..5 {
+        harness.frame();
+        if workspace.polling.get() {
+            break;
+        }
+    }
+    assert!(workspace.polling.get(), "页面一挂上就取了，还没回来");
+    workspace.toggle_panel();
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("monitor").is_none(), "页面卸掉了");
+    release.store(true, Ordering::Release);
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        harness.advance(ms(50));
+        if !workspace.polling.get() {
+            break;
+        }
+    }
+    assert!(!workspace.polling.get(), "页面卸掉以后任务也要跑完，不能一直占着「取数中」");
+    assert_eq!(workspace.monitors.get_untracked()[&1].status, Status::NotConnected);
+    // 再打开：又能取了，数据能进来
+    *workspace.fetch.borrow_mut() = Arc::new(|_, _| Err(Failure::Unsupported));
+    workspace.toggle_panel();
+    for _ in 0..100 {
+        harness.advance(ms(50));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if workspace.monitors.get_untracked()[&1].status == Status::Unsupported {
+            break;
+        }
+    }
+    assert_eq!(workspace.monitors.get_untracked()[&1].status, Status::Unsupported);
+}
+
+/// 面板展开、收起有动画：展开时宽度逐渐变大（不是一下子到位），收起时面板还在一会儿再消失；拖宽度仍然跟手
+#[test]
+fn the_panel_animates_open_and_closed() {
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.polling.set(true); // 这里不测取数
+    workspace.new_tab_ssh("prod-hk");
+    harness.frame();
+    harness.advance(secs(1.0));
+    let target = workspace.panel_width.get_untracked();
+    let width = |harness: &Harness| harness.bounds("panel").map(|panel| panel.width);
+    assert_eq!(width(&harness), Some(target), "展开完是目标宽度");
+    // 收起：马上还在，慢慢变窄，最后没了
+    workspace.toggle_panel();
+    harness.frame();
+    harness.advance(ms(40));
+    let closing = width(&harness).expect("退场动画期间面板还在");
+    assert!(closing > 0.0 && closing < target, "收起中：{closing}（目标 {target}）");
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel").is_none(), "收完就卸掉了");
+    // 展开：从窄变宽
+    workspace.toggle_panel();
+    harness.frame();
+    harness.advance(ms(40));
+    let opening = width(&harness).expect("面板挂上了");
+    assert!(opening < target, "展开中：{opening}（目标 {target}）");
+    harness.advance(secs(1.0));
+    assert_eq!(width(&harness), Some(target));
+    // 拖宽度不走弹簧：宽度一变马上就是新宽度
+    let [x, y] = harness.bounds("panel-resize").expect("拖动条在").center();
+    harness.mouse_down(x, y, MouseButton::Left);
+    harness.mouse_move(x - 50.0, y);
+    harness.mouse_up(MouseButton::Left);
+    harness.frame();
+    assert_eq!(width(&harness), Some(target + 50.0), "拖的时候跟手，没有动画拖着");
+}

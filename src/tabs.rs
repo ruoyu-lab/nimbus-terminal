@@ -11,6 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use aureole::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,8 @@ use crate::settings::{
     Form, LastTab, Settings, ShellKind, SidebarStart, Startup, ThemeChoice, TitleSource,
 };
 use crate::store::Store;
-use crate::target::Target;
+use crate::monitor::{self, Monitor};
+use crate::target::{PanelKind, Target};
 use crate::{chrome, view};
 
 /// 打开窗口时的内容区大小
@@ -83,6 +85,9 @@ impl SettingsPage {
 /// 起一个会话：怎么起（连到哪、多少列行、哪个目录、哪个 shell）
 pub type SpawnFn = Rc<dyn Fn(&Launch) -> Spawned>;
 
+/// 取一次监控数据：主机、复用套接字 → 脚本的输出。在后台线程里调
+type Fetch = Arc<dyn Fn(&str, &Path) -> Result<String, monitor::Failure> + Send + Sync>;
+
 /// 一个标签
 #[derive(Clone)]
 pub struct Tab {
@@ -92,6 +97,8 @@ pub struct Tab {
     /// 聚焦的是哪个终端（排布里叶子的编号）：键盘打字、状态条、存目录都看它
     pub focus: Signal<u64>,
     pub target: Target,
+    /// 服务器标签的连接复用套接字：第一个终端的 `ssh` 是主连接，监控借它。本机标签没有
+    pub control: Option<PathBuf>,
     /// 归在哪个文件夹下面；没有就是直接列在「目标」下
     pub folder: Option<u64>,
 }
@@ -127,6 +134,18 @@ pub struct TabDrag {
     pub to: usize,
 }
 
+/// 拖着的文件夹：拖的过程中顺序不变，别的文件夹只靠平移让位，松手才真的换顺序（和标签一样）
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FolderDrag {
+    pub id: u64,
+    pub from: usize,
+    pub to: usize,
+}
+
+/// 拖文件夹时带的数据。单独一个类型：窗口里接标签的放置目标收的是 `u64`，不能把文件夹当成标签放下
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FolderId(pub u64);
+
 /// 侧栏「目标」里的一个文件夹
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Folder {
@@ -151,9 +170,12 @@ pub enum FolderPrompt {
 struct Saved {
     folders: Vec<SavedFolder>,
     tabs: Vec<SavedTab>,
+    /// 手动连过的服务器（`~/.ssh/config` 里的不用存，每次启动重新读）
+    hosts: Vec<String>,
     /// 当前标签是 `tabs` 里的第几个
     active: Option<usize>,
     sidebar_width: Option<f32>,
+    panel_width: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -167,6 +189,8 @@ struct SavedFolder {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SavedTab {
     folder: Option<u64>,
+    /// 服务器的主机名；本机的标签是 `None`
+    host: Option<String>,
     /// 用户给起的名字；没起过就是 `None`
     title: Option<String>,
     /// 关掉时聚焦的那个终端的目录（没有 `layout` 的旧文件用它）
@@ -233,8 +257,22 @@ pub struct Workspace {
     pub tabs: Signal<Vec<Tab>>,
     /// 「目标」下面的文件夹，按创建的先后
     pub folders: Signal<Vec<Folder>>,
+    /// 侧栏「远程」里列的服务器：`~/.ssh/config` 里的，加上手动连过的
+    pub hosts: Signal<Vec<String>>,
+    /// 手动连过的那部分（要存下来）
+    manual_hosts: RefCell<Vec<String>>,
+    /// 「连接到服务器」的输入框开着没有
+    pub connect_prompt: Signal<bool>,
+    /// 每个服务器标签的监控数据（只有看着监控页的标签才会更新）
+    pub monitors: Signal<HashMap<u64, Monitor>>,
+    /// 有一次取数还没回来：不叠着发
+    polling: Cell<bool>,
+    /// 怎么取数（后台线程里调）：平时借 ssh 连接跑脚本，测试里换成可控的
+    fetch: RefCell<Fetch>,
     /// 文件夹命名框：新建，或者在改哪一个
     pub folder_prompt: Signal<Option<FolderPrompt>>,
+    /// 正在拖着的文件夹；没拖时是 `None`
+    pub folder_drag: Signal<Option<FolderDrag>>,
     /// 顶部标签条里的顺序（会话的 id）：拖动只改它，和侧栏的顺序无关
     pub bar: Signal<Vec<u64>>,
     /// 正在拖着的标签；没拖时是 `None`
@@ -250,6 +288,10 @@ pub struct Workspace {
     pub collapsed: Signal<bool>,
     /// 侧栏展开时的宽度，拖交界处改它
     pub sidebar_width: Signal<f32>,
+    /// 右侧面板：用户有没有把它收起来、多宽、停在哪一页。有没有面板可显示由当前会话的目标决定
+    pub panel_open: Signal<bool>,
+    pub panel_width: Signal<f32>,
+    pub panel_tab: Signal<PanelKind>,
     pub palette_open: Signal<bool>,
     /// 设置页开着：卡片里是设置，顶上的标签条收起，侧栏换成设置的分类
     pub settings_open: Signal<bool>,
@@ -319,10 +361,21 @@ impl Workspace {
             .sidebar_width
             .unwrap_or(chrome::SIDEBAR_DEFAULT)
             .clamp(chrome::SIDEBAR_MIN, chrome::SIDEBAR_MAX);
+        let panel_width = saved
+            .panel_width
+            .unwrap_or(chrome::PANEL_DEFAULT)
+            .clamp(chrome::PANEL_MIN, chrome::PANEL_MAX);
         let workspace = Rc::new_cyclic(|this| Self {
             tabs: signal(Vec::new()),
             folders: signal(folders),
+            hosts: signal(saved.hosts.clone()),
+            manual_hosts: RefCell::new(saved.hosts.clone()),
+            connect_prompt: signal(false),
+            monitors: signal(HashMap::new()),
+            polling: Cell::new(false),
+            fetch: RefCell::new(Arc::new(crate::ssh::poll)),
             folder_prompt: signal(None),
+            folder_drag: signal(None),
             bar: signal(Vec::new()),
             tab_drag: signal(None),
             titles: signal(HashMap::new()),
@@ -331,6 +384,9 @@ impl Workspace {
             size: signal(size),
             collapsed: signal(settings.sidebar == SidebarStart::Closed),
             sidebar_width: signal(sidebar_width),
+            panel_open: signal(true),
+            panel_width: signal(panel_width),
+            panel_tab: signal(PanelKind::Monitor),
             palette_open: signal(false),
             settings_open: signal(false),
             settings_page: signal(SettingsPage::General),
@@ -410,13 +466,15 @@ impl Workspace {
             return;
         }
         let this = self.this.clone();
-        let (folders, tabs, bar, titles, active, width) = (
+        let (folders, tabs, bar, titles, active, width, panel_width, hosts) = (
             self.folders,
             self.tabs,
             self.bar,
             self.titles,
             self.active,
             self.sidebar_width,
+            self.panel_width,
+            self.hosts,
         );
         Effect::new(move || {
             let _ = (
@@ -426,6 +484,8 @@ impl Workspace {
                 titles.get(),
                 active.get(),
                 width.get(),
+                panel_width.get(),
+                hosts.get(),
             );
             if let Some(workspace) = this.upgrade() {
                 workspace.save_soon();
@@ -480,6 +540,7 @@ impl Workspace {
             .collect();
         let active = self.active.get_untracked();
         Saved {
+            hosts: self.manual_hosts.borrow().clone(),
             folders: self
                 .folders
                 .get_untracked()
@@ -498,6 +559,7 @@ impl Workspace {
                     let focus = tab.focus.get_untracked();
                     SavedTab {
                         folder: tab.folder,
+                        host: tab.target.host().map(str::to_string),
                         title: customs.get(&tab.id).cloned(),
                         directory: tab.session().working_directory(),
                         focus: layout.leaves().iter().position(|(id, _)| *id == focus),
@@ -507,6 +569,7 @@ impl Workspace {
                 .collect(),
             active: ordered.iter().position(|tab| tab.id == active),
             sidebar_width: Some(self.sidebar_width.get_untracked()),
+            panel_width: Some(self.panel_width.get_untracked()),
         }
     }
 
@@ -586,12 +649,30 @@ impl Workspace {
             let layout = tab.layout.clone().unwrap_or(SavedPane::Pane {
                 directory: tab.directory.clone(),
             });
-            let pane = self.build_pane(tab_id, folder, &layout, keep_output, &mut flat);
+            let target = tab
+                .host
+                .as_deref()
+                .and_then(crate::ssh::normalize)
+                .map_or(Target::Local, |host| Target::Ssh { host });
+            if let Some(host) = target.host() {
+                self.remember_host(host);
+            }
+            let mut control = target.host().and_then(|_| crate::ssh::control_path(tab_id));
+            let pane = self.build_pane(
+                tab_id,
+                folder,
+                &target,
+                &mut control,
+                &layout,
+                keep_output,
+                &mut flat,
+            );
             let focus = tab
                 .focus
                 .and_then(|index| pane.leaves().get(index).map(|(id, _)| *id))
                 .unwrap_or_else(|| pane.first_id());
-            self.push_tab(tab_id, folder, pane, focus);
+            let control = target.host().and_then(|_| crate::ssh::control_path(tab_id));
+            self.push_tab(tab_id, folder, target, control, pane, focus);
             if let Some(title) = &tab.title {
                 self.rename_tab(tab_id, title);
             }
@@ -613,6 +694,8 @@ impl Workspace {
         &self,
         tab: u64,
         folder: Option<u64>,
+        target: &Target,
+        control: &mut Option<PathBuf>,
         saved: &SavedPane,
         keep_output: bool,
         flat: &mut usize,
@@ -623,7 +706,16 @@ impl Workspace {
                     .then(|| self.store.load_text(&output_file(*flat)))
                     .flatten();
                 *flat += 1;
-                let (id, session) = self.spawn_pane(tab, folder, directory.clone(), history);
+                // 复用套接字只给第一个终端：它当主连接，拆出来的各连各的
+                let (id, session) = self.spawn_pane(
+                    tab,
+                    folder,
+                    target,
+                    control.take(),
+                    directory.clone(),
+                    history,
+                    true,
+                );
                 Pane::leaf(id, session)
             }
             SavedPane::Split {
@@ -632,8 +724,8 @@ impl Workspace {
                 first,
                 second,
             } => {
-                let first = self.build_pane(tab, folder, first, keep_output, flat);
-                let second = self.build_pane(tab, folder, second, keep_output, flat);
+                let first = self.build_pane(tab, folder, target, control, first, keep_output, flat);
+                let second = self.build_pane(tab, folder, target, control, second, keep_output, flat);
                 Pane::split_node(
                     *axis,
                     ratio.clamp(crate::pane::RATIO_RANGE.0, crate::pane::RATIO_RANGE.1),
@@ -654,20 +746,20 @@ impl Workspace {
             .iter()
             .find(|tab| tab.id == self.active.get_untracked())
             .and_then(|tab| tab.folder);
-        let id = self.open(folder, None, None);
+        let id = self.open(folder, Target::Local, None, None);
         self.activate(id);
     }
 
     /// 新开一个不归任何文件夹的终端（直接列在「目标」下），用设置里的起始目录
     pub fn new_tab_loose(&self) {
-        let id = self.open(None, None, None);
+        let id = self.open(None, Target::Local, None, None);
         self.activate(id);
     }
 
     /// 在这个文件夹里新开一个本机终端，并把它展开。文件夹有目录就从那个目录起
     pub fn new_tab_in(&self, folder: u64) {
         self.reveal_folder(folder);
-        let id = self.open(Some(folder), None, None);
+        let id = self.open(Some(folder), Target::Local, None, None);
         self.activate(id);
     }
 
@@ -853,36 +945,98 @@ impl Workspace {
     fn open(
         &self,
         folder: Option<u64>,
+        target: Target,
         directory: Option<PathBuf>,
         history: Option<String>,
     ) -> u64 {
         let id = self.new_id();
-        let (pane, session) = self.spawn_pane(id, folder, directory, history);
-        self.push_tab(id, folder, Pane::leaf(pane, session), pane);
+        let control = target.host().and_then(|_| crate::ssh::control_path(id));
+        let (pane, session) = self.spawn_pane(
+            id,
+            folder,
+            &target,
+            control.clone(),
+            directory,
+            history,
+            false,
+        );
+        self.push_tab(id, folder, target, control, Pane::leaf(pane, session), pane);
         id
     }
 
+    /// 新开一个连到服务器的标签并切过去。主机名不能用（空的、以 `-` 开头、带空白……）时什么也不做，返回 `false`。
+    /// 手动连过的主机记下来，下次启动还在侧栏的「远程」里
+    pub fn new_tab_ssh(&self, host: &str) -> bool {
+        let Some(host) = crate::ssh::normalize(host) else {
+            return false;
+        };
+        self.remember_host(&host);
+        let id = self.open(None, Target::Ssh { host }, None, None);
+        self.activate(id);
+        true
+    }
+
+    fn remember_host(&self, host: &str) {
+        if self.hosts.get_untracked().iter().any(|known| known == host) {
+            return;
+        }
+        self.manual_hosts.borrow_mut().push(host.to_string());
+        self.hosts.update(|hosts| hosts.push(host.to_string()));
+    }
+
+    /// 把 `~/.ssh/config` 里读到的主机并进侧栏的「远程」（和手动连过的合在一起，去重）
+    pub fn add_config_hosts(&self, found: Vec<String>) {
+        self.hosts.update(|hosts| {
+            for host in found {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+        });
+    }
+
     /// 起一个终端（会话），它属于标签 `tab`。返回它在标签里的编号和会话
+    ///
+    /// `waiting` 为真时服务器的会话不连，停在「已断开，按回车连接」（重启后恢复的）
     fn spawn_pane(
         &self,
         tab: u64,
         folder: Option<u64>,
+        target: &Target,
+        control: Option<PathBuf>,
         directory: Option<PathBuf>,
         history: Option<String>,
+        waiting: bool,
     ) -> (u64, Rc<Session>) {
         let (columns, rows) = self.size.get_untracked();
         let shell = (self.form.shell.get_untracked() == ShellKind::Program)
             .then(|| self.form.shell_program.get_untracked().trim().to_string())
             .filter(|program| !program.is_empty());
         let launch = Launch {
-            target: Target::Local,
+            target: target.clone(),
             columns,
             rows,
-            directory: self.start_directory(folder, directory),
+            // 起始目录只对本机有意思
+            directory: match target {
+                Target::Local => self.start_directory(folder, directory),
+                Target::Ssh { .. } => None,
+            },
             shell,
             dark_background: crate::theme::dark().get_untracked(),
+            control,
         };
-        let spawned = (self.spawn)(&launch);
+        let remote = target.host().is_some();
+        let restoring = remote && waiting;
+        let spawned = if restoring {
+            // 恢复的服务器会话先不连
+            Spawned {
+                pty: None,
+                queue: None,
+                error: None,
+            }
+        } else {
+            (self.spawn)(&launch)
+        };
         let pane = self.next_pane.get();
         self.next_pane.set(pane + 1);
         let (for_title, for_size, for_exit, for_activity) = (
@@ -921,12 +1075,34 @@ impl Workspace {
             }),
         };
         let session = Session::start(spawned, columns, rows, hooks, self.form, history.as_deref());
+        if remote {
+            // 断线后按回车重连：用当时的大小再起一次 `ssh`
+            let (spawn, this) = (self.spawn.clone(), self.this.clone());
+            session.set_reconnect(Rc::new(move || {
+                let mut launch = launch.clone();
+                if let Some(workspace) = this.upgrade() {
+                    (launch.columns, launch.rows) = workspace.size.get_untracked();
+                }
+                spawn(&launch)
+            }));
+            if restoring {
+                let host = target.host().unwrap_or_default();
+                session.wait_for_reconnect(&format!("[已断开 {host}。按回车连接]"));
+            }
+        }
         (pane, session)
     }
 
     /// 把排布放进新的标签：进标签条和侧栏的末尾
-    fn push_tab(&self, id: u64, folder: Option<u64>, layout: Pane, focus: u64) {
-        self.refresh_title(id);
+    fn push_tab(
+        &self,
+        id: u64,
+        folder: Option<u64>,
+        target: Target,
+        control: Option<PathBuf>,
+        layout: Pane,
+        focus: u64,
+    ) {
         // 信号放在不挂界面的作用域里：标签是在点击、快捷键、命令面板的处理器里开的，
         // 记在它们的作用域上，一会儿就释放了
         let (layout, focus) = aureole::detached(|| (signal(layout), signal(focus)));
@@ -935,11 +1111,14 @@ impl Workspace {
                 id,
                 layout,
                 focus,
-                target: Target::Local,
+                target,
+                control,
                 folder,
             })
         });
         self.bar.update(|bar| bar.push(id));
+        // 标题要在标签进了列表之后才算：服务器的会话默认叫主机名，得先找得到它的目标
+        self.refresh_title(id);
     }
 
     // ---- 拆分 ----
@@ -959,7 +1138,9 @@ impl Workspace {
             return;
         };
         let directory = tab.session().working_directory();
-        let (pane, session) = self.spawn_pane(tab.id, tab.folder, directory, None);
+        // 拆出来的终端各连各的，不抢主连接
+        let (pane, session) =
+            self.spawn_pane(tab.id, tab.folder, &tab.target, None, directory, None, false);
         let layout = tab.layout.get_untracked();
         tab.layout
             .set(layout.split(tab.focus.get_untracked(), axis, Pane::leaf(pane, session)));
@@ -1056,7 +1237,13 @@ impl Workspace {
             if self.form.title.get_untracked() == TitleSource::Reported && !reported.is_empty() {
                 reported
             } else {
-                DEFAULT_TITLE.to_string()
+                // 服务器的会话默认叫主机名，一眼分得清是哪台
+                self.tabs
+                    .get_untracked()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .and_then(|tab| tab.target.host().map(str::to_string))
+                    .unwrap_or_else(|| DEFAULT_TITLE.to_string())
             }
         };
         self.titles.update(|titles| {
@@ -1148,6 +1335,9 @@ impl Workspace {
         }
         self.unseen.update(|unseen| {
             unseen.remove(&id);
+        });
+        self.monitors.update(|monitors| {
+            monitors.remove(&id);
         });
         let mut bar = self.bar.get_untracked();
         let slot = bar.iter().position(|&shown| shown == id);
@@ -1246,6 +1436,43 @@ impl Workspace {
         });
     }
 
+    /// 文件夹在侧栏里排第几（从 0 起）
+    pub fn folder_index(&self, id: u64) -> Option<usize> {
+        self.folders
+            .get_untracked()
+            .iter()
+            .position(|folder| folder.id == id)
+    }
+
+    /// 拖着的文件夹放下了：按拖动时算好的格子换顺序。顺序一变，落盘的 Effect 会自己存
+    pub fn drop_folder(&self, id: u64) {
+        let Some(dragged) = self
+            .folder_drag
+            .get_untracked()
+            .filter(|dragged| dragged.id == id)
+        else {
+            return;
+        };
+        aureole::without_animation(|| {
+            self.folder_drag.set(None);
+            self.move_folder(id, dragged.to);
+        });
+    }
+
+    /// 把文件夹挪到侧栏里第 `to` 个位置。已经在那里就什么也不做
+    pub fn move_folder(&self, id: u64, to: usize) {
+        let Some(from) = self.folder_index(id) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        self.folders.update(|folders| {
+            let moved = folders.remove(from);
+            folders.insert(to.min(folders.len()), moved);
+        });
+    }
+
     /// 把标签挪到标签条上第 `to` 个位置（拖动换位置）；只动顶部的顺序，侧栏不变。已经在那里就什么也不做
     pub fn move_tab(&self, id: u64, to: usize) {
         let Some(from) = self.bar_index(id) else {
@@ -1271,6 +1498,77 @@ impl Workspace {
             None => 0,
         };
         self.select(bar[next]);
+    }
+
+    /// 当前会话的目标有哪些面板：本机没有；设置里关了「远程功能」也没有。在副作用里调用会跟着变
+    pub fn panels(&self) -> Vec<PanelKind> {
+        if !self.form.remote.get() {
+            return Vec::new();
+        }
+        let active = self.active.get();
+        self.tabs
+            .get()
+            .into_iter()
+            .find(|tab| tab.id == active)
+            .map_or_else(Vec::new, |tab| tab.target.panels())
+    }
+
+    pub fn has_panels(&self) -> bool {
+        !self.panels().is_empty()
+    }
+
+    /// 右侧面板现在显示着吗：当前会话的目标有面板、没被收起、不在设置页里
+    pub fn panel_shown(&self) -> bool {
+        !self.settings_open.get() && self.panel_open.get() && self.has_panels()
+    }
+
+    /// 现在该监控谁：当前标签是服务器、有复用套接字就返回（标签、主机、套接字）
+    pub fn monitor_plan(&self) -> Option<(u64, String, PathBuf)> {
+        let active = self.active.get_untracked();
+        let tab = self.tabs.get_untracked().into_iter().find(|tab| tab.id == active)?;
+        let host = tab.target.host()?.to_string();
+        Some((active, host, tab.control.clone()?))
+    }
+
+    /// 取一次监控数据，结果回来写进 `monitors`。上一次还没回来就不再发；
+    /// 取数在后台线程做（`ssh` 要等网络），界面不会卡
+    pub fn poll_monitor(self: &Rc<Self>) {
+        if self.polling.get() || !self.form.remote.get_untracked() {
+            return;
+        }
+        let Some((tab, host, control)) = self.monitor_plan() else {
+            return;
+        };
+        self.polling.set(true);
+        let this = Rc::downgrade(self);
+        // 任务不能记在调用它的作用域上：这里是监控页的定时器调的，页面一卸掉（关了标签、收起面板、换页）
+        // 作用域就释放，在途的任务跟着被取消，结果永远回不来，「取数中」的标记就一直是真，之后再也不取了。
+        // 放在不挂界面的作用域里，页面来来去去它都会跑完
+        let fetch = self.fetch.borrow().clone();
+        aureole::detached(|| {
+            aureole::spawn_blocking(move || {
+                fetch(&host, &control).and_then(|text| monitor::parse(&text))
+            })
+            .then(move |result| {
+                let Some(workspace) = this.upgrade() else {
+                    return;
+                };
+                workspace.polling.set(false);
+                workspace.apply_reading(tab, result);
+            })
+        });
+    }
+
+    /// 收下一次取数的结果（标签已经关了就丢掉）
+    pub fn apply_reading(&self, tab: u64, result: Result<monitor::Reading, monitor::Failure>) {
+        if !self.has_tab(tab) {
+            return;
+        }
+        self.monitors.update(|monitors| monitors.entry(tab).or_default().apply(result));
+    }
+
+    pub fn toggle_panel(&self) {
+        self.panel_open.update(|open| *open = !*open);
     }
 
     pub fn toggle_sidebar(&self) {
@@ -1381,6 +1679,10 @@ pub fn root() -> Element {
         }
         crate::display::track(window, store);
     }
+    // 侧栏「远程」里列的服务器：~/.ssh/config 里的
+    workspace.add_config_hosts(
+        crate::ssh::config_path().map_or_else(Vec::new, |path| crate::ssh::load_hosts(&path)),
+    );
     workspace.restore();
     workspace.autosave();
     chrome::build(workspace)

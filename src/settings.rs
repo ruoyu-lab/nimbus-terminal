@@ -217,6 +217,8 @@ settings! {
     cursor: CursorStyle = CursorStyle::Block,
     cursor_blink: bool = true,
     status_bar: bool = true,
+    /// 连到服务器的会话显示右侧的监控和文件面板；关掉就一直不显示
+    remote: bool = true,
     // 终端
     scrollback: f64 = 10_000.0,
     wheel: f64 = 3.0,
