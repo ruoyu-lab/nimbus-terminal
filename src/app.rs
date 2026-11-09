@@ -210,6 +210,8 @@ pub struct Session {
     local: Cell<bool>,
     /// 指针现在在哪一格（不在终端上是 `None`）
     pointer_cell: Cell<Option<(usize, usize)>>,
+    /// 右键点在哪个链接上（菜单里的「打开链接」「复制链接」用）：点的时候记下，没点在链接上是 `None`
+    context_link: RefCell<Option<links::Link>>,
     /// 指针停着的链接：它在显示的第几行、哪几列
     hover: Cell<Option<view::Hover>>,
     /// 指针停着的链接变了：下一次画要整屏重画一遍
@@ -316,6 +318,7 @@ impl Session {
             reconnect: RefCell::new(None),
             waiting: Cell::new(false),
             local: Cell::new(false),
+            context_link: RefCell::new(None),
             pointer_cell: Cell::new(None),
             hover: Cell::new(None),
             hover_dirty: Cell::new(false),
@@ -1093,7 +1096,8 @@ impl Session {
 
     /// 右键。程序抓着鼠标时（按着 Shift 除外）右键归程序；设置里选了「右键粘贴」就直接粘贴；
     /// 都不是就该弹右键菜单，返回 `true`
-    fn secondary_click(&self, modifiers: Modifiers) -> bool {
+    fn secondary_click(&self, position: [f32; 2], modifiers: Modifiers) -> bool {
+        self.remember_link(position);
         if self.mouse_reporting(modifiers) {
             return false;
         }
@@ -1102,6 +1106,32 @@ impl Session {
             return false;
         }
         true
+    }
+
+    /// 记下 `position`（网格里的位置）那一格上的链接：网址，或者本机上真有的文件路径
+    fn remember_link(&self, position: [f32; 2]) {
+        let link = self.cell_at(position).and_then(|(row, column)| {
+            let terminal = self.terminal.borrow();
+            view::source_line(&terminal, row, self.offset.get())
+                .and_then(|line| links::link_at(line, column))
+        });
+        let link = link.map(|(link, ..)| link).filter(|link| match link {
+            links::Link::Url(_) => true,
+            links::Link::Path { path, .. } => {
+                self.local.get() && self.resolve_path(path).is_some()
+            }
+        });
+        *self.context_link.borrow_mut() = link;
+    }
+
+    /// 右键点中的链接（右键菜单现看）
+    pub fn context_link(&self) -> Option<links::Link> {
+        self.context_link.borrow().clone()
+    }
+
+    /// 打开链接（菜单里的「打开」）
+    pub fn open_link_now(&self, link: &links::Link) -> bool {
+        self.open_link(link)
     }
 
     /// 选中的字（没有选中是 `None`）
@@ -1369,7 +1399,7 @@ pub fn view(
                 .focus_ring(FocusRing::NONE)
                 .report_bounds(shown)
                 .on_secondary_click(move |event: &ClickEvent| {
-                    if click_session.secondary_click(event.modifiers) {
+                    if click_session.secondary_click(event.position, event.modifiers) {
                         event.stop_propagation();
                         on_menu(event.window_position);
                     }
@@ -1459,6 +1489,10 @@ impl Session {
             }
         }
         found
+    }
+
+    pub(crate) fn grid_size_for_test(&self) -> [usize; 2] {
+        self.grid.size()
     }
 
     pub(crate) fn offset_for_test(&self) -> usize {

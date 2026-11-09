@@ -150,6 +150,28 @@ fn pane_actions(workspace: &Rc<Workspace>, tab_id: u64, pane: u64) -> Vec<Action
         run,
     };
     let mut actions = Vec::new();
+    // 右键点在链接上：最前面加打开和复制
+    if let Some(link) = session.context_link() {
+        let (noun, text) = match &link {
+            crate::links::Link::Url(url) => ("链接", url.clone()),
+            crate::links::Link::Path { path, .. } => ("路径", path.clone()),
+        };
+        let (opener, target) = (session.clone(), link);
+        actions.push(action(
+            "open-link",
+            &format!("打开{noun}"),
+            Rc::new(move || {
+                opener.open_link_now(&target);
+            }),
+        ));
+        actions.push(action(
+            "copy-link",
+            &format!("复制{noun}"),
+            Rc::new(move || {
+                aureole::clipboard::write_text(text.clone());
+            }),
+        ));
+    }
     if session.selected_text().is_some() {
         let copy = session.clone();
         actions.push(action(

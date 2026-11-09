@@ -5206,3 +5206,37 @@ fn elapsed_text_reads_naturally() {
     assert_eq!(elapsed_text(130), "2 分 10 秒");
     assert_eq!(elapsed_text(3780), "1 小时 3 分");
 }
+
+/// 右键点在网址上：菜单最前面有「打开链接」「复制链接」；点在别处没有
+#[test]
+fn right_clicking_a_link_offers_open_and_copy() {
+    let (harness, workspace) = mounted();
+    let session = workspace.focused_session().expect("有终端");
+    session.feed_for_test("see https://example.com/x now\r\n");
+    harness.frame();
+    let grid = harness.window_bounds("grid").expect("网格在");
+    let [columns, rows] = session.grid_size_for_test();
+    let cell = (grid.width / columns as f32, grid.height / rows as f32);
+    let at = |column: usize| (grid.x + (column as f32 + 0.5) * cell.0, grid.y + 0.5 * cell.1);
+    let pane = workspace.tabs.get_untracked()[0].layout.get_untracked().first_id();
+    // 点在别处：没有链接的项
+    let (x, y) = at(1);
+    harness.right_click(x, y);
+    harness.advance(secs(1.0));
+    assert!(harness.bounds(&format!("menu-pane-open-link-{pane}")).is_none());
+    assert!(harness.bounds(&format!("menu-pane-paste-{pane}")).is_some(), "普通菜单在");
+    harness.key_down(NamedKey::Escape);
+    harness.advance(secs(1.0));
+    // 点在网址上
+    let (x, y) = at(8);
+    harness.right_click(x, y);
+    harness.advance(secs(1.0));
+    assert!(harness.bounds(&format!("menu-pane-copy-link-{pane}")).is_some());
+    let [mx, my] = harness
+        .window_bounds(&format!("menu-pane-open-link-{pane}"))
+        .expect("菜单项在")
+        .center();
+    harness.click(mx, my);
+    harness.advance(secs(1.0));
+    assert_eq!(harness.opened_urls(), ["https://example.com/x"]);
+}
