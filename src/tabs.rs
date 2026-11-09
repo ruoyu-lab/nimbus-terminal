@@ -109,7 +109,8 @@ pub struct Tab {
     /// 聚焦的是哪个终端（排布里叶子的编号）：键盘打字、状态条、存目录都看它
     pub focus: Signal<u64>,
     pub target: Target,
-    /// SSH 标签的连接复用套接字：第一个终端的 `ssh` 是主连接，监控借它。别的标签没有
+    /// SSH 标签的连接（`ssh::control_path`）：macOS、Linux 上是复用套接字，第一个终端的 `ssh` 是主连接，监控借它；
+    /// Windows 上是面板另开的那条连接登记用的名字。别的标签没有
     pub control: Option<PathBuf>,
     /// 归在哪个文件夹下面；没有就是直接列在「目标」下
     pub folder: Option<u64>,

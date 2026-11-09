@@ -3,14 +3,48 @@
 //! 不自己实现 SSH：认证（密钥、`ssh-agent`、跳板机、`~/.ssh/config`、两步验证、host key 确认）全沿用用户现有的配置，
 //! 密码和确认的提示就直接出现在终端里。这里只做三件事：把主机名变成命令行（并且防止它被当成选项）、
 //! 从 `~/.ssh/config` 里读出有哪些主机、判断一个主机名能不能用。
+//!
+//! 右侧面板（监控、文件页）也走系统的 `ssh` 和 `sftp`。macOS、Linux 上借终端的连接（连接复用，终端的 `ssh` 当主连接），
+//! 不用再认证；Windows 自带的 OpenSSH 不支持连接复用，面板自己另开连接，只用密钥或 `ssh-agent`、从不问密码，
+//! 见 [`Sharing`]。
 
 use std::path::{Path, PathBuf};
 
 use crate::pty;
-use crate::remote::{Ran, run};
+use crate::remote::{Ran, hide_console, run};
 
 /// 主连接在没有任何客户端连着之后多久自己退出（秒）。正常情况由我们在标签关闭时关掉
 const CONTROL_PERSIST: u32 = 600;
+
+/// 保活：每 30 秒问一次，连着 3 次没回应就断开。终端的连接、Windows 上面板自己的连接都用它
+const KEEPALIVE: [&str; 4] = [
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=3",
+];
+
+/// 右侧面板（常驻通道、`sftp`）怎么连到服务器
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sharing {
+    /// 借终端的连接：终端的 `ssh` 开连接复用（`ControlMaster`）当主连接，面板的 `ssh`、`sftp` 走它的套接字，
+    /// 不用再认证（密码、两步验证、host key 都只在终端里问一次）。macOS、Linux 用这个
+    Multiplexed,
+    /// 面板自己另开连接，只用密钥、`ssh-agent` 认证（`BatchMode`：要密码就直接失败，不会卡在没人看得见的提示上）。
+    /// Windows 自带的 OpenSSH 不支持连接复用，只能这样；要密码的服务器，面板上写明白（[`KEY_LOGIN_NEEDED`]）
+    Separate,
+}
+
+/// 这个系统用哪种：Unix 上的 OpenSSH 都支持连接复用
+const SHARING: Sharing = if cfg!(unix) {
+    Sharing::Multiplexed
+} else {
+    Sharing::Separate
+};
+
+/// 要密码（或者两步验证）的服务器：Windows 上面板写这句
+const KEY_LOGIN_NEEDED: &str = "需要密钥登录。Windows 上监控和文件页要另开一条连接，只能用密钥或 ssh-agent，\
+不能输密码；配好之后重新连接终端再试";
 
 /// 主机名最长多少：`ssh` 自己的上限是 255
 const HOST_MAX: usize = 255;
@@ -36,7 +70,8 @@ pub fn normalize(host: &str) -> Option<String> {
 /// 保活：每 30 秒问一次，连着 3 次没回应就断开，网络掉了 `ssh` 会自己退出，标签上才看得到「已断开」，
 /// 而不是一直卡在那里
 ///
-/// `control` 是连接复用的套接字：终端的 `ssh` 当主连接，监控再起的 `ssh` 借它跑命令，不用再认证一次
+/// `control` 是这个标签的连接（[`control_path`]）。macOS、Linux 上它是连接复用的套接字：终端的 `ssh` 当主连接，
+/// 监控再起的 `ssh` 借它跑命令，不用再认证一次。Windows 上终端就是一条普通的连接，命令行里不带它
 pub fn config(
     host: &str,
     columns: u16,
@@ -44,18 +79,23 @@ pub fn config(
     control: Option<&Path>,
     directory: Option<&str>,
 ) -> pty::Config {
+    config_for(SHARING, host, columns, rows, control, directory)
+}
+
+/// 同 [`config`]，按给定的方式（测试里两种都要看）
+fn config_for(
+    sharing: Sharing,
+    host: &str,
+    columns: u16,
+    rows: u16,
+    control: Option<&Path>,
+    directory: Option<&str>,
+) -> pty::Config {
     let mut arguments: Vec<String> = extra_arguments();
-    arguments.extend(
-        [
-            "-o",
-            "ServerAliveInterval=30",
-            "-o",
-            "ServerAliveCountMax=3",
-        ]
-        .into_iter()
-        .map(String::from),
-    );
-    if let Some(path) = control.and_then(Path::to_str) {
+    arguments.extend(KEEPALIVE.into_iter().map(String::from));
+    if sharing == Sharing::Multiplexed
+        && let Some(path) = control.and_then(Path::to_str)
+    {
         // 终端的连接当主连接，并且**留在后台**（`ControlPersist`）：终端里 `exit` 之后客户端马上结束、标签才关得掉，
         // 常驻通道还借着连接没用完。实测：不加这个，只要有一个通道还连在主连接上，主连接自己的会话早结束了，
         // `ssh` 进程还要等通道结束才退出，标签就卡住。主连接由我们负责关（标签关了、会话结束了、应用退出时
@@ -110,13 +150,25 @@ pub fn control_directory() -> Option<PathBuf> {
     None
 }
 
-/// 标签 `tab` 的复用套接字路径。带进程号：上次崩溃留下的套接字不会和这次的撞上
+/// 标签 `tab` 的连接叫什么。带进程号：上次崩溃留下的不会和这次的撞上。
+/// macOS、Linux 上是复用套接字的路径（目录不可用就是 `None`：终端照常连，只是没有面板）；
+/// Windows 上没有套接字，只是面板的连接在登记表里的名字（不是文件，不会在磁盘上建出来）
 pub fn control_path(tab: u64) -> Option<PathBuf> {
-    control_directory().map(|directory| directory.join(format!("{}-{tab}", std::process::id())))
+    let name = format!("{}-{tab}", std::process::id());
+    match SHARING {
+        Sharing::Multiplexed => control_directory().map(|directory| directory.join(name)),
+        Sharing::Separate => Some(PathBuf::from(format!("nimbus-{name}"))),
+    }
 }
 
-/// 起主连接之前清掉同名的旧套接字（重连时上一条连接留下的）。目录不可用返回 `false`
+/// 终端的 `ssh` 要起了（新开、重连）。macOS、Linux：起主连接之前清掉同名的旧套接字（重连时上一条连接留下的），
+/// 目录不可用返回 `false`。Windows：把这个标签记成「终端连着」，面板可以另开连接了；
+/// 上一次认证被拒的记录也清掉（重连了，再试一次）
 pub fn control_ready(path: &Path) -> bool {
+    if SHARING == Sharing::Separate {
+        links().insert(path.to_path_buf(), Link::default());
+        return true;
+    }
     let Some(parent) = path.parent() else {
         return false;
     };
@@ -188,7 +240,7 @@ fn extra_arguments() -> Vec<String> {
     }
 }
 
-/// 每个标签的常驻通道，按复用套接字的路径找
+/// 每个标签的常驻通道，按标签的连接（[`control_path`]）找
 static CHANNELS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<crate::channel::Channel>>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -202,29 +254,112 @@ fn channels() -> std::sync::MutexGuard<
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 借复用连接开一条通道：`ssh … -- host sh`，远端的 `sh` 一直开着
+/// Windows（[`Sharing::Separate`]）上每个标签的面板连接，按标签的连接名（[`control_path`]）找。
+/// 在表里就是终端连着（终端的 `ssh` 起了、还没结束），面板才去连；终端结束、标签关了就从表里拿掉。
+/// macOS、Linux 不用它：那边看复用套接字在不在
+#[derive(Default)]
+struct Link {
+    /// 面板的连接被服务器拒绝认证过（要密码、两步验证）：记下给人看的原因，终端重连之前不再试。
+    /// 监控每 2 秒取一次数，每次都去撞一次认证的话，服务器那边（fail2ban 之类）会当成有人在猜密码，把这台机器封掉
+    refused: Option<String>,
+}
+
+static LINKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Link>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn links() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, Link>> {
+    LINKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 终端连着吗：macOS、Linux 看复用套接字在不在，Windows 看登记表
+fn connected(control: &Path) -> bool {
+    match SHARING {
+        Sharing::Multiplexed => control.exists(),
+        Sharing::Separate => links().contains_key(control),
+    }
+}
+
+/// 面板现在能不能去连这个标签的服务器：终端不连着是 `NotConnected`；
+/// Windows 上认证被拒过，终端重连之前一直是那次的原因，不再去连
+fn usable(control: &Path) -> Result<(), crate::monitor::Failure> {
+    use crate::monitor::Failure;
+    match SHARING {
+        Sharing::Multiplexed if control.exists() => Ok(()),
+        Sharing::Multiplexed => Err(Failure::NotConnected),
+        Sharing::Separate => match links().get(control) {
+            None => Err(Failure::NotConnected),
+            Some(Link {
+                refused: Some(reason),
+            }) => Err(Failure::Failed(reason.clone())),
+            Some(Link { refused: None }) => Ok(()),
+        },
+    }
+}
+
+/// Windows 上面板自己连不上时，`ssh` 在标准错误里说的话 → 给人看的原因，和是不是认证被拒
+/// （要密码、两步验证：这种终端重连之前不再试）。`ssh` 认证失败一定写成
+/// `user@host: Permission denied (publickey,password).`，括号里是服务器接受的方式
+fn separate_failure(stderr: &str) -> (String, bool) {
+    if stderr.contains("Permission denied (") {
+        return (KEY_LOGIN_NEEDED.to_string(), true);
+    }
+    if stderr.contains("Host key verification failed") {
+        // 第一次连这台服务器，终端里还在问要不要信它；或者 host key 变了。终端那边会说清楚，确认之后这里自己就好
+        return (
+            "服务器的身份（host key）还没确认，或者和记下的对不上：看终端里 ssh 怎么说".to_string(),
+            false,
+        );
+    }
+    // 别的（连不上、域名解析不了）：`ssh` 最后一句就是原因，前面的多半是警告
+    let reason = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("起不了通道");
+    (reason.chars().take(160).collect(), false)
+}
+
+/// 面板的常驻通道要起的命令：`ssh 选项… -- host sh`，远端的 `sh` 一直开着。
+/// 套接字的路径不是 UTF-8（交不给 `ssh`）时是 `None`
+fn channel_command(sharing: Sharing, host: &str, control: &Path) -> Option<std::process::Command> {
+    let mut command = std::process::Command::new("ssh");
+    command
+        .args(extra_arguments())
+        .args(Transport::options(sharing, control)?)
+        .args(["--", host, "sh"]);
+    Some(command)
+}
+
+/// 开一条通道。macOS、Linux 借复用连接，起不来时套接字不在就是没连上；
+/// Windows 另开一条，起不来时看 `ssh` 怎么说，认证被拒就记下来（终端重连之前不再试）
 fn start_channel(
     host: &str,
     control: &Path,
 ) -> Result<crate::channel::Channel, crate::monitor::Failure> {
     use crate::monitor::Failure;
-    let options = Transport::mux_options(control).ok_or(Failure::NotConnected)?;
-    let mut command = std::process::Command::new("ssh");
-    command
-        .args(extra_arguments())
-        .args(options)
-        .args(["--", host, "sh"]);
-    crate::channel::Channel::start(command).map_err(|_| {
-        if control.exists() {
-            Failure::Failed("起不了通道".into())
-        } else {
-            Failure::NotConnected
+    let command = channel_command(SHARING, host, control).ok_or(Failure::NotConnected)?;
+    crate::channel::Channel::start(command).map_err(|failed| match SHARING {
+        Sharing::Multiplexed => {
+            if control.exists() {
+                Failure::Failed("起不了通道".into())
+            } else {
+                Failure::NotConnected
+            }
+        }
+        Sharing::Separate => {
+            let (reason, refused) = separate_failure(&failed.stderr);
+            if refused && let Some(link) = links().get_mut(control) {
+                link.refused = Some(reason.clone());
+            }
+            Failure::Failed(reason)
         }
     })
 }
 
 /// 在这个连接的常驻通道里跑一段 `sh` 脚本。没有通道就开一条；通道断了（比如主连接重启过）换一条新的再试一次。
-/// 超时：通道作废（下一次重开），这次报没有及时回应。套接字不在（终端没连上、断了）是 `NotConnected`
+/// 超时：通道作废（下一次重开），这次报没有及时回应。终端没连着（套接字不在、Windows 上没登记）是 `NotConnected`
 fn run_in_channel(
     host: &str,
     control: &Path,
@@ -236,21 +371,29 @@ fn run_in_channel(
     if !is_valid_host(host) {
         return Err(Failure::Failed("主机名不能用".into()));
     }
-    if !control.exists() {
+    if let Err(failure) = usable(control) {
         channels().remove(control);
-        return Err(Failure::NotConnected);
+        return Err(failure);
     }
     for _ in 0..2 {
         let existing = channels().get(control).cloned();
         let channel = match existing {
             Some(channel) => channel,
             None => {
+                usable(control)?;
                 // 起通道要等网络，不能占着登记表的锁
                 let started = std::sync::Arc::new(start_channel(host, control)?);
-                channels()
+                let channel = channels()
                     .entry(control.to_path_buf())
                     .or_insert(started)
-                    .clone()
+                    .clone();
+                // 起通道的这段时间里终端结束了、标签关了：不留下没人收的通道
+                // （Windows 上通道是自己的连接，套接字没了也照样连着）
+                if !connected(control) {
+                    channels().remove(control);
+                    return Err(Failure::NotConnected);
+                }
+                channel
             }
         };
         match channel.request(script, timeout) {
@@ -270,22 +413,29 @@ fn run_in_channel(
             }
         }
     }
-    Err(if control.exists() {
+    Err(if connected(control) {
         Failure::Failed("和服务器的通道断了".into())
     } else {
         Failure::NotConnected
     })
 }
 
-/// 这个标签不用连接了（标签关了、终端会话结束了、应用要退出了）：收掉通道，再让后台的主连接退出（`ssh -O exit`）。
-/// 会等 `ssh -O exit` 做完，很快（毫秒级）；套接字已经不在就什么也不用做
+/// 这个标签不用连接了（标签关了、终端会话结束了、应用要退出了）：收掉通道。
+/// macOS、Linux 上再让后台的主连接退出（`ssh -O exit`），会等它做完，很快（毫秒级）；套接字已经不在就什么也不用做。
+/// Windows 上没有后台的主连接（终端的 `ssh` 是普通连接，跟着它的 pty 走），从登记表里拿掉，面板就不会再去连
 pub fn shutdown(host: &str, control: &Path) {
+    if SHARING == Sharing::Separate {
+        // 先拿掉登记再收通道：正在起的通道起完一看登记没了，会自己收掉（见 `run_in_channel`）
+        links().remove(control);
+        channels().remove(control);
+        return;
+    }
     channels().remove(control);
     if !control.exists() || !is_valid_host(host) {
         return;
     }
     let Some(path) = control.to_str() else { return };
-    let _ = std::process::Command::new("ssh")
+    let _ = hide_console(&mut std::process::Command::new("ssh"))
         .args(extra_arguments())
         .args([
             "-o",
@@ -307,7 +457,7 @@ pub fn shutdown_in_background(host: &str, control: &Path) {
     std::thread::spawn(move || shutdown(&host, &control));
 }
 
-/// 借终端的连接在远端跑一次监控脚本，返回它的输出。走常驻通道
+/// 在远端跑一次监控脚本，返回它的输出。走这个标签的常驻通道
 pub fn poll(host: &str, control: &Path) -> Result<String, crate::monitor::Failure> {
     use crate::monitor::Failure;
     let ran = run_in_channel(
@@ -333,7 +483,8 @@ pub fn poll(host: &str, control: &Path) -> Result<String, crate::monitor::Failur
     }
 }
 
-/// 通到远端的路：借终端的 SSH 连接。测试里还有一条直接连本机 `sftp-server` 的，
+/// 通到远端的路：这个标签的 SSH 连接（macOS、Linux 借终端的，Windows 另开，见 [`Sharing`]）。
+/// 测试里还有一条直接连本机 `sftp-server` 的，
 /// 这样 `sftp` 的批处理（引号、通配符、退出码）能用真的 `sftp` 验证，不用一台服务器
 pub enum Transport {
     Ssh {
@@ -366,18 +517,42 @@ impl Transport {
         )
     }
 
-    /// 连接不在（套接字没有了）就是没连上
+    /// 自己另开连接用的选项（Windows）：只用密钥、agent 认证（`BatchMode`：要密码就直接失败，不会卡在没人看得见的提示上）；
+    /// 10 秒连不上就放弃；保活和终端一样；不碰连接复用（`~/.ssh/config` 里写了 `ControlMaster` 也不管，
+    /// Windows 的 OpenSSH 用不了它）；不要终端（配置里写了 `RequestTTY` 的话，远端的 `sh` 会回显，搅乱通道的协议）
+    fn separate_options() -> Vec<String> {
+        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+            .into_iter()
+            .chain(KEEPALIVE)
+            .chain([
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "RequestTTY=no",
+            ])
+            .map(String::from)
+            .collect()
+    }
+
+    /// 面板的 `ssh`、`sftp` 连服务器用的选项：借复用连接，或者自己另开一条。
+    /// 套接字的路径不是 UTF-8（交不给 `ssh`）时是 `None`
+    fn options(sharing: Sharing, control: &Path) -> Option<Vec<String>> {
+        match sharing {
+            Sharing::Multiplexed => Self::mux_options(control),
+            Sharing::Separate => Some(Self::separate_options()),
+        }
+    }
+
+    /// 终端没连着（套接字没有了、Windows 上没登记）就是没连上；Windows 上认证被拒过就是那次的原因
     fn check(&self) -> Result<(), crate::monitor::Failure> {
         match self {
             Self::Ssh { host, control } => {
                 if !is_valid_host(host) {
                     return Err(crate::monitor::Failure::Failed("主机名不能用".into()));
                 }
-                if control.exists() {
-                    Ok(())
-                } else {
-                    Err(crate::monitor::Failure::NotConnected)
-                }
+                usable(control)
             }
             #[cfg(test)]
             Self::Local => Ok(()),
@@ -406,24 +581,31 @@ impl Transport {
     /// 跑一段 `sftp` 批处理。不设超时：大文件要传多久不知道，连接断了 `sftp` 自己会退出
     fn sftp(&self, batch: &str) -> Result<Ran, crate::monitor::Failure> {
         self.check()?;
-        let mut command = std::process::Command::new("sftp");
-        command.arg("-q");
-        match self {
+        let command = match self {
             Self::Ssh { host, control } => {
-                let options =
-                    Self::mux_options(control).ok_or(crate::monitor::Failure::NotConnected)?;
-                command
-                    .args(extra_arguments())
-                    .args(options)
-                    .args(["-b", "-", "--", host]);
+                sftp_command(SHARING, host, control).ok_or(crate::monitor::Failure::NotConnected)?
             }
             #[cfg(test)]
             Self::Local => {
-                command.args(["-b", "-", "-D", "/usr/libexec/sftp-server"]);
+                let mut command = std::process::Command::new("sftp");
+                command.args(["-q", "-b", "-", "-D", "/usr/libexec/sftp-server"]);
+                command
             }
-        }
+        };
         run(command, Some(batch.as_bytes().to_vec()), None)
     }
+}
+
+/// 传输要起的命令：`sftp -q 选项… -b - -- host`，批处理从标准输入读。连接的选项和常驻通道一样。
+/// 套接字的路径不是 UTF-8（交不给 `sftp`）时是 `None`
+fn sftp_command(sharing: Sharing, host: &str, control: &Path) -> Option<std::process::Command> {
+    let mut command = std::process::Command::new("sftp");
+    command
+        .arg("-q")
+        .args(extra_arguments())
+        .args(Transport::options(sharing, control)?)
+        .args(["-b", "-", "--", host]);
+    Some(command)
 }
 
 /// `sftp` 出错时给人看的一句话：错误输出里第一条不是命令回显（`sftp> …`）的非空行
@@ -601,10 +783,11 @@ mod tests {
         );
     }
 
-    /// 带复用套接字：终端当主连接；主机名仍然在 `--` 后面
+    /// macOS、Linux 带复用套接字：终端当主连接；主机名仍然在 `--` 后面
     #[test]
     fn the_control_socket_options_come_before_the_separator() {
-        let config = config(
+        let config = config_for(
+            Sharing::Multiplexed,
             "prod-hk",
             80,
             24,
@@ -627,6 +810,118 @@ mod tests {
             before.contains(&format!("ControlPersist={CONTROL_PERSIST}")),
             "{before}"
         );
+    }
+
+    /// Windows（面板另开连接）：终端就是普通的 `ssh`，带着标签的连接名也不加任何复用的选项，和不带一样
+    #[test]
+    fn with_separate_connections_the_terminal_is_a_plain_ssh() {
+        let named = config_for(
+            Sharing::Separate,
+            "prod-hk",
+            80,
+            24,
+            Some(Path::new("nimbus-1-2")),
+            None,
+        );
+        let plain = config_for(Sharing::Separate, "prod-hk", 80, 24, None, None);
+        assert_eq!(named.arguments, plain.arguments);
+        assert!(
+            !named.arguments.join(" ").contains("Control"),
+            "{:?}",
+            named.arguments
+        );
+    }
+
+    /// 起好的命令的参数，一个个变成字符串
+    fn arguments_of(command: &std::process::Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// 面板的常驻通道：macOS、Linux 借终端的套接字（不新开认证、不自己当主连接）；Windows 另开一条只用密钥的连接
+    /// （从不问密码、连不上 10 秒就放弃、保活、不碰连接复用、不要终端）。两种都是 `ssh 选项… -- host sh`
+    #[test]
+    fn the_panel_channel_borrows_the_socket_or_opens_its_own_key_only_connection() {
+        let control = Path::new("/tmp/nimbus-501/1-2");
+        let tail = ["--", "prod-hk", "sh"].map(String::from);
+
+        let borrowed = channel_command(Sharing::Multiplexed, "prod-hk", control).expect("UTF-8");
+        assert_eq!(borrowed.get_program(), "ssh");
+        let borrowed = arguments_of(&borrowed);
+        assert!(borrowed.ends_with(&tail), "{borrowed:?}");
+        let text = borrowed.join(" ");
+        for option in [
+            "ControlMaster=no",
+            "ControlPath=/tmp/nimbus-501/1-2",
+            "BatchMode=yes",
+        ] {
+            assert!(text.contains(option), "{option}：{text}");
+        }
+
+        let own = channel_command(Sharing::Separate, "prod-hk", control).expect("UTF-8");
+        assert_eq!(own.get_program(), "ssh");
+        let own = arguments_of(&own);
+        assert!(own.ends_with(&tail), "{own:?}");
+        let text = own.join(" ");
+        for option in [
+            "-o BatchMode=yes",
+            "-o ConnectTimeout=10",
+            "-o ServerAliveInterval=30",
+            "-o ServerAliveCountMax=3",
+            "-o ControlMaster=no",
+            "-o ControlPath=none",
+            "-o RequestTTY=no",
+        ] {
+            assert!(text.contains(option), "{option}：{text}");
+        }
+        assert!(!text.contains("nimbus-501"), "不用套接字：{text}");
+    }
+
+    /// 传输（`sftp`）和常驻通道用同一套连接选项；批处理从标准输入读，主机名紧跟在 `--` 后面
+    #[test]
+    fn transfers_connect_the_same_way_as_the_channel() {
+        let control = Path::new("/tmp/nimbus-501/1-2");
+        for sharing in [Sharing::Multiplexed, Sharing::Separate] {
+            let command = sftp_command(sharing, "prod-hk", control).expect("UTF-8");
+            assert_eq!(command.get_program(), "sftp");
+            let arguments = arguments_of(&command);
+            let options = Transport::options(sharing, control).expect("UTF-8");
+            let mut expected = vec!["-q".to_string()];
+            expected.extend(extra_arguments());
+            expected.extend(options);
+            expected.extend(["-b", "-", "--", "prod-hk"].map(String::from));
+            assert_eq!(arguments, expected, "{sharing:?}");
+        }
+    }
+
+    /// Windows 上面板自己连不上：认证被拒（要密码、两步验证）写成「需要密钥登录」，并且记成不再试；
+    /// host key 没确认写明白；别的就是 `ssh` 的最后一句话（前面多半是警告）
+    #[test]
+    fn a_refused_separate_connection_asks_for_key_login() {
+        // Windows 自带的 OpenSSH 9.5 连一台只能输密码的服务器，原样是这句
+        let (reason, refused) = separate_failure(
+            "deploy@prod-hk: Permission denied (publickey,keyboard-interactive).\r\n",
+        );
+        assert!(refused, "认证被拒，终端重连之前不再试");
+        assert_eq!(reason, KEY_LOGIN_NEEDED);
+        assert!(reason.starts_with("需要密钥登录"));
+        let (reason, refused) = separate_failure("Host key verification failed.\r\n");
+        assert!(!refused, "终端里确认了 host key 就好，要接着试");
+        assert!(reason.contains("host key"), "{reason}");
+        let (reason, refused) = separate_failure(
+            "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
+             ssh: Could not resolve hostname nimbus-test.invalid: No such host is known. \n",
+        );
+        assert!(!refused);
+        assert_eq!(
+            reason,
+            "ssh: Could not resolve hostname nimbus-test.invalid: No such host is known."
+        );
+        assert_eq!(separate_failure(""), ("起不了通道".to_string(), false));
+        // 远端文件没权限（`sftp` 里也叫 Permission denied，但没有括号里的认证方式）不算认证被拒
+        assert!(!separate_failure("remote open \"/root/x\": Permission denied\n").1);
     }
 
     /// 复用目录：自己的、0700 才用；权限松了、是符号链接都不用（别人能借走已经认证的连接）
@@ -661,7 +956,7 @@ mod tests {
         std::fs::remove_dir_all(base).ok();
     }
 
-    /// 套接字不在就是没连上，不去起任何进程
+    /// 终端没连着（套接字不在，Windows 上没登记）就是没连上，不去起任何进程
     #[test]
     fn polling_without_a_socket_means_not_connected() {
         use crate::monitor::Failure;
@@ -673,6 +968,127 @@ mod tests {
             poll("-oProxyCommand=x", Path::new("/tmp")),
             Err(Failure::Failed(_))
         ));
+    }
+
+    /// Windows：标签的连接名不是文件；终端起了才算连着，结束了（或者标签关了）就不连。
+    /// 认证被拒过之后不再去连（直接给上次的原因，不起进程），终端重连之后清掉、再试
+    #[cfg(not(unix))]
+    #[test]
+    fn separate_links_follow_the_terminal_and_remember_a_refusal() {
+        use crate::monitor::Failure;
+        let key = control_path(9_100_001).expect("Windows 上总有名字");
+        assert_eq!(key.parent(), Some(Path::new("")), "只是个名字：{key:?}");
+        assert!(key.to_string_lossy().starts_with("nimbus-"), "{key:?}");
+        let transport = Transport::Ssh {
+            host: "prod-hk".into(),
+            control: key.clone(),
+        };
+        assert_eq!(
+            poll("prod-hk", &key),
+            Err(Failure::NotConnected),
+            "终端还没起"
+        );
+        assert_eq!(transport.check(), Err(Failure::NotConnected));
+
+        assert!(control_ready(&key), "终端起了");
+        assert!(!key.exists(), "不在磁盘上建东西");
+        assert_eq!(transport.check(), Ok(()));
+        // 假装面板刚才去连被拒了：之后取数、传输都直接给这句，不再去连（去连的话会是域名解析的错）
+        links().get_mut(&key).expect("登记了").refused = Some(KEY_LOGIN_NEEDED.into());
+        assert_eq!(
+            poll("prod-hk", &key),
+            Err(Failure::Failed(KEY_LOGIN_NEEDED.into()))
+        );
+        assert_eq!(
+            transport.check(),
+            Err(Failure::Failed(KEY_LOGIN_NEEDED.into()))
+        );
+
+        assert!(control_ready(&key), "终端重连");
+        assert_eq!(transport.check(), Ok(()), "重连之后再试");
+
+        shutdown("prod-hk", &key);
+        assert_eq!(
+            poll("prod-hk", &key),
+            Err(Failure::NotConnected),
+            "终端结束、标签关了就不连"
+        );
+        assert_eq!(transport.check(), Err(Failure::NotConnected));
+    }
+
+    /// Windows：面板真的另开一条 `ssh`（不弹窗口、`BatchMode`），连一个解析不了的域名（`.invalid` 保证不存在）：
+    /// 失败的原因是 `ssh` 自己说的那句，不算认证被拒（下一次还会再试），也不留下通道。机器上没有 `ssh` 时跳过
+    #[cfg(not(unix))]
+    #[test]
+    fn a_separate_channel_reports_what_ssh_said() {
+        use crate::monitor::Failure;
+        let has_ssh = hide_console(&mut std::process::Command::new("ssh"))
+            .arg("-V")
+            .output()
+            .is_ok();
+        if !has_ssh {
+            return;
+        }
+        let key = control_path(9_100_002).expect("有名字");
+        assert!(control_ready(&key));
+        let result = poll("nimbus-test.invalid", &key);
+        let Err(Failure::Failed(reason)) = &result else {
+            panic!("应该失败：{result:?}");
+        };
+        assert!(reason.contains("nimbus-test.invalid"), "{reason}");
+        assert!(
+            links().get(&key).is_some_and(|link| link.refused.is_none()),
+            "不是认证被拒，下次还试"
+        );
+        assert!(!channels().contains_key(&key), "没起来的通道不留");
+        shutdown("nimbus-test.invalid", &key);
+    }
+
+    /// Windows 实验室：`NIMBUS_SSH_PASSWORD_HOST=主机` 指向一台只能输密码登录的服务器（本机的 sshd 就行），
+    /// 可选 `NIMBUS_SSH_KNOWN_HOSTS=文件` 是认得它的 known_hosts（设了就不碰 `~/.ssh/known_hosts`）。
+    /// 面板要很快说「需要密钥登录」，不卡在密码提示上；之后不再去连。没设就跳过。
+    /// 单独跑：`cargo test ssh::tests::a_password_only`（加的参数是全局的，和别的测试一起跑会互相看到）
+    #[cfg(not(unix))]
+    #[test]
+    fn a_password_only_server_is_refused_quickly_and_not_retried() {
+        use crate::monitor::Failure;
+        use std::time::{Duration, Instant};
+        let Ok(host) = std::env::var("NIMBUS_SSH_PASSWORD_HOST") else {
+            return;
+        };
+        if let Ok(file) = std::env::var("NIMBUS_SSH_KNOWN_HOSTS") {
+            let mut arguments = TEST_ARGUMENTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            arguments.clear();
+            arguments.extend(["-o".to_string(), format!("UserKnownHostsFile={file}")]);
+        }
+        let key = control_path(9_100_003).expect("有名字");
+        assert!(control_ready(&key));
+        let started = Instant::now();
+        assert_eq!(
+            poll(&host, &key),
+            Err(Failure::Failed(KEY_LOGIN_NEEDED.into()))
+        );
+        let first = started.elapsed();
+        assert!(first < Duration::from_secs(15), "不能卡住：{first:?}");
+        let started = Instant::now();
+        assert_eq!(
+            poll(&host, &key),
+            Err(Failure::Failed(KEY_LOGIN_NEEDED.into()))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "第二次不再去连：{:?}",
+            started.elapsed()
+        );
+        println!("LAB 要密码的服务器：第一次 {first:?} 就说了需要密钥登录");
+        shutdown(&host, &key);
+        // 加的参数是全局的：用完拿掉，别的测试看到的命令行还是原样
+        TEST_ARGUMENTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     #[test]

@@ -208,7 +208,8 @@ fn the_connect_dialog_refuses_bad_names_and_connects_good_ones() {
     assert_eq!(ssh_host(&workspace, 2).as_deref(), Some("prod-hk"));
 }
 
-/// 本机标签没有监控的对象；服务器标签有（带复用套接字，监控借终端的连接）
+/// 本机标签没有监控的对象；服务器标签有，带着这个标签的连接：macOS、Linux 上是复用套接字
+/// （在只有自己进得去的 `nimbus-<uid>` 目录里，监控借终端的连接），Windows 上只是面板另开的那条连接的名字（不是文件）
 #[test]
 fn only_server_tabs_have_something_to_monitor() {
     let (_harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
@@ -217,18 +218,44 @@ fn only_server_tabs_have_something_to_monitor() {
     workspace.new_tab_ssh("prod-hk");
     let (tab, target, control) = workspace.monitor_plan().expect("服务器标签要监控");
     assert_eq!((tab, target.host()), (2, Some("prod-hk")));
-    let control = control.expect("服务器有套接字");
-    assert!(control.to_string_lossy().contains("nimbus-"), "{control:?}");
+    let control = control.expect("服务器标签有自己的连接");
+    if cfg!(unix) {
+        let directory = control.parent().and_then(Path::file_name);
+        assert!(
+            directory.is_some_and(|name| name.to_string_lossy().starts_with("nimbus-")),
+            "{control:?}"
+        );
+    } else {
+        assert_eq!(
+            control.parent(),
+            Some(Path::new("")),
+            "只是个名字：{control:?}"
+        );
+        assert!(
+            control.to_string_lossy().starts_with("nimbus-"),
+            "{control:?}"
+        );
+    }
 }
 
-/// 服务器标签的 ssh 带复用选项（终端当主连接）；拆出来的终端和本机的都不带，不抢主连接
+/// 服务器标签的第一个终端带着标签的连接，拆出来的终端和本机的都不带。
+/// macOS、Linux 上带着它的 ssh 当主连接（复用选项），拆出来的不抢；Windows 上终端都是普通的 ssh，
+/// 连接只用来登记面板自己那条（终端连着面板才去连），命令行里没有复用的选项
 #[test]
 fn only_the_first_terminal_of_a_server_tab_owns_the_control_socket() {
     let (_harness, workspace, fake) = blank_with_traffic_lights(Store::none());
     workspace.new_tab_ssh("prod-hk");
     workspace.split(Axis::Columns);
     workspace.new_tab();
-    assert!(fake.launch(0).control.is_some(), "第一个终端是主连接");
+    let control = fake.launch(0).control.expect("第一个终端带着标签的连接");
     assert_eq!(fake.launch(1).control, None, "拆出来的各连各的");
     assert_eq!(fake.launch(2).control, None, "本机没有");
+    let arguments = crate::ssh::config("prod-hk", 80, 24, Some(&control), None)
+        .arguments
+        .join(" ");
+    assert_eq!(
+        arguments.contains("ControlMaster=auto"),
+        cfg!(unix),
+        "{arguments}"
+    );
 }

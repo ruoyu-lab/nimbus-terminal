@@ -1,5 +1,6 @@
-//! 远端操作的分发：界面只认识 [`Target`]，这里决定走 SSH（借终端的复用连接）还是 Docker（本机的 `docker` 命令）。
-//! [`run`] 是两边共用的「跑一个外部命令」：收好输出、到点杀掉。
+//! 远端操作的分发：界面只认识 [`Target`]，这里决定走 SSH（macOS、Linux 借终端的复用连接，Windows 另开连接，见 [`crate::ssh`]）
+//! 还是 Docker（本机的 `docker` 命令）。
+//! [`run`] 是两边共用的「跑一个外部命令」：收好输出、到点杀掉。[`hide_console`] 让这些命令在 Windows 上不弹窗口。
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,21 @@ pub(crate) struct Ran {
     pub stderr: String,
 }
 
+/// 起控制台程序（`ssh`、`sftp`、`docker`、`sh`）之前都过一下这里：Windows 上不给它开控制台窗口。
+/// 发布版是图形界面程序（`windows_subsystem = "windows"`），自己没有控制台，子进程是控制台程序的话
+/// 系统会给它新开一个，每取一次监控数就闪一个黑窗口。这些命令的输入输出都接在管道上，用不着窗口。
+/// 别的系统上什么也不做。终端里的 shell 不走这里：它要 ConPTY 给的伪控制台（见 `pty::windows`）
+pub(crate) fn hide_console(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `CREATE_NO_WINDOW`：子进程照样有控制台（它的子进程也挂在这个看不见的控制台上，`sftp` 起的 `ssh` 一样不弹），
+        // 只是不显示窗口
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// 跑一个命令：`input` 写进它的标准输入，标准输出和错误输出各一个线程同时读
 /// （输出大了，只等进程退出再读会把管道塞满、双方一起卡死），`timeout` 到了就杀掉
 pub(crate) fn run(
@@ -26,7 +42,7 @@ pub(crate) fn run(
     use std::process::Stdio;
     use std::time::Instant;
 
-    let mut child = command
+    let mut child = hide_console(&mut command)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -106,7 +122,7 @@ pub trait Remote: Send + Sync {
     ) -> Result<(), Failure>;
 }
 
-/// 真的远端：SSH 借终端的复用连接（套接字不在就是没连上），Docker 用本机的 `docker` 命令
+/// 真的远端：SSH 走这个标签的连接（终端没连着就是没连上），Docker 用本机的 `docker` 命令
 pub struct OverRemote;
 
 impl OverRemote {

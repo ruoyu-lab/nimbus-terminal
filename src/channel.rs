@@ -11,6 +11,8 @@
 //!
 //! 出了岔子（超时、连接断了、读写失败）这条通道就作废、杀掉进程，下一个请求调用的人换一条新的。
 //! 这一层不认识 `ssh`：给它一个 [`Command`] 就行，所以协议能用本机的 `sh` 直接测。
+//! 起不来的时候把进程说的话（标准错误）一起交回去：Windows 上面板的 `ssh` 是自己另开的连接，
+//! 认证被拒、host key 不对都只写在那里，上层要靠它告诉人为什么没连上。
 
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -33,6 +35,14 @@ pub enum Error {
     Dead,
     /// 超时没有结束标记
     Timeout,
+}
+
+/// 通道没起来：原因，和进程到那时为止往标准错误写的话（`ssh` 连不上、认证被拒时说的就在这里；
+/// 程序根本起不来时是起不来的原因）
+#[derive(Debug, PartialEq, Eq)]
+pub struct StartError {
+    pub error: Error,
+    pub stderr: String,
 }
 
 enum Message {
@@ -85,15 +95,20 @@ fn wire(script: &str, token: &str, sequence: u64) -> String {
 }
 
 impl Channel {
-    /// 起一条通道：跑 `command`（它的标准输入输出会被接管）。起来之后先做一次空请求，把远端 shell 启动时
-    /// 可能打出来的东西（有的 `.bashrc` 会往标准输出打字）读掉丢掉，免得混进第一个请求的结果
-    pub fn start(mut command: Command) -> Result<Self, Error> {
-        let mut child = command
+    /// 起一条通道：跑 `command`（它的标准输入输出会被接管；Windows 上不开控制台窗口）。起来之后先做一次空请求，
+    /// 把远端 shell 启动时可能打出来的东西（有的 `.bashrc` 会往标准输出打字）读掉丢掉，免得混进第一个请求的结果。
+    /// 这次空请求没做成就是没起来，连同进程在标准错误里说的话一起返回
+    pub fn start(mut command: Command) -> Result<Self, StartError> {
+        let program = command.get_program().to_string_lossy().into_owned();
+        let mut child = crate::remote::hide_console(&mut command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|_| Error::Dead)?;
+            .map_err(|error| StartError {
+                error: Error::Dead,
+                stderr: format!("起不了 {program}：{error}"),
+            })?;
         let stdin = child.stdin.take();
         let (sender, messages) = mpsc::channel();
         let reader = |mut stream: Box<dyn Read + Send>,
@@ -132,8 +147,33 @@ impl Channel {
                 dead: false,
             }),
         };
-        channel.request("true", Duration::from_secs(15))?;
+        if let Err(error) = channel.request("true", Duration::from_secs(15)) {
+            return Err(StartError {
+                error,
+                stderr: channel.last_words(),
+            });
+        }
         Ok(channel)
+    }
+
+    /// 通道作废之后，把进程在标准错误里还没读到的话读完，连同之前读到的整段返回。
+    /// 进程已经杀掉、等过了，两个读线程很快就读到头；最多等一秒（万一别的进程还拿着管道）
+    fn last_words(&self) -> String {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match inner.messages.recv_timeout(remaining) {
+                Ok(Message::Err(bytes)) => inner.err.extend(bytes),
+                Ok(Message::Out(_) | Message::Closed) => {}
+                // 两个读线程都结束了，或者时间到了
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&inner.err).into_owned()
     }
 
     /// 在通道里跑一段 `sh` 脚本。同一时刻只有一个请求在跑，别的等着
@@ -220,7 +260,8 @@ impl Drop for Channel {
     }
 }
 
-#[cfg(test)]
+/// 拿本机的 `sh` 当「远端」测协议。只在 Unix 上跑：Windows 上不一定有 `sh`（装了 Git 的 Bash 里才有）
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -357,11 +398,34 @@ mod tests {
         assert_eq!(channel.request("echo hi", LONG), Err(Error::Dead));
         let mut command = Command::new("sh");
         command.args(["-c", "exit 1"]);
-        assert!(matches!(Channel::start(command), Err(Error::Dead)));
         assert!(matches!(
-            Channel::start(Command::new("/nonexistent/program")),
-            Err(Error::Dead)
+            Channel::start(command),
+            Err(StartError {
+                error: Error::Dead,
+                ..
+            })
         ));
+    }
+
+    /// 起不来的时候，进程在标准错误里说的话（`ssh` 的「Permission denied」之类）一字不落地交回去，
+    /// 哪怕是和进程退出同时才读到的。多跑几次，确认不会漏
+    #[test]
+    fn a_failed_start_keeps_what_the_process_said() {
+        for _ in 0..20 {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "echo 'Warning: first' >&2; echo 'u@h: Permission denied (publickey).' >&2; exit 255",
+            ]);
+            let Err(failed) = Channel::start(command) else {
+                panic!("不该起得来");
+            };
+            assert_eq!(failed.error, Error::Dead);
+            assert_eq!(
+                failed.stderr,
+                "Warning: first\nu@h: Permission denied (publickey).\n"
+            );
+        }
     }
 
     /// 多个线程同时请求：互斥，各拿各的结果
@@ -384,6 +448,44 @@ mod tests {
             .collect();
         for handle in handles {
             handle.join().expect("线程没有 panic");
+        }
+    }
+}
+
+/// 不用 `sh` 的：每个系统上都跑
+#[cfg(test)]
+mod anywhere {
+    use super::*;
+
+    /// 程序根本起不来（没有这个程序）：Dead，起不来的原因放在 `stderr` 里
+    #[test]
+    fn a_program_that_does_not_exist_is_dead_with_a_reason() {
+        let Err(failed) = Channel::start(Command::new("/nonexistent/nimbus-program")) else {
+            panic!("不该起得来");
+        };
+        assert_eq!(failed.error, Error::Dead);
+        assert!(
+            failed
+                .stderr
+                .starts_with("起不了 /nonexistent/nimbus-program："),
+            "{}",
+            failed.stderr
+        );
+    }
+
+    /// Windows：拿系统自带的 `cmd` 当一个一起来就报错退出的「ssh」，它在标准错误里说的话要交回来
+    /// （读线程和进程退出是同时的，多跑几次确认不会漏）
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_start_keeps_what_the_process_said() {
+        for _ in 0..10 {
+            let mut command = Command::new("cmd");
+            command.args(["/D", "/C", "echo nimbus-denied 1>&2 & exit 255"]);
+            let Err(failed) = Channel::start(command) else {
+                panic!("不该起得来");
+            };
+            assert_eq!(failed.error, Error::Dead);
+            assert_eq!(failed.stderr.trim_end(), "nimbus-denied");
         }
     }
 }
