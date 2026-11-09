@@ -17,7 +17,7 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 | 路径 | 认 `C:\…`、`C:/…`、`.\…`、`..\…`、`~\…`、`\\服务器\共享\…`；拖进来的路径按这个终端起的 shell 引（PowerShell 单引号、cmd 双引号，能两边都对时用双引号）；文件页的上传下载换成 `C:/…` 交给 `sftp`；远端文件名里 Windows 不能有的字换成 `_`，跑不出下载目录 |
 | 字体 | 系统等宽（Cascadia Mono，Windows 10 上退到 Consolas）、Cascadia Mono、Consolas、Courier New |
 | 图片 | iTerm2 内联图片能用；Kitty（APC）、Sixel（DCS）被系统的 ConPTY 整段吃掉（测试标了 `#[ignore]`）。要支持得像 WezTerm 那样随包带新版的 `conpty.dll` 和 `OpenConsole.exe` |
-| 窗口 | 窗口按钮按 Windows 的样子自己画；**系统材质先关着**（`chrome::WINDOW_MATERIAL`，原因见下）。窗口位置按显示器记（Win32 枚举显示器） |
+| 窗口 | 窗口按钮按 Windows 的样子自己画；侧栏透出系统材质（Mica，框架 `c2728f4` 起开着材质也不会多出系统的窗口按钮）。窗口位置按显示器记（Win32 枚举显示器） |
 | 打包 | `scripts\bundle-windows.ps1`：默认出 NSIS 安装程序（先要 `cargo install cargo-packager --version 0.11.8 --locked`，第一次还会下载 NSIS）；`-Format installer` 用框架自己的安装程序，不用下载。编译时（`build.rs`）就把图标和应用标识写进可执行文件 |
 | 通知 | 应用标识 `com.ruoyu-lab.nimbus` 在启动时声明；Windows 要先登记过这个标识才显示通知，安装程序建开始菜单快捷方式时会登记 |
 | Docker 目标 | 代码在 Windows 上编译、子进程不弹窗口；这台机器没装 Docker，没验证 |
@@ -35,14 +35,11 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 
 ## 还没做、要在框架那边做的
 
-1. **系统材质**：框架为了透出材质把窗口框架扩到整个窗口（`DwmExtendFrameIntoClientArea` 用 -1），窗口又留着标题栏的样式，
-   系统就在右上角画一套原生的最小化、最大化、关闭，和 Nimbus 自己画的叠在一起；框架却报告「Windows 上没有系统按钮」
-   （`title_bar_info().controls` 是 `None`）。框架修好（不让系统画，或者报告它们、让出位置）以后把 `chrome::WINDOW_MATERIAL` 打开。
-2. **框架依赖是私有仓库**：现在用的是 aureole-framework（私有）`windows-first-tier` 分支的 `54913ae`，外部的人和 CI 都拉不到。
+1. **框架依赖是私有仓库**：现在用的是 aureole-framework（私有）master 的 `d213db7`，外部的人和 CI 都拉不到。
    框架出了带 Windows 改进的公开版本以后换回公开的依赖。在那之前 CI 的两个任务都会在第一步失败。
-3. **混合缩放的多显示器**：窗口位置按显示器记，但窗口库按建窗口时那块显示器的缩放换算存下的位置；
+2. **混合缩放的多显示器**：窗口位置按显示器记，但窗口库按建窗口时那块显示器的缩放换算存下的位置；
    主屏 150%、副屏 100% 时在副屏上关掉、再打开，要看会不会开到一半在屏幕外面。
-4. **macOS、Linux 没编译过**：这一轮的改动在 Windows 上做的，类 Unix 的分支只读过代码，要等 macOS 的 CI（依赖换回公开的以后）。
+3. **macOS、Linux 没编译过**：这一轮的改动在 Windows 上做的，类 Unix 的分支只读过代码，要等 macOS 的 CI（依赖换回公开的以后）。
    CI 的 clippy 只在 macOS 上跑，管不到 `cfg(windows)` 的代码（`pty/windows.rs` 等），本机也没装 clippy。
 
 ## 测试

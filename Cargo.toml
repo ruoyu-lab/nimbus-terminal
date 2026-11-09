@@ -22,9 +22,9 @@ category = "developer-tools"
 icon = "assets/icon-windows.png"
 
 [dependencies]
-# 只用公开 API，不改框架。现在用的是私有仓库 windows-first-tier 分支上的提交（Windows 上改大小、标题栏、输入的改进），
+# 只用公开 API，不改框架。现在用的是私有仓库 master 上的提交（带 Windows 上改大小、标题栏、输入、材质的改进），
 # 框架出了带这些的公开版本以后换回公开的
-aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "54913ae" }
+aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "d213db7" }
 # 字宽（汉字、emoji 两格）：和框架用同一版
 unicode-width = "0.2"
 # 设置、文件夹、窗口位置的落盘（JSON）
@@ -33,7 +33,7 @@ serde_json = "1"
 
 [dev-dependencies]
 # 离屏测试：`Harness` 挂视图、模拟点击和移动，不用 GPU 和窗口
-aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "54913ae", features = ["testing"] }
+aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "d213db7", features = ["testing"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -94,12 +94,8 @@ fn main() {
                 .title_bar(TitleBar::Hidden)
                 .title_bar_controls_position(tabs::CONTROLS_POSITION.0, tabs::CONTROLS_POSITION.1)
                 // 外框（标题栏和侧栏）透出系统的窗口材质，白色的主卡片浮在上面；
-                // 平台不支持、或者没开（Windows，见 `chrome::WINDOW_MATERIAL`）时不透明，底色由 `chrome` 定
-                .backdrop(if chrome::WINDOW_MATERIAL {
-                    WindowMaterial::Sidebar
-                } else {
-                    WindowMaterial::Opaque
-                })
+                // 平台不支持时照常不透明（底色由 `chrome` 按能力决定）
+                .backdrop(WindowMaterial::Sidebar)
                 // 再小就放不下侧栏和标签了
                 .min_size(display::MIN_SIZE.0, display::MIN_SIZE.1)
                 // 点关闭先把工作区存一遍：之后窗口一关，shell 就收到 SIGHUP，屏幕上的内容会变

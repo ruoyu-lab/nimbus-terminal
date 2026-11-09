@@ -418,7 +418,7 @@ dependencies = [
 [[package]]
 name = "aureole"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "aureole-controls",
  "aureole-core",
@@ -429,12 +429,12 @@ dependencies = [
 [[package]]
 name = "aureole-animation"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 
 [[package]]
 name = "aureole-controls"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "aureole-core",
  "aureole-reactive",
@@ -443,7 +443,7 @@ dependencies = [
 [[package]]
 name = "aureole-core"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "accesskit",
  "aureole-animation",
@@ -474,7 +474,7 @@ dependencies = [
 [[package]]
 name = "aureole-platform"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "arboard",
  "block2 0.6.2",
@@ -500,7 +500,7 @@ dependencies = [
 [[package]]
 name = "aureole-reactive"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "slotmap",
  "tracing",
@@ -509,7 +509,7 @@ dependencies = [
 [[package]]
 name = "aureole-render"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "aureole-scene",
  "bytemuck",
@@ -523,7 +523,7 @@ dependencies = [
 [[package]]
 name = "aureole-runtime"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -542,7 +542,7 @@ dependencies = [
 [[package]]
 name = "aureole-scene"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "bytemuck",
 ]
@@ -550,7 +550,7 @@ dependencies = [
 [[package]]
 name = "aureole-testing"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=54913ae#54913aeec3bec0fd235d872b33565c30bf9b99a2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=d213db7#d213db7bc73b18630ea3e1bc350036ecf1613741"
 dependencies = [
  "accesskit",
  "aureole-core",
