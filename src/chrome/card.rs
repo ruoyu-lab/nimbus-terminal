@@ -146,6 +146,7 @@ fn pane_leaf(
 ) -> Element {
     let (focus, owner, tab_id) = (tab.focus, workspace.clone(), tab.id);
     let (dropper, drop_session) = (workspace.clone(), session.clone());
+    let (files_dropper, files_session) = (workspace.clone(), session.clone());
     let focused = move || focus.get() == pane;
     // 右键菜单：点在哪、开没开
     let (open, at) = (signal(false), signal([0.0f32, 0.0]));
@@ -166,6 +167,13 @@ fn pane_leaf(
         .clip(true)
         .report_bounds(bounds)
         .on_pointer_down(move |_: &PointerEvent| owner.focus_pane(tab_id, pane))
+        // 从访达拖来的文件：把本机路径写在这个终端的光标处（服务器、容器里的终端不收）
+        .on_file_drop(move |event: &FileDropEvent| {
+            files_dropper.focus_pane(tab_id, pane);
+            if files_session.drop_files(&event.paths) {
+                files_session.request_focus();
+            }
+        })
         // 从右侧文件页拖来的条目：把它的绝对路径写在这个终端的光标处（引好，不按回车）
         .accepts_drop(|_: &RemotePath| true)
         .on_drop(move |path: RemotePath, _: &DropEvent| {

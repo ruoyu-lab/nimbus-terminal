@@ -9,7 +9,10 @@ use crate::vt::Cell;
 pub enum Link {
     Url(String),
     /// 路径原样（还没展开 `~`、没接当前目录），以及后面跟的行号
-    Path { path: String, line: Option<u32> },
+    Path {
+        path: String,
+        line: Option<u32>,
+    },
 }
 
 /// 链接两边的界：碰到这些就断开
@@ -18,7 +21,19 @@ fn is_break(ch: char) -> bool {
         || ch.is_control()
         || matches!(
             ch,
-            '"' | '\'' | '`' | '<' | '>' | '|' | '（' | '）' | '「' | '」' | '“' | '”' | '，' | '。'
+            '"' | '\''
+                | '`'
+                | '<'
+                | '>'
+                | '|'
+                | '（'
+                | '）'
+                | '「'
+                | '」'
+                | '“'
+                | '”'
+                | '，'
+                | '。'
         )
 }
 
@@ -44,7 +59,9 @@ pub fn scan(line: &[Cell], uris: &[String]) -> Vec<(Link, usize, usize)> {
             last += 1;
         }
         if let Some(hit) = token_link(&chars, index, last)
-            && !found.iter().any(|(_, start, end)| hit.1 < *end && *start < hit.2)
+            && !found
+                .iter()
+                .any(|(_, start, end)| hit.1 < *end && *start < hit.2)
         {
             found.push(hit);
         }
@@ -123,9 +140,10 @@ fn token_link(
 /// 点一下就用默认应用打开也不要紧的文件：文档、图片、文本、代码。别的（可执行的、安装包）不直接开
 pub fn is_plain_document(path: &std::path::Path) -> bool {
     const PLAIN: [&str; 40] = [
-        "txt", "md", "log", "json", "toml", "yaml", "yml", "csv", "pdf", "png", "jpg", "jpeg", "gif", "webp",
-        "svg", "html", "htm", "css", "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp", "java", "kt",
-        "swift", "rb", "php", "xml", "ini", "conf", "cfg", "lock", "diff", "patch",
+        "txt", "md", "log", "json", "toml", "yaml", "yml", "csv", "pdf", "png", "jpg", "jpeg",
+        "gif", "webp", "svg", "html", "htm", "css", "rs", "py", "js", "ts", "tsx", "jsx", "go",
+        "c", "h", "cpp", "java", "kt", "swift", "rb", "php", "xml", "ini", "conf", "cfg", "lock",
+        "diff", "patch",
     ];
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -140,7 +158,11 @@ fn classify(text: &str) -> Option<Link> {
             return (text.len() > scheme.len()).then(|| Link::Url(text.to_string()));
         }
     }
-    if !(text.starts_with('/') || text.starts_with("~/") || text.starts_with("./") || text.starts_with("../")) {
+    if !(text.starts_with('/')
+        || text.starts_with("~/")
+        || text.starts_with("./")
+        || text.starts_with("../"))
+    {
         return None;
     }
     // `路径:行号[:列号]`：从后面剥掉纯数字的段
@@ -194,8 +216,12 @@ mod tests {
         assert_eq!(link, Link::Url("https://example.com/docs".into()));
         let (link, ..) = at("(see https://example.com/x)", "https", 0).expect("链接");
         assert_eq!(link, Link::Url("https://example.com/x".into()));
-        let (link, ..) = at("https://en.wikipedia.org/wiki/Rust_(language)", "https", 0).expect("链接");
-        assert_eq!(link, Link::Url("https://en.wikipedia.org/wiki/Rust_(language)".into()));
+        let (link, ..) =
+            at("https://en.wikipedia.org/wiki/Rust_(language)", "https", 0).expect("链接");
+        assert_eq!(
+            link,
+            Link::Url("https://en.wikipedia.org/wiki/Rust_(language)".into())
+        );
     }
 
     #[test]
@@ -218,11 +244,29 @@ mod tests {
     #[test]
     fn finds_paths_with_line_and_column() {
         let (link, ..) = at("error in ./src/main.rs:42:7: bad", "./src", 3).expect("路径");
-        assert_eq!(link, Link::Path { path: "./src/main.rs".into(), line: Some(42) });
+        assert_eq!(
+            link,
+            Link::Path {
+                path: "./src/main.rs".into(),
+                line: Some(42)
+            }
+        );
         let (link, ..) = at("~/notes/todo.md", "~/", 0).expect("路径");
-        assert_eq!(link, Link::Path { path: "~/notes/todo.md".into(), line: None });
+        assert_eq!(
+            link,
+            Link::Path {
+                path: "~/notes/todo.md".into(),
+                line: None
+            }
+        );
         let (link, ..) = at("cat /var/log/system.log", "/var", 0).expect("路径");
-        assert_eq!(link, Link::Path { path: "/var/log/system.log".into(), line: None });
+        assert_eq!(
+            link,
+            Link::Path {
+                path: "/var/log/system.log".into(),
+                line: None
+            }
+        );
         // 普通的词、相对路径（没有 ./）、单个斜杠不算
         assert!(at("a/b/c", "a/b", 0).is_none());
         assert!(at("/ alone", "/", 0).is_none());

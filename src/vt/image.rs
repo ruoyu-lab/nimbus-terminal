@@ -5,6 +5,11 @@
 //!
 //! 位置用行的编号记（见 [`super::marks`]）：图片跟着它所在的那一行一起滚进历史。
 
+mod codec;
+mod sixel;
+
+use codec::{decode_base64, image_size};
+use sixel::decode_sixel;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -119,7 +124,9 @@ impl Terminal {
             })
             .collect();
         let mut keep = alive.into_iter();
-        self.images.placements.retain(|_| keep.next().unwrap_or(false));
+        self.images
+            .placements
+            .retain(|_| keep.next().unwrap_or(false));
     }
 
     /// 清屏（`ED 2`、`ED 3`）、整机复位：图片一起清掉
@@ -153,7 +160,10 @@ impl Terminal {
             ),
             (width, Extent::Auto) => {
                 let cols = resolve(width, cell_width, columns);
-                (cols, (cols * cell_width * ratio / cell_height).ceil().max(1.0))
+                (
+                    cols,
+                    (cols * cell_width * ratio / cell_height).ceil().max(1.0),
+                )
             }
             (Extent::Auto, height) => {
                 let rows = resolve(height, cell_height, screen_rows);
@@ -259,7 +269,9 @@ impl Terminal {
 
     pub(super) fn dcs(&mut self, content: &[u8]) {
         // 参数是数字和分号，后面跟 `q` 才是 Sixel
-        let Some(start) = content.iter().position(|byte| !byte.is_ascii_digit() && *byte != b';')
+        let Some(start) = content
+            .iter()
+            .position(|byte| !byte.is_ascii_digit() && *byte != b';')
         else {
             return;
         };
@@ -427,7 +439,7 @@ fn kitty_image(control: &HashMap<String, String>, bytes: Vec<u8>) -> Option<Imag
                     return None;
                 }
                 let mut rgba = Vec::with_capacity(count * 4);
-                for pixel in bytes.chunks_exact(3) {
+                for pixel in bytes.as_chunks::<3>().0 {
                     rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
                 }
                 rgba
@@ -471,308 +483,18 @@ fn resolve(extent: Extent, unit: f32, total: usize) -> f32 {
     }
 }
 
-// ---------- base64 ----------
-
-/// 标准 base64，空白忽略，末尾的 `=` 可有可无。写错了是 `None`
-pub fn decode_base64(text: &[u8]) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(text.len() / 4 * 3);
-    let (mut buffer, mut bits) = (0u32, 0u32);
-    for &byte in text {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' => break,
-            b' ' | b'\n' | b'\r' | b'\t' => continue,
-            _ => return None,
-        };
-        buffer = (buffer << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buffer >> bits) as u8);
-            buffer &= (1 << bits) - 1;
-        }
-    }
-    Some(output)
-}
-
-// ---------- 从文件头读图片的宽高 ----------
-
-/// PNG、JPEG、GIF、WebP 的像素宽高（只读文件头，不解码）。认不出来、尺寸不合理是 `None`
-pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    let be32 = |at: usize| -> Option<u32> {
-        Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-    };
-    let (width, height) = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        (be32(16)?, be32(20)?)
-    } else if bytes.starts_with(b"GIF8") {
-        let le16 = |at: usize| Some(u32::from(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?)));
-        (le16(6)?, le16(8)?)
-    } else if bytes.starts_with(b"\xff\xd8") {
-        jpeg_size(bytes)?
-    } else if bytes.len() > 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        webp_size(bytes)?
-    } else {
-        return None;
-    };
-    (width > 0 && height > 0 && u64::from(width) * u64::from(height) <= MAX_PIXELS)
-        .then_some((width, height))
-}
-
-fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    let mut at = 2;
-    while at + 9 < bytes.len() {
-        if bytes[at] != 0xff {
-            at += 1;
-            continue;
-        }
-        let marker = bytes[at + 1];
-        // 没有长度的标记
-        if marker == 0xff || marker == 0x01 || (0xd0..=0xd9).contains(&marker) {
-            at += if marker == 0xff { 1 } else { 2 };
-            continue;
-        }
-        let length = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
-        // SOF0..SOF15（除了 DHT、JPG、DAC）带着尺寸
-        if matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
-            let height = u32::from(u16::from_be_bytes([bytes[at + 5], bytes[at + 6]]));
-            let width = u32::from(u16::from_be_bytes([bytes[at + 7], bytes[at + 8]]));
-            return Some((width, height));
-        }
-        at += 2 + length;
-    }
-    None
-}
-
-fn webp_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    match bytes.get(12..16)? {
-        b"VP8 " => {
-            let width = u32::from(u16::from_le_bytes(bytes.get(26..28)?.try_into().ok()?) & 0x3fff);
-            let height = u32::from(u16::from_le_bytes(bytes.get(28..30)?.try_into().ok()?) & 0x3fff);
-            Some((width, height))
-        }
-        b"VP8L" => {
-            let bits = u32::from_le_bytes(bytes.get(21..25)?.try_into().ok()?);
-            Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
-        }
-        b"VP8X" => {
-            let le24 = |at: usize| -> Option<u32> {
-                let part = bytes.get(at..at + 3)?;
-                Some(u32::from(part[0]) | u32::from(part[1]) << 8 | u32::from(part[2]) << 16)
-            };
-            Some((le24(24)? + 1, le24(27)? + 1))
-        }
-        _ => None,
-    }
-}
-
-// ---------- Sixel ----------
-
-/// VT340 的默认 16 色
-const SIXEL_PALETTE: [(u8, u8, u8); 16] = [
-    (0, 0, 0),
-    (51, 51, 204),
-    (204, 33, 33),
-    (51, 204, 51),
-    (204, 51, 204),
-    (51, 204, 204),
-    (204, 204, 51),
-    (135, 135, 135),
-    (66, 66, 66),
-    (84, 84, 153),
-    (153, 66, 66),
-    (84, 153, 84),
-    (153, 84, 153),
-    (84, 153, 153),
-    (153, 153, 84),
-    (204, 204, 204),
-];
-
-/// HLS（色相 0–360，亮度、饱和度 0–100）→ RGB
-fn hls_to_rgb(hue: f32, lightness: f32, saturation: f32) -> (u8, u8, u8) {
-    let (l, s) = (lightness / 100.0, saturation / 100.0);
-    // Sixel 的色相 0 是蓝色，比通常的 HLS 转了 240 度
-    let h = ((hue + 240.0) % 360.0) / 360.0;
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
-    let p = 2.0 * l - q;
-    let channel = |mut t: f32| {
-        if t < 0.0 {
-            t += 1.0;
-        }
-        if t > 1.0 {
-            t -= 1.0;
-        }
-        let value = if t < 1.0 / 6.0 {
-            p + (q - p) * 6.0 * t
-        } else if t < 0.5 {
-            q
-        } else if t < 2.0 / 3.0 {
-            p + (q - p) * (2.0 / 3.0 - t) * 6.0
-        } else {
-            p
-        };
-        (value * 255.0).round().clamp(0.0, 255.0) as u8
-    };
-    if s == 0.0 {
-        let gray = (l * 255.0).round() as u8;
-        return (gray, gray, gray);
-    }
-    (channel(h + 1.0 / 3.0), channel(h), channel(h - 1.0 / 3.0))
-}
-
-/// 解 Sixel 的数据（`q` 后面的部分）：宽、高、RGBA（没画到的像素是透明的）。出错、太大是 `None`
-fn decode_sixel(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    const MAX_SIDE: usize = 8192;
-    let mut palette = [(0u8, 0u8, 0u8); 256];
-    palette[..16].copy_from_slice(&SIXEL_PALETTE);
-    let (mut width, mut height) = (0usize, 0usize);
-    // 每个像素一个 u32：0 是没画，否则是 0xFF000000 | RGB。按行存，行宽是 `stride`
-    let mut stride = 0usize;
-    let mut pixels: Vec<u32> = Vec::new();
-    let (mut x, mut band) = (0usize, 0usize);
-    let mut color = 0usize;
-    let mut at = 0;
-    let number = |at: &mut usize| -> Option<usize> {
-        let start = *at;
-        while *at < data.len() && data[*at].is_ascii_digit() {
-            *at += 1;
-        }
-        (*at > start).then(|| std::str::from_utf8(&data[start..*at]).ok()?.parse().ok())?
-    };
-    while at < data.len() {
-        let byte = data[at];
-        at += 1;
-        match byte {
-            // 光栅属性 "Pan;Pad;Ph;Pv：只用来知道大小的下限，数据本身会撑开
-            b'"' => {
-                let mut values = Vec::new();
-                loop {
-                    match number(&mut at) {
-                        Some(value) => values.push(value),
-                        None => break,
-                    }
-                    if data.get(at) == Some(&b';') {
-                        at += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if let (Some(&w), Some(&h)) = (values.get(2), values.get(3)) {
-                    width = width.max(w.min(MAX_SIDE));
-                    height = height.max(h.min(MAX_SIDE));
-                }
-            }
-            b'#' => {
-                let index = number(&mut at)?.min(255);
-                if data.get(at) == Some(&b';') {
-                    at += 1;
-                    let kind = number(&mut at)?;
-                    let mut parts = [0usize; 3];
-                    for part in &mut parts {
-                        if data.get(at) == Some(&b';') {
-                            at += 1;
-                        }
-                        *part = number(&mut at).unwrap_or(0);
-                    }
-                    palette[index] = if kind == 2 {
-                        let scale = |value: usize| (value.min(100) as f32 * 255.0 / 100.0).round() as u8;
-                        (scale(parts[0]), scale(parts[1]), scale(parts[2]))
-                    } else {
-                        hls_to_rgb(parts[0] as f32, parts[1] as f32, parts[2] as f32)
-                    };
-                }
-                color = index;
-            }
-            b'$' => x = 0,
-            b'-' => {
-                x = 0;
-                band += 1;
-            }
-            b'!' | b'?'..=b'~' => {
-                let (count, sixel) = if byte == b'!' {
-                    let count = number(&mut at)?;
-                    let sixel = *data.get(at)?;
-                    at += 1;
-                    (count, sixel)
-                } else {
-                    (1, byte)
-                };
-                if !(b'?'..=b'~').contains(&sixel) {
-                    continue;
-                }
-                let bits = sixel - b'?';
-                let (red, green, blue) = palette[color];
-                let rgb = 0xff00_0000 | u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue);
-                if x + count > MAX_SIDE || (band + 1) * 6 > MAX_SIDE {
-                    return None;
-                }
-                // 宽度、高度不够就扩（先扩宽：每一行搬到新的行距里；再扩高：补零行）
-                let needed_width = x + count;
-                let needed_height = (band + 1) * 6;
-                if needed_width > stride {
-                    let rows = if stride == 0 { 0 } else { pixels.len() / stride };
-                    let mut grown = vec![0u32; needed_width * rows];
-                    for row in 0..rows {
-                        grown[row * needed_width..row * needed_width + stride]
-                            .copy_from_slice(&pixels[row * stride..(row + 1) * stride]);
-                    }
-                    pixels = grown;
-                    stride = needed_width;
-                }
-                if pixels.len() / stride < needed_height {
-                    pixels.resize(stride * needed_height, 0);
-                }
-                for bit in 0..6 {
-                    if bits & (1 << bit) != 0 {
-                        let row = band * 6 + bit;
-                        for column in x..x + count {
-                            pixels[row * stride + column] = rgb;
-                        }
-                    }
-                }
-                x += count;
-                width = width.max(x);
-                height = height.max(band * 6 + 6);
-            }
-            _ => {}
-        }
-    }
-    if width == 0 || height == 0 || stride == 0 {
-        return None;
-    }
-    let (width, height) = (width.min(stride), height.min(pixels.len() / stride));
-    if (width * height) as u64 > MAX_PIXELS {
-        return None;
-    }
-    let mut rgba = Vec::with_capacity(width * height * 4);
-    for row in 0..height {
-        for column in 0..width {
-            let pixel = pixels[row * stride + column];
-            if pixel == 0 {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            } else {
-                rgba.extend_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8, 255]);
-            }
-        }
-    }
-    Some((width as u32, height as u32, rgba))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn base64(bytes: &[u8]) -> String {
-        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut text = String::new();
         for chunk in bytes.chunks(3) {
-            let value = chunk
-                .iter()
-                .enumerate()
-                .fold(0u32, |acc, (index, byte)| acc | u32::from(*byte) << (16 - 8 * index));
+            let value = chunk.iter().enumerate().fold(0u32, |acc, (index, byte)| {
+                acc | u32::from(*byte) << (16 - 8 * index)
+            });
             for index in 0..4 {
                 if index <= chunk.len() {
                     text.push(TABLE[(value >> (18 - 6 * index) & 63) as usize] as char);
@@ -795,10 +517,24 @@ mod tests {
 
     #[test]
     fn base64_roundtrip_and_errors() {
-        for sample in [&b""[..], b"a", b"ab", b"abc", b"hello world!", &[0, 255, 128, 7]] {
-            assert_eq!(decode_base64(base64(sample).as_bytes()).as_deref(), Some(sample));
+        for sample in [
+            &b""[..],
+            b"a",
+            b"ab",
+            b"abc",
+            b"hello world!",
+            &[0, 255, 128, 7],
+        ] {
+            assert_eq!(
+                decode_base64(base64(sample).as_bytes()).as_deref(),
+                Some(sample)
+            );
         }
-        assert_eq!(decode_base64(b"aGVs\nbG8=").as_deref(), Some(&b"hello"[..]), "空白忽略");
+        assert_eq!(
+            decode_base64(b"aGVs\nbG8=").as_deref(),
+            Some(&b"hello"[..]),
+            "空白忽略"
+        );
         assert!(decode_base64(b"a$b").is_none());
     }
 
@@ -808,8 +544,8 @@ mod tests {
         assert_eq!(image_size(b"GIF89a\x10\x00\x20\x00rest"), Some((16, 32)));
         // JPEG：SOI，一个 APP0（长度 4），然后 SOF0（高 100，宽 200）
         let jpeg = [
-            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0, 0, 0xff, 0xc0, 0x00, 0x0b, 8, 0x00, 100, 0x00, 200, 1, 1, 0x11,
-            0,
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0, 0, 0xff, 0xc0, 0x00, 0x0b, 8, 0x00, 100, 0x00,
+            200, 1, 1, 0x11, 0,
         ];
         assert_eq!(image_size(&jpeg), Some((200, 100)));
         assert_eq!(image_size(b"not an image at all, just text"), None);
@@ -831,16 +567,32 @@ mod tests {
         term.feed(format!("\x1b]1337;File=inline=1;width=10;height=3:{png}\x07").as_bytes());
         let placement = &term.placements()[0];
         assert_eq!((placement.cols, placement.rows), (10, 3));
-        assert_eq!((placement.column, term.screen().cursor.row, term.screen().cursor.column), (0, 3, 0));
+        assert_eq!(
+            (
+                placement.column,
+                term.screen().cursor.row,
+                term.screen().cursor.column
+            ),
+            (0, 3, 0)
+        );
         // 只给宽：高按宽高比算（20 列 = 200px 宽，高 80px = 4 行）
         term.feed(format!("\x1b]1337;File=inline=1;width=20:{png}\x07").as_bytes());
-        assert_eq!((term.placements()[1].cols, term.placements()[1].rows), (20, 4));
+        assert_eq!(
+            (term.placements()[1].cols, term.placements()[1].rows),
+            (20, 4)
+        );
         // 都不给：原始大小，100×40 px = 10 × 2 格
         term.feed(format!("\x1b]1337;File=inline=1:{png}\x07").as_bytes());
-        assert_eq!((term.placements()[2].cols, term.placements()[2].rows), (10, 2));
+        assert_eq!(
+            (term.placements()[2].cols, term.placements()[2].rows),
+            (10, 2)
+        );
         // 百分比、像素
         term.feed(format!("\x1b]1337;File=inline=1;width=50%;height=60px:{png}\x07").as_bytes());
-        assert_eq!((term.placements()[3].cols, term.placements()[3].rows), (20, 3));
+        assert_eq!(
+            (term.placements()[3].cols, term.placements()[3].rows),
+            (20, 3)
+        );
         // 不是内联的（下载）、不是图片、base64 坏了：不放
         let before = term.placements().len();
         term.feed(format!("\x1b]1337;File=name=a.png:{png}\x07").as_bytes());
@@ -857,7 +609,10 @@ mod tests {
         term.feed(format!("\x1b]1337;File=inline=1:{png}\x07").as_bytes());
         let placement = &term.placements()[0];
         assert_eq!(placement.cols, 40, "不超过终端宽");
-        assert_eq!(placement.rows, 4, "高跟着等比缩小（原来 10 行，宽缩到 40/100，高也是 4 行）");
+        assert_eq!(
+            placement.rows, 4,
+            "高跟着等比缩小（原来 10 行，宽缩到 40/100，高也是 4 行）"
+        );
     }
 
     /// 图片跟着它所在的行滚进历史；滚出历史（挤掉了）就清理；清屏时一起清
@@ -871,7 +626,11 @@ mod tests {
         let before = term.absolute_line(line).expect("在");
         term.feed(b"1\r\n2\r\n3\r\n4\r\n5\r\n");
         assert!(term.absolute_line(line).is_some());
-        assert_eq!(term.absolute_line(line), Some(before), "滚了以后编号还对应同一行");
+        assert_eq!(
+            term.absolute_line(line),
+            Some(before),
+            "滚了以后编号还对应同一行"
+        );
         term.prune_images();
         assert_eq!(term.placements().len(), 1);
         term.feed(b"\x1b[2J");
@@ -885,11 +644,19 @@ mod tests {
     #[test]
     fn kitty_direct_transmission_replies_and_deletes() {
         let mut term = terminal();
-        let pixels = base64(&[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
+        let pixels = base64(&[
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ]);
         // a=T：传输并显示；带编号时回 OK
         term.feed(format!("\x1b_Ga=T,f=32,s=2,v=2,i=7;{pixels}\x1b\\").as_bytes());
         assert_eq!(term.placements().len(), 1);
-        assert_eq!((term.placements()[0].data.width, term.placements()[0].data.height), (2, 2));
+        assert_eq!(
+            (
+                term.placements()[0].data.width,
+                term.placements()[0].data.height
+            ),
+            (2, 2)
+        );
         assert_eq!(term.take_output(), b"\x1b_Gi=7;OK\x1b\\");
         // 不带编号：不回
         term.feed(format!("\x1b_Ga=T,f=32,s=2,v=2;{pixels}\x1b\\").as_bytes());
@@ -902,7 +669,10 @@ mod tests {
         assert_eq!(term.placements().len(), 3, "a=t 只存不放");
         term.take_output();
         term.feed(b"\x1b_Ga=p,i=9,c=6,r=2\x1b\\");
-        assert_eq!((term.placements()[3].cols, term.placements()[3].rows), (6, 2));
+        assert_eq!(
+            (term.placements()[3].cols, term.placements()[3].rows),
+            (6, 2)
+        );
         // 放不存在的：报错
         term.feed(b"\x1b_Ga=p,i=99\x1b\\");
         assert!(String::from_utf8_lossy(&term.take_output()).contains("ENOENT"));
@@ -920,7 +690,10 @@ mod tests {
         assert!(term.placements().is_empty(), "还没传完");
         term.feed(format!("\x1b_Gm=0;{second}\x1b\\").as_bytes());
         assert_eq!(term.placements().len(), 1);
-        assert_eq!((term.placements()[0].cols, term.placements()[0].rows), (3, 2));
+        assert_eq!(
+            (term.placements()[0].cols, term.placements()[0].rows),
+            (3, 2)
+        );
         term.take_output();
         // C=1：放了以后光标不动
         let row = term.screen().cursor.row;

@@ -1,7 +1,8 @@
 //! pty 层：起一个子进程，把它的终端接到我们手上。
 //!
 //! 跨平台的接缝是 [`PtyBackend`]：类 Unix 走 `forkpty`（[`posix`]，在 macOS 上跑，Linux 是同一套代码），
-//! Windows 要另写一份 ConPTY 实现，那边现在调用会直接报错，而不是编出一个能过但跑不对的二进制。
+//! Windows 走 ConPTY（[`windows`]，现在只有骨架，调用会直接报错，而不是编出一个能过但跑不对的二进制）。
+//! 加一个平台只要在这里加一个后端文件，再接到 [`spawn`] 和 [`default_shell`]，上面的代码不用动。
 //!
 //! 数据走两条线：
 //! - **读**：后台线程堵住 pty 的读端，读到多少就塞进 [`ByteQueue`]，主线程 `await` 它
@@ -9,7 +10,11 @@
 
 #[cfg(unix)]
 mod posix;
+// ConPTY 后端写出来之前，Windows 上这些都没人用
+#[cfg_attr(not(unix), allow(dead_code))]
 mod queue;
+#[cfg(windows)]
+mod windows;
 
 use std::io;
 use std::path::PathBuf;
@@ -64,6 +69,7 @@ impl Pty {
 }
 
 /// 起一个子进程要说的东西
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct Config {
     /// 要跑的程序，一般是 `$SHELL`
     pub program: String,
@@ -100,8 +106,7 @@ impl Config {
 
     /// 用户默认的 shell，加上登录 shell 该有的那几个参数
     pub fn login_shell(columns: u16, rows: u16) -> Self {
-        let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        Self::shell(program, columns, rows)
+        Self::shell(default_shell(), columns, rows)
     }
 
     /// 跑指定的 shell 程序；认识的 shell 按登录 shell 起
@@ -125,16 +130,28 @@ fn home_directory() -> Option<PathBuf> {
     crate::store::user_home()
 }
 
+/// 这个平台上用户默认的 shell：类 Unix 读 `$SHELL`，Windows 读 `%COMSPEC%`（没有就 PowerShell）
+pub fn default_shell() -> String {
+    #[cfg(unix)]
+    return std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    #[cfg(windows)]
+    return std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
+    #[cfg(not(any(unix, windows)))]
+    return String::new();
+}
+
 /// 起一个 pty，返回句柄和读到的字节
 pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
     #[cfg(unix)]
     return posix::spawn(config);
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    return windows::spawn(config);
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = config;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "这一版只在 macOS（类 Unix）上实现了 pty，Windows 的 ConPTY 还没写",
+            "这个平台没有 pty 后端",
         ))
     }
 }

@@ -20,3 +20,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
       - run: cargo build --release
+
+  # Windows 现在只能编译（ConPTY 后端还没写，见 docs/windows.md）：先保证它一直编得过
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets

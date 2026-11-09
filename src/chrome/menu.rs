@@ -551,7 +551,11 @@ pub(super) fn paste_dialog(workspace: Rc<Workspace>) -> Element {
         .take(6)
         .map(|line| {
             let short: String = line.chars().take(60).collect();
-            if line.chars().count() > 60 { format!("{short}…") } else { short }
+            if line.chars().count() > 60 {
+                format!("{short}…")
+            } else {
+                short
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -592,7 +596,11 @@ pub(super) fn paste_dialog(workspace: Rc<Workspace>) -> Element {
                 .child(text(preview).font_size(12).font_family("monospace"))
                 .child_when(
                     move || more > 0,
-                    move || text(format!("… 还有 {more} 行")).font_size(12).color(text_3()),
+                    move || {
+                        text(format!("… 还有 {more} 行"))
+                            .font_size(12)
+                            .color(text_3())
+                    },
                 ),
         )
         .child(

@@ -552,7 +552,10 @@ mod tests {
             events(&["\x1b_Gi=".as_bytes(), "1\x1b".as_bytes(), "\\".as_bytes()]),
             vec![Event::Apc(b"Gi=1".to_vec())]
         );
-        assert_eq!(events(&["\x1b_Gabc\x18z".as_bytes()]), vec![Event::Print('z')]);
+        assert_eq!(
+            events(&["\x1b_Gabc\x18z".as_bytes()]),
+            vec![Event::Print('z')]
+        );
     }
 
     #[test]

@@ -341,6 +341,7 @@ pub enum Transport {
         control: PathBuf,
     },
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     Local,
 }
 

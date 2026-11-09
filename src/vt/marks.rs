@@ -62,7 +62,11 @@ impl Terminal {
             "A" => {
                 self.integrated = true;
                 // 上一个提示符没跑过命令（直接按了回车、Ctrl-C）：不留
-                if self.commands.last().is_some_and(|last| last.output_start.is_none()) {
+                if self
+                    .commands
+                    .last()
+                    .is_some_and(|last| last.output_start.is_none())
+                {
                     self.commands.pop();
                 }
                 self.commands.push(Command {
@@ -95,7 +99,11 @@ impl Terminal {
                     return;
                 };
                 // 输入的最后一行：光标在行首说明回车已经把光标送到下一行了
-                let last_line = if column == 0 { here.saturating_sub(1) } else { here };
+                let last_line = if column == 0 {
+                    here.saturating_sub(1)
+                } else {
+                    here
+                };
                 let typed = self.text_between(input.0, last_line.max(input.0), input.1);
                 if let Some(last) = self.commands.last_mut() {
                     last.output_start = Some(here);
@@ -114,7 +122,9 @@ impl Terminal {
                 }
                 last.output_end = Some(end);
                 last.exit = exit;
-                let seconds = last.started.map_or(0, |started| started.elapsed().as_secs());
+                let seconds = last
+                    .started
+                    .map_or(0, |started| started.elapsed().as_secs());
                 let finished = Finished {
                     exit,
                     seconds,
@@ -140,7 +150,9 @@ impl Terminal {
         let dropped = screen.archived_total().checked_sub(history as u64)?;
         let absolute = usize::try_from(id.checked_sub(dropped)?).ok()?;
         if absolute < history {
-            screen.history_line(history - 1 - absolute).map(Vec::as_slice)
+            screen
+                .history_line(history - 1 - absolute)
+                .map(Vec::as_slice)
         } else {
             screen.lines.get(absolute - history).map(Vec::as_slice)
         }
@@ -149,7 +161,9 @@ impl Terminal {
     /// 编号对应的「绝对行」（0 是最老的历史行，和查找、回看用的一样）
     pub fn absolute_line(&self, id: u64) -> Option<usize> {
         let screen = &self.primary;
-        let dropped = screen.archived_total().checked_sub(screen.history_len() as u64)?;
+        let dropped = screen
+            .archived_total()
+            .checked_sub(screen.history_len() as u64)?;
         usize::try_from(id.checked_sub(dropped)?).ok()
     }
 
@@ -175,7 +189,9 @@ impl Terminal {
             }
             text.push_str(row.trim_end());
             wrapped = line.len() >= columns
-                && line.last().is_some_and(|cell| cell.ch != ' ' && cell.width != 0);
+                && line
+                    .last()
+                    .is_some_and(|cell| cell.ch != ' ' && cell.width != 0);
             if text.chars().count() > MAX_TEXT {
                 break;
             }
@@ -204,7 +220,10 @@ impl Terminal {
     pub(super) fn mark_rows(&self, first: usize, end: usize) -> HashMap<usize, RowMarks> {
         let mut rows: HashMap<usize, RowMarks> = HashMap::new();
         let mut put = |id: u64, mark: String, input: Option<usize>| {
-            let Some(line) = self.absolute_line(id).filter(|line| (first..end).contains(line)) else {
+            let Some(line) = self
+                .absolute_line(id)
+                .filter(|line| (first..end).contains(line))
+            else {
                 return;
             };
             let row = rows.entry(line).or_default();
@@ -220,7 +239,9 @@ impl Terminal {
                 put(start, "\x1b]133;C\x07".to_string(), None);
             }
             if let Some(stop) = command.output_end {
-                let code = command.exit.map_or(String::new(), |code| format!(";{code}"));
+                let code = command
+                    .exit
+                    .map_or(String::new(), |code| format!(";{code}"));
                 put(stop, format!("\x1b]133;D{code}\x07"), None);
             }
         }
@@ -276,16 +297,30 @@ mod tests {
         assert_eq!(commands.len(), 4);
         assert!(commands[3].output_start.is_none());
         assert_eq!(
-            commands.iter().take(3).map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            commands
+                .iter()
+                .take(3)
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
             ["echo hi", "false", "ls"]
         );
-        assert_eq!(commands.iter().take(3).map(|c| c.exit).collect::<Vec<_>>(), [Some(0), Some(1), Some(0)]);
+        assert_eq!(
+            commands.iter().take(3).map(|c| c.exit).collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(0)]
+        );
         assert_eq!(term.command_output(0).as_deref(), Some("hi"));
         assert_eq!(term.command_output(2).as_deref(), Some("a\nb"));
         assert_eq!(term.command_output(1), None, "没输出");
         let finished = term.take_finished();
         assert_eq!(finished.len(), 3);
-        assert_eq!(finished[1], Finished { exit: Some(1), seconds: 0, text: "false".into() });
+        assert_eq!(
+            finished[1],
+            Finished {
+                exit: Some(1),
+                seconds: 0,
+                text: "false".into()
+            }
+        );
         assert!(term.take_finished().is_empty());
     }
 
@@ -300,7 +335,10 @@ mod tests {
         assert!(term.screen().history_len() > 5, "已经滚进历史了");
         assert_eq!(term.command_output(0).as_deref(), Some("first-output"));
         let id = term.commands()[0].prompt;
-        assert!(term.absolute_line(id).is_some_and(|line| line < term.screen().history_len()));
+        assert!(
+            term.absolute_line(id)
+                .is_some_and(|line| line < term.screen().history_len())
+        );
         assert_eq!(term.commands()[0].text, "echo first");
     }
 
@@ -335,7 +373,12 @@ mod tests {
         run(&mut term, "false", "", 1);
         term.feed(b"\x1b]8;;https://example.com/a\x07link\x1b]8;;\x07 text\r\n");
         for index in 0..6 {
-            run(&mut term, &format!("cmd{index}"), &format!("out{index}\r\n"), 0);
+            run(
+                &mut term,
+                &format!("cmd{index}"),
+                &format!("out{index}\r\n"),
+                0,
+            );
         }
         term.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07typing");
         assert!(term.screen().history_len() > 5, "内容已经滚进历史");
@@ -371,7 +414,14 @@ mod tests {
         restored.feed(b"\x1b[0m\r\n\x1b]133;A\x07$ ");
         let last = restored.commands().last().expect("有命令");
         assert!(last.output_start.is_none(), "新提示符");
-        assert_eq!(restored.commands().iter().filter(|c| c.output_start.is_none()).count(), 1);
+        assert_eq!(
+            restored
+                .commands()
+                .iter()
+                .filter(|c| c.output_start.is_none())
+                .count(),
+            1
+        );
     }
 
     /// 只留最后几行时，更早的命令整条丢掉（不留半条）
@@ -379,14 +429,29 @@ mod tests {
     fn trimmed_history_drops_whole_commands() {
         let mut term = Terminal::new(40, 5);
         for index in 0..10 {
-            run(&mut term, &format!("cmd{index}"), &format!("out{index}\r\n"), 0);
+            run(
+                &mut term,
+                &format!("cmd{index}"),
+                &format!("out{index}\r\n"),
+                0,
+            );
         }
         let saved = term.transcript(8);
         let mut restored = Terminal::new(40, 5);
         restored.feed(saved.as_bytes());
-        let texts: Vec<_> = restored.commands().iter().map(|c| c.text.as_str()).collect();
+        let texts: Vec<_> = restored
+            .commands()
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
         assert!(!texts.is_empty() && texts.len() < 10, "{texts:?}");
         assert!(texts.iter().all(|text| text.starts_with("cmd")));
-        assert_eq!(restored.command_output(0).as_deref().map(|o| o.starts_with("out")), Some(true));
+        assert_eq!(
+            restored
+                .command_output(0)
+                .as_deref()
+                .map(|o| o.starts_with("out")),
+            Some(true)
+        );
     }
 }

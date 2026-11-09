@@ -70,7 +70,6 @@ fn card(workspace: &Rc<Workspace>, width: Signal<f32>) -> Element {
             move || page(&owner, kind) == PanelKind::Files,
             move || files_page(&files_owner),
         )
-        .into()
 }
 
 /// 现在显示哪一页：用户选的，没有这一页（换了目标）就退到第一页
@@ -171,7 +170,7 @@ fn monitor_page(workspace: &Rc<Workspace>) -> Element {
             .cloned()
             .unwrap_or_default()
     };
-    let (status, body) = (current.clone(), current);
+    let (status, body) = (current, current);
     column()
         .name("monitor")
         .grow(1)
@@ -184,13 +183,7 @@ fn monitor_page(workspace: &Rc<Workspace>) -> Element {
             let _ = aureole::every(POLL_EVERY, move || poller.poll_monitor());
         })
         .child(status_line(status))
-        .child_when(
-            {
-                let body = body.clone();
-                move || body().latest.is_some()
-            },
-            move || stats(body.clone()),
-        )
+        .child_when(move || body().latest.is_some(), move || stats(body))
 }
 
 /// 顶上一行：连着时写运行时间（这个目标有运行时间才写），没连着、不支持、出错时写明白
@@ -311,7 +304,6 @@ fn stats(current: impl Fn() -> Monitor + Clone + 'static) -> Element {
                 )
             },
         )
-        .into()
 }
 
 fn usage_label(monitor: &Monitor, pick: impl Fn(&monitor::Snapshot) -> (u64, u64)) -> String {
@@ -476,7 +468,7 @@ fn files_page(workspace: &Rc<Workspace>) -> Element {
         let _ = active.get();
         ensure.files_ensure_loaded();
     });
-    let (header_state, body_state, transfers_state) = (current.clone(), current.clone(), current);
+    let (header_state, body_state, transfers_state) = (current, current, current);
     column()
         .name("files")
         .grow(1)
@@ -562,7 +554,7 @@ fn files_header(
                 let go = go.clone();
                 text_field(draft)
                     .name("files-path-field")
-                    .focus_handle(focus.clone())
+                    .focus_handle(focus)
                     // 没有边框：一块淡灰的底就够看出是输入框（焦点边框是框架默认的蓝色，不要）
                     .background(hover())
                     .border(0, Color::TRANSPARENT)

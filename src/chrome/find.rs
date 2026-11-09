@@ -26,7 +26,12 @@ pub(super) fn bar(session: Rc<Session>) -> Element {
         .radius(9)
         .background(card_bg())
         .shadow(popup_shadow())
-        .child(row().padding_x(4).color(text_3()).child(icon(Icon::Search, 15.0)))
+        .child(
+            row()
+                .padding_x(4)
+                .color(text_3())
+                .child(icon(Icon::Search, 15.0)),
+        )
         .child(
             text_field(query)
                 .name("find-input")

@@ -193,21 +193,46 @@ pub(crate) fn source_line(terminal: &Terminal, row: usize, offset: usize) -> Opt
     }
 }
 
+/// 这一次画要知道的：往回翻到哪、上次画的时候翻到哪、要不要整屏重画，和叠在上面的高亮
+#[derive(Clone, Copy, Default)]
+pub struct Frame<'a> {
+    /// 往回翻了多少行（0 是跟着最新的输出走）
+    pub offset: usize,
+    /// 上一次画的时候的 `offset`
+    pub shown_offset: usize,
+    /// 配色换了之类的：每个格子都要重算
+    pub full: bool,
+    /// 查找的命中
+    pub highlights: Option<Highlights<'a>>,
+    /// 指针停着的链接
+    pub hover: Option<Hover>,
+}
+
+impl Frame<'_> {
+    /// 只有翻动状态：没有高亮、不指定重画
+    #[cfg(test)]
+    pub fn at(offset: usize, shown_offset: usize) -> Self {
+        Self {
+            offset,
+            shown_offset,
+            ..Self::default()
+        }
+    }
+}
+
 /// 把屏幕的改动搬到网格上。
 ///
 /// `offset` 是往回翻了多少行（0 是跟着最新的输出走），`shown_offset` 是上一次画的时候的 `offset`。
 /// 平时只搬改动；翻着看时屏幕和网格的行对不上了，任何变化（翻动、新输出）都整屏重画一遍；
 /// 从回看回到最新时也整屏重画，把网格还原成现在的屏幕
-pub fn paint(
-    terminal: &mut Terminal,
-    grid: &CharGrid,
-    look: Look,
-    offset: usize,
-    shown_offset: usize,
-    full: bool,
-    highlights: Option<Highlights>,
-    hover: Option<Hover>,
-) {
+pub fn paint(terminal: &mut Terminal, grid: &CharGrid, look: Look, frame: Frame) {
+    let Frame {
+        offset,
+        shown_offset,
+        full,
+        highlights,
+        hover,
+    } = frame;
     let (columns, rows) = terminal.size();
     if grid.size() != [columns, rows] {
         grid.resize(columns, rows);
@@ -316,7 +341,11 @@ fn paint_row(
             }
             if let Some(current) = mark {
                 // 命中的地方：自己的底色和字色，不管原来是什么样式
-                let background = if current { colors.found_current } else { colors.found };
+                let background = if current {
+                    colors.found_current
+                } else {
+                    colors.found
+                };
                 cell_style = cell_style
                     .inverse(false)
                     .background(background)
@@ -420,7 +449,7 @@ mod tests {
     fn live_view_shows_the_screen() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 0, 0, false, None, None);
+        paint(&mut terminal, &grid, look(), Frame::at(0, 0));
         assert_eq!(rows(&grid), ["4", "5", "6"]);
     }
 
@@ -429,10 +458,10 @@ mod tests {
     fn scrolled_back_view_joins_history_and_screen() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 0, 0, false, None, None);
-        paint(&mut terminal, &grid, look(), 2, 0, false, None, None);
+        paint(&mut terminal, &grid, look(), Frame::at(0, 0));
+        paint(&mut terminal, &grid, look(), Frame::at(2, 0));
         assert_eq!(rows(&grid), ["2", "3", "4"]);
-        paint(&mut terminal, &grid, look(), 3, 2, false, None, None);
+        paint(&mut terminal, &grid, look(), Frame::at(3, 2));
         assert_eq!(rows(&grid), ["1", "2", "3"]);
     }
 
@@ -441,9 +470,9 @@ mod tests {
     fn returning_to_live_restores_the_screen() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 0, 0, false, None, None);
-        paint(&mut terminal, &grid, look(), 3, 0, false, None, None);
-        paint(&mut terminal, &grid, look(), 0, 3, false, None, None);
+        paint(&mut terminal, &grid, look(), Frame::at(0, 0));
+        paint(&mut terminal, &grid, look(), Frame::at(3, 0));
+        paint(&mut terminal, &grid, look(), Frame::at(0, 3));
         assert_eq!(rows(&grid), ["4", "5", "6"]);
     }
 
@@ -452,11 +481,11 @@ mod tests {
     fn new_output_while_scrolled_back_repaints_the_view() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 0, 0, false, None, None);
-        paint(&mut terminal, &grid, look(), 2, 0, false, None, None);
+        paint(&mut terminal, &grid, look(), Frame::at(0, 0));
+        paint(&mut terminal, &grid, look(), Frame::at(2, 0));
         terminal.feed(b"\r\n7");
         // 又滚出去一行，看着的那一屏要跟着多翻一行才不动
-        paint(&mut terminal, &grid, look(), 3, 2, false, None, None);
+        paint(&mut terminal, &grid, look(), Frame::at(3, 2));
         assert_eq!(rows(&grid), ["2", "3", "4"]);
     }
 
@@ -464,9 +493,9 @@ mod tests {
     fn caret_hides_while_scrolled_back() {
         let mut terminal = terminal_with_history();
         let grid = CharGrid::new(10, 3);
-        paint(&mut terminal, &grid, look(), 1, 0, false, None, None);
+        paint(&mut terminal, &grid, look(), Frame::at(1, 0));
         assert!(grid.caret().hidden);
-        paint(&mut terminal, &grid, look(), 0, 1, false, None, None);
+        paint(&mut terminal, &grid, look(), Frame::at(0, 1));
         assert!(!grid.caret().hidden);
     }
 }

@@ -1,5 +1,6 @@
 //! Shell 集成：把 `OSC 133` 的脚本放到配置目录里，本机的 zsh 起来时自动加载（靠 `ZDOTDIR` 垫片，
 //! 不改用户的任何配置文件）。别的 shell 手动 `source` 同目录下的脚本。
+//! 加一个 shell（比如 Windows 的 PowerShell）：在 `assets/shell/` 放它的脚本，再在 [`environment`] 里认出它、让它起来时加载。
 
 use std::path::{Path, PathBuf};
 
@@ -72,7 +73,11 @@ mod tests {
         assert!(install(&Store::none()).is_none(), "不落盘时没有地方放");
         let zsh = environment(&installed, "/bin/zsh");
         assert!(zsh.iter().any(|(name, _)| name == "ZDOTDIR"));
-        assert!(zsh.iter().any(|(name, value)| name == "NIMBUS_ZSH_INTEGRATION" && value.ends_with("nimbus.zsh")));
+        assert!(
+            zsh.iter()
+                .any(|(name, value)| name == "NIMBUS_ZSH_INTEGRATION"
+                    && value.ends_with("nimbus.zsh"))
+        );
         assert!(environment(&installed, "/bin/bash").is_empty());
         assert!(environment(&installed, "/usr/local/bin/fish").is_empty());
         std::fs::remove_dir_all(&directory).ok();
