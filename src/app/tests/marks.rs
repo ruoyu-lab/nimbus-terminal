@@ -93,6 +93,55 @@ fn jumping_between_commands() {
     assert!(!plain.jump_prompt(true));
 }
 
+/// shell 报的目录（OSC 7）比问进程优先：PowerShell 的 `cd` 不改进程的当前目录。
+/// 只认本机的会话、本机报的；新的提示符没报就回去问进程
+#[test]
+fn reported_directories_come_before_asking_the_process() {
+    let recorder = Arc::new(Recorder::default());
+    let (asked, prefix, reported) = if cfg!(windows) {
+        (r"C:\asked", "/C:", r"C:\from osc\7")
+    } else {
+        ("/asked", "", "/from osc/7")
+    };
+    let (asked, reported) = (
+        std::path::PathBuf::from(asked),
+        std::path::PathBuf::from(reported),
+    );
+    recorder.set_directory(asked.clone());
+    let session = Session::new(
+        Terminal::new(40, 5),
+        CharGrid::new(40, 5),
+        Some(Pty::from_backend(recorder.clone())),
+        Hooks::none(),
+        Form::new(&crate::settings::Settings::default()),
+    );
+    session.set_local(true);
+    assert_eq!(session.working_directory(), Some(asked.clone()), "还没报");
+    let report = |host: &str| format!("\x1b]7;file://{host}{prefix}/from%20osc/7\x07");
+    session.feed_for_test(&format!(
+        "\x1b]133;A\x07{}$ \x1b]133;B\x07",
+        report("localhost")
+    ));
+    assert_eq!(session.working_directory(), Some(reported.clone()));
+    // 服务器、容器的会话：报的是那边的目录
+    session.set_local(false);
+    assert_eq!(session.working_directory(), Some(asked.clone()));
+    session.set_local(true);
+    // 在里面 ssh 到了服务器，那边报的不算
+    session.feed_for_test(&report("some-server"));
+    assert_eq!(session.working_directory(), Some(asked.clone()));
+    // 本机的名字（大小写不论）算本机
+    if let Some(name) = host_name() {
+        session.feed_for_test(&report(&name.to_lowercase()));
+        assert_eq!(session.working_directory(), Some(reported.clone()));
+    }
+    // 下一个提示符没报：回去问进程
+    session.feed_for_test(&report(""));
+    assert_eq!(session.working_directory(), Some(reported));
+    session.feed_for_test("\x1b]133;A\x07$ ");
+    assert_eq!(session.working_directory(), Some(asked));
+}
+
 #[test]
 fn copies_the_last_commands_output() {
     let session = session_with_commands(3);

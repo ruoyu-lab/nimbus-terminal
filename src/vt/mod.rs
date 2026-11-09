@@ -144,6 +144,8 @@ pub struct Terminal {
     commands: Vec<marks::Command>,
     /// 收到过命令标记，说明 shell 集成在工作
     integrated: bool,
+    /// shell 报的当前目录（OSC 7、ConEmu 的 OSC 9;9），每个提示符开始时清掉
+    directory: Option<marks::ReportedDirectory>,
     /// 结束了、还没被取走的命令
     finished: Vec<marks::Finished>,
     /// 屏幕上的图片
@@ -181,6 +183,7 @@ impl Terminal {
             link_uris: Vec::new(),
             commands: Vec::new(),
             integrated: false,
+            directory: None,
             finished: Vec::new(),
             images: image::Images::new(),
             charsets: [Charset::Ascii; 2],
@@ -813,13 +816,16 @@ impl Terminal {
         }
     }
 
-    /// OSC：只认标题（0 和 2；1 是图标名，没有图标，忽略）。
-    /// 剪贴板（52）、超链接（8）、目录（7）、提示符标记（133）还没做，整条丢掉
+    /// OSC：标题（0 和 2；1 是图标名，没有图标，忽略）、当前目录（7）、超链接（8）、通知（9、777）、
+    /// 提示符标记（133）、iTerm2 的图片（1337）。剪贴板（52）这些还没做，整条丢掉
     fn osc(&mut self, code: i32, text: &str) {
         match code {
+            7 => self.report_directory(text),
             8 => self.hyperlink(text),
             133 => self.semantic_prompt(text),
             1337 => self.iterm_image(text),
+            // ConEmu 的 `9;9;目录`（Windows Terminal 的文档教 cmd 用户在提示符里发它）：是当前目录，不是通知
+            9 if text.starts_with("9;") => self.report_conemu_directory(&text[2..]),
             // iTerm 的写法：`9;正文`。`9;4;…` 是 ConEmu 的进度条，不是通知
             9 if !text.starts_with("4;") => self.push_alert(String::new(), text),
             // `777;notify;标题;正文`（rxvt、Kitty 等）

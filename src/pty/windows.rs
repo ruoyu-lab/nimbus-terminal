@@ -888,7 +888,280 @@ mod tests {
         assert!(!pty.backend.is_busy(), "等输入时不忙");
         pty.write(b"ping -n 30 127.0.0.1\r").expect("写得进去");
         assert!(wait_until(|| pty.backend.is_busy()), "ping 跑着时忙");
+        // 等 ping 打出第一条回复（各种语言里都有 `=32`，是字节数）再按：进程刚建好、还没初始化完时收到的 Ctrl+C
+        // 会丢，别的测试同时在起 PowerShell、机器忙的时候撞得上
+        collect(&queue, Some("=32"));
         pty.write(b"\x03").expect("写得进去");
         assert!(wait_until(|| !pty.backend.is_busy()), "Ctrl-C 之后不忙");
+    }
+
+    // ---------- 真的 shell 经过伪控制台：shell 集成、图片 ----------
+
+    use crate::vt::Terminal;
+    use crate::vt::marks::Command;
+
+    /// 一个跑在伪控制台里的 shell：读到的输出喂给仿真层（应答写回去，和应用里一样），测试照屏幕和命令标记等它
+    struct Live {
+        pty: Pty,
+        queue: ByteQueue,
+        terminal: Terminal,
+        output: Vec<u8>,
+    }
+
+    impl Live {
+        fn start(config: Config) -> Self {
+            let terminal = Terminal::new(config.columns.into(), config.rows.into());
+            let (pty, queue) = spawn(config).expect("起得来");
+            Self {
+                pty,
+                queue,
+                terminal,
+                output: Vec::new(),
+            }
+        }
+
+        /// 一直读，直到 `done` 成立。Windows PowerShell 5.1 起得慢（第一次还要准备模块），最多等 90 秒
+        fn wait(&mut self, what: &str, mut done: impl FnMut(&Terminal) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while !done(&self.terminal) {
+                match self.queue.try_next() {
+                    Some(Chunk::Bytes(bytes)) => {
+                        self.terminal.feed(&bytes);
+                        self.output.extend_from_slice(&bytes);
+                        let reply = self.terminal.take_output();
+                        if !reply.is_empty() {
+                            let _ = self.pty.write(&reply);
+                        }
+                    }
+                    Some(Chunk::Closed(code)) => panic!(
+                        "等{what}时 shell 退出了（{code}），读到的是 {:?}",
+                        String::from_utf8_lossy(&self.output)
+                    ),
+                    None => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "等了 90 秒还没等到{what}，读到的是 {:?}",
+                            String::from_utf8_lossy(&self.output)
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+
+        /// 在提示符上敲一行、回车，等它跑完、下一个提示符出来，返回这条命令
+        fn run(&mut self, line: &str) -> Command {
+            self.pty
+                .write(format!("{line}\r").as_bytes())
+                .expect("写得进去");
+            self.wait(&format!("「{line}」跑完"), |terminal| {
+                at_prompt(terminal) && finished(terminal, line).is_some()
+            });
+            finished(&self.terminal, line).expect("跑完了").clone()
+        }
+
+        /// 敲 `exit`，等 shell 退出，返回退出码
+        fn exit(self) -> i32 {
+            self.pty.write(b"exit\r").expect("写得进去");
+            drain(&self.queue).1
+        }
+    }
+
+    /// shell 在提示符上等输入：最后一条只有提示符（B 到了），还没跑
+    fn at_prompt(terminal: &Terminal) -> bool {
+        terminal
+            .commands()
+            .last()
+            .is_some_and(|last| last.input.is_some() && last.output_start.is_none())
+    }
+
+    /// 跑完了的、文字是 `text` 的那条命令（最近的一条）
+    fn finished<'a>(terminal: &'a Terminal, text: &str) -> Option<&'a Command> {
+        terminal
+            .commands()
+            .iter()
+            .rev()
+            .find(|command| command.text == text && command.output_end.is_some())
+    }
+
+    /// 最后一个提示符那一行的字
+    fn prompt_text(terminal: &Terminal) -> String {
+        let prompt = terminal.commands().last().expect("有提示符").prompt;
+        terminal
+            .line_by_id(prompt)
+            .expect("提示符那一行还在")
+            .iter()
+            .filter(|cell| cell.width != 0)
+            .map(|cell| cell.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// shell 报的目录：（主机，路径）
+    fn reported(terminal: &Terminal) -> Option<(String, PathBuf)> {
+        terminal
+            .reported_directory()
+            .map(|directory| (directory.host.clone(), directory.path.clone()))
+    }
+
+    /// 按 Nimbus 起它的方式起 Windows PowerShell（`-NoLogo`、集成脚本的 `-NoExit -Command`），
+    /// 只多一个 `-NoProfile`：不跑这台机器上用户自己的配置文件。`before` 是加载脚本之前先跑的命令（定义提示符之类）。
+    /// 脚本装在名字带单引号、空格、中文的目录里，命令行和 PowerShell 的引号都要对。返回 shell 和临时目录
+    fn integrated_powershell(label: &str, before: &str, columns: u16) -> (Live, PathBuf) {
+        let root = crate::store::tests::scratch(label);
+        let store = crate::store::Store::at(root.join("it's 中文 dir"));
+        let installed = crate::shell::install(&store).expect("装得上");
+        let program = system_root().join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut config = super::super::Config::shell(program.to_string_lossy(), columns, 24);
+        crate::shell::integrate(&installed, &mut config);
+        assert_eq!(config.arguments[..3], ["-NoLogo", "-NoExit", "-Command"]);
+        config.arguments.insert(1, "-NoProfile".to_string());
+        let load = config.arguments.pop().expect("有加载脚本的命令");
+        config.arguments.push(format!("{before}{load}"));
+        config.working_directory = Some(system_root());
+        (Live::start(config), root)
+    }
+
+    /// Windows PowerShell 的集成脚本经过伪控制台：提示符带着命令标记、原来的提示符文字还在；
+    /// 命令的文字、输出、退出码都对（原生程序的退出码原样报，PowerShell 自己的错误报 1）；
+    /// 回车敲空行不算一条命令；`cd` 以后 OSC 7 报的是新目录（进程的当前目录不跟着变，只有它准）
+    #[test]
+    fn powershell_integration_marks_commands_and_reports_the_directory() {
+        let (mut shell, root) = integrated_powershell("powershell-integration", "", 160);
+        let host = std::env::var("COMPUTERNAME").expect("有 COMPUTERNAME");
+        let start = system_root();
+        shell.wait("第一个提示符", |terminal| {
+            at_prompt(terminal) && terminal.reported_directory().is_some()
+        });
+        assert!(shell.terminal.has_command_marks());
+        assert_eq!(
+            reported(&shell.terminal),
+            Some((host.clone(), start.clone()))
+        );
+        assert_eq!(
+            prompt_text(&shell.terminal),
+            format!("PS {}>", start.display()),
+            "原来的提示符"
+        );
+
+        let failed = shell.run("cmd /c exit 3");
+        assert_eq!(failed.exit, Some(3), "原生程序的退出码");
+        let printed = shell.run("Write-Output nimbus-output");
+        assert_eq!(printed.exit, Some(0));
+        let index = shell.terminal.commands().len() - 2;
+        assert_eq!(
+            shell.terminal.command_output(index).as_deref(),
+            Some("nimbus-output")
+        );
+        let error = shell.run(r"Get-Item C:\nimbus-does-not-exist");
+        assert_eq!(error.exit, Some(1), "PowerShell 自己的错误");
+        // 加载脚本的那条 `-Command` 不留在 PowerShell 的历史里，用户敲的都在
+        shell.run("Get-History | ForEach-Object CommandLine");
+        let index = shell.terminal.commands().len() - 2;
+        let history = shell.terminal.command_output(index).expect("有输出");
+        assert!(
+            history.contains("cmd /c exit 3") && !history.contains("nimbus.ps1"),
+            "{history:?}"
+        );
+
+        // 空行：不发 C，提示符换一个，命令不多
+        let count = shell.terminal.commands().len();
+        let before = shell.terminal.commands().last().expect("有").prompt;
+        shell.pty.write(b"\r").expect("写得进去");
+        shell.wait("空行之后的提示符", |terminal| {
+            at_prompt(terminal) && terminal.commands().last().expect("有").prompt != before
+        });
+        assert_eq!(shell.terminal.commands().len(), count);
+
+        // 目录名里有空格、中文、`#`：报的时候编码，收的时候解回来
+        let target = root.join("目标 #1");
+        std::fs::create_dir_all(&target).expect("建得了目录");
+        let moved = shell.run(&format!("Set-Location -LiteralPath '{}'", target.display()));
+        assert_eq!(moved.exit, Some(0));
+        assert_eq!(reported(&shell.terminal), Some((host, target.clone())));
+        assert_eq!(
+            prompt_text(&shell.terminal),
+            format!("PS {}>", target.display())
+        );
+
+        assert_eq!(shell.exit(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 用户自己的提示符包得住：文字照样显示，看到的 `$?` 也是上一条命令的（主题靠它变色）
+    #[test]
+    fn powershell_integration_keeps_the_users_prompt() {
+        let prompt = "function global:prompt { if ($?) { 'good> ' } else { 'bad> ' } }; ";
+        let (mut shell, root) = integrated_powershell("powershell-prompt", prompt, 80);
+        shell.wait("第一个提示符", at_prompt);
+        assert_eq!(prompt_text(&shell.terminal), "good>");
+        assert_eq!(shell.run("cmd /c exit 2").exit, Some(2));
+        assert_eq!(prompt_text(&shell.terminal), "bad>");
+        assert_eq!(shell.run("Write-Output fine").exit, Some(0));
+        assert_eq!(prompt_text(&shell.terminal), "good>");
+        assert_eq!(shell.exit(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 让 PowerShell 原样写出 `sequence`（放在环境变量里带过去，不用管命令行的引号），读到它退出，喂给仿真层
+    fn written_through_the_pseudoconsole(sequence: &str) -> Terminal {
+        let mut config = powershell("[Console]::Write($env:NIMBUS_SEQUENCE)");
+        config.environment = vec![("NIMBUS_SEQUENCE".to_string(), sequence.to_string())];
+        let (_pty, queue) = spawn(config).expect("起得来");
+        let (output, _) = drain(&queue);
+        let mut terminal = Terminal::new(80, 24);
+        terminal.set_cell_pixels(10.0, 20.0);
+        terminal.feed(output.as_bytes());
+        terminal
+    }
+
+    /// 报目录的两种写法都原样穿过伪控制台：OSC 7，和 cmd 用户常在 `PROMPT` 里写的 ConEmu 的 OSC 9;9
+    #[test]
+    fn directory_reports_pass_through_the_pseudoconsole() {
+        let terminal =
+            written_through_the_pseudoconsole("\x1b]7;file://box/C:/Windows/%E4%B8%AD\x07");
+        assert_eq!(
+            reported(&terminal),
+            Some(("box".to_string(), PathBuf::from(r"C:\Windows\中")))
+        );
+        let mut terminal = written_through_the_pseudoconsole("\x1b]9;9;\"C:\\Windows\"\x1b\\");
+        assert_eq!(
+            reported(&terminal),
+            Some((String::new(), PathBuf::from(r"C:\Windows")))
+        );
+        assert!(terminal.take_alerts().is_empty(), "不是通知");
+    }
+
+    /// 图片序列直接喂给仿真层能放出一张图（序列本身是好的），再看穿过伪控制台以后还有没有
+    fn assert_image_passes_through(sequence: &str) {
+        let mut direct = Terminal::new(80, 24);
+        direct.set_cell_pixels(10.0, 20.0);
+        direct.feed(sequence.as_bytes());
+        assert_eq!(direct.placements().len(), 1, "直接喂能放出图");
+        let terminal = written_through_the_pseudoconsole(sequence);
+        assert_eq!(terminal.placements().len(), 1, "穿过伪控制台以后没有图了");
+    }
+
+    /// iTerm2 的内联图片（OSC 1337 File=…，1×1 的 PNG）：系统自带的 ConPTY 原样放过去（挪到了那一帧画面后面）
+    #[test]
+    fn iterm_images_pass_through_the_pseudoconsole() {
+        assert_image_passes_through(
+            "\x1b]1337;File=inline=1:iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==\x07",
+        );
+    }
+
+    /// Kitty 的图片（APC `_G…`，1×1 的 RGBA）
+    #[test]
+    #[ignore = "系统自带的 ConPTY 把 APC（Kitty 图片）整条吃掉；要随包带新版的 conpty.dll 和 OpenConsole.exe"]
+    fn kitty_images_pass_through_the_pseudoconsole() {
+        assert_image_passes_through("\x1b_Ga=T,f=32,s=1,v=1;/wAA/w==\x1b\\");
+    }
+
+    /// Sixel（DCS `q…`，4×6 的红块）
+    #[test]
+    #[ignore = "系统自带的 ConPTY 把 DCS（Sixel）整条吃掉；要随包带新版的 conpty.dll 和 OpenConsole.exe"]
+    fn sixel_images_pass_through_the_pseudoconsole() {
+        assert_image_passes_through("\x1bPq#1;2;100;0;0#1!4~\x1b\\");
     }
 }

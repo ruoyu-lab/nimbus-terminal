@@ -112,8 +112,9 @@ pub fn spawn(launch: &Launch) -> Spawned {
         config.working_directory = Some(directory.clone());
     }
     config.dark_background = launch.dark_background;
+    // shell 集成：zsh 加环境变量，Windows 上的 PowerShell 加参数；认的是要起的程序，设置里指定的别的 shell 不动
     if let (Target::Local, Some(directory)) = (&launch.target, &launch.integration) {
-        config.environment = crate::shell::environment(directory, &config.program);
+        crate::shell::integrate(directory, &mut config);
     }
     match pty::spawn(config).map_err(|error| error.to_string()) {
         Ok((pty, queue)) => Spawned {

@@ -2,8 +2,11 @@
 //! 终端据此知道每条命令在屏幕和历史里的位置。
 //!
 //! 位置用「行的编号」记：往历史里每挤进一行，编号加一，所以一行字不管滚到哪儿，编号都不变（`已挤出的行数 + 屏幕行`）。
+//!
+//! shell 集成的另一半也在这里：shell 报的当前目录（OSC 7，和 ConEmu 的 OSC 9;9）。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use super::Terminal;
@@ -43,10 +46,21 @@ pub(super) struct RowMarks {
     pub input: Option<usize>,
 }
 
+/// shell 报的当前目录
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportedDirectory {
+    /// 哪台机器上的目录，空的是没写（就是本机）。在本机的 shell 里 ssh 到服务器，那边报的是服务器上的
+    pub host: String,
+    /// 本机写法的绝对路径（Windows 上是 `C:\x`）
+    pub path: PathBuf,
+}
+
 /// 最多记这么多条命令，再多挤掉最旧的
 const MAX_COMMANDS: usize = 2000;
 /// 命令文字最长这么多字符
 const MAX_TEXT: usize = 1000;
+/// 目录报告最长收这么长（Windows 的路径最长 32767 个字，百分号编码以后更长）
+const MAX_DIRECTORY: usize = 128 * 1024;
 
 impl Terminal {
     /// OSC 133 的处理。副屏（vim、less）里的不理：那里没有提示符
@@ -61,6 +75,8 @@ impl Terminal {
         match kind {
             "A" => {
                 self.integrated = true;
+                // 新的提示符：目录等它重新报（见 `reported_directory`）
+                self.directory = None;
                 // 上一个提示符没跑过命令（直接按了回车、Ctrl-C）：不留
                 if self
                     .commands
@@ -269,6 +285,128 @@ impl Terminal {
     pub fn take_finished(&mut self) -> Vec<Finished> {
         std::mem::take(&mut self.finished)
     }
+
+    /// OSC 7：`file://主机/路径`，路径按百分号解码；Windows 上 `/C:/x` 是 `C:\x`。
+    /// 不是绝对路径的不收；副屏（vim、less）里的不理，和命令标记一样
+    pub(super) fn report_directory(&mut self, text: &str) {
+        if self.on_alternate {
+            return;
+        }
+        if let Some(directory) = parse_file_uri(text) {
+            self.directory = Some(directory);
+        }
+    }
+
+    /// ConEmu 的 OSC 9;9：`9;9;"C:\x"`（引号可有可无），本机的目录。`text` 是 `9;9;` 后面的部分
+    pub(super) fn report_conemu_directory(&mut self, text: &str) {
+        if self.on_alternate || text.len() > MAX_DIRECTORY {
+            return;
+        }
+        if let Some(path) = absolute_directory(text.trim().trim_matches('"')) {
+            self.directory = Some(ReportedDirectory {
+                host: String::new(),
+                path,
+            });
+        }
+    }
+
+    /// shell 报的当前目录（OSC 7）：PowerShell 的 `cd` 不改进程的当前目录，只有它报的准。
+    ///
+    /// 每个提示符开始（OSC 133;A）时清掉，等这个提示符重新报：用了命令标记却不报目录的 shell
+    /// （Nimbus 给 zsh 的脚本）这里一直是 `None`；嵌套的 shell 退出以后、或者跑着的程序发了一条，
+    /// 留下的旧目录到下一个提示符就没了
+    pub fn reported_directory(&self) -> Option<&ReportedDirectory> {
+        self.directory.as_ref()
+    }
+}
+
+/// `file://主机/路径` → 主机和本机写法的路径
+fn parse_file_uri(text: &str) -> Option<ReportedDirectory> {
+    const SCHEME: &str = "file://";
+    if text.len() > MAX_DIRECTORY
+        || !text
+            .get(..SCHEME.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(SCHEME))
+    {
+        return None;
+    }
+    let rest = &text[SCHEME.len()..];
+    let (host, path) = rest.split_at(rest.find('/')?);
+    if host.chars().any(char::is_control) {
+        return None;
+    }
+    let decoded = percent_decode(path)?;
+    // Windows 的写法是 `/C:/x`：盘符前面那个斜杠去掉
+    let local = if cfg!(windows) {
+        decoded.strip_prefix('/').unwrap_or(&decoded)
+    } else {
+        &decoded
+    };
+    Some(ReportedDirectory {
+        host: host.to_string(),
+        path: absolute_directory(local)?,
+    })
+}
+
+/// `%xx` 换回字节，再按 UTF-8 读。不成样的 `%`（后面不是两位十六进制）原样留着：有的 shell 报的路径没有编码
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let digit = |at: usize| {
+        bytes
+            .get(at)
+            .and_then(|byte| char::from(*byte).to_digit(16))
+    };
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let (Some(high), Some(low)) = (digit(index + 1), digit(index + 2))
+        {
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// 本机写法的绝对目录，去掉结尾的分隔符（根目录留着）；带控制字符的不要。
+/// Windows 上只收带盘符的（`C:\x`，斜杠换成反斜杠）：`\\服务器\共享` 这种网络路径不收，
+/// 不然随便一段输出就能让终端去连别人的服务器。类 Unix 上收 `/` 开头的
+fn absolute_directory(path: &str) -> Option<PathBuf> {
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    if cfg!(windows) {
+        let mut chars = path.chars();
+        let (drive, colon) = (chars.next()?, chars.next()?);
+        let rest = chars.as_str();
+        if !drive.is_ascii_alphabetic() || colon != ':' {
+            return None;
+        }
+        if !rest.is_empty() && !rest.starts_with(['/', '\\']) {
+            return None;
+        }
+        let mut text = format!("{drive}:{}", rest.replace('/', "\\"));
+        while text.len() > 3 && text.ends_with('\\') {
+            text.pop();
+        }
+        if text.len() == 2 {
+            text.push('\\');
+        }
+        return Some(PathBuf::from(text));
+    }
+    if !path.starts_with('/') {
+        return None;
+    }
+    let trimmed = path.trim_end_matches('/');
+    Some(PathBuf::from(if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }))
 }
 
 #[cfg(test)]

@@ -175,6 +175,118 @@ fn osc_9_and_777_become_alerts() {
     assert_eq!(term.take_alerts().len(), MAX_ALERTS);
 }
 
+/// shell 报的目录：（主机，路径）
+fn reported(term: &Terminal) -> Option<(String, std::path::PathBuf)> {
+    term.reported_directory()
+        .map(|directory| (directory.host.clone(), directory.path.clone()))
+}
+
+/// 这个平台上的写法：Windows 上 `C:` 开头、反斜杠，别的平台去掉盘符、用斜杠
+fn native(windows: &str) -> std::path::PathBuf {
+    if cfg!(windows) {
+        windows.into()
+    } else {
+        windows[2..].replace('\\', "/").into()
+    }
+}
+
+/// OSC 7：`file://主机/路径`，按百分号解码成本机写法的绝对路径（Windows 上 `/C:/x` 是 `C:\x`），结尾的分隔符去掉
+#[test]
+fn osc_7_reports_the_working_directory() {
+    let mut term = Terminal::new(40, 4);
+    assert_eq!(term.reported_directory(), None);
+    let prefix = if cfg!(windows) { "/C:" } else { "" };
+    term.feed(format!("\x1b]7;file://box{prefix}/Users/me/%E4%B8%AD%20x/\x1b\\").as_bytes());
+    assert_eq!(
+        reported(&term),
+        Some(("box".to_string(), native(r"C:\Users\me\中 x")))
+    );
+    // 没写主机、协议大写、没编码的 `%`（有的 shell 不编码）
+    term.feed(format!("\x1b]7;FILE://{prefix}/tmp/100%done\x07").as_bytes());
+    assert_eq!(
+        reported(&term),
+        Some((String::new(), native(r"C:\tmp\100%done")))
+    );
+    // 根目录
+    term.feed(format!("\x1b]7;file://box{prefix}/\x07").as_bytes());
+    assert_eq!(reported(&term).map(|(_, path)| path), Some(native(r"C:\")));
+}
+
+/// 不收的报告：不是 file 协议、没有路径、解出来带控制字符或者不是 UTF-8；Windows 上没有盘符的。收不下就留着上一个
+#[test]
+fn bad_directory_reports_are_ignored() {
+    let mut term = Terminal::new(40, 4);
+    let prefix = if cfg!(windows) { "/C:" } else { "" };
+    term.feed(format!("\x1b]7;file://box{prefix}/good\x07").as_bytes());
+    let good = reported(&term);
+    assert_eq!(
+        good.as_ref().map(|(_, path)| path.clone()),
+        Some(native(r"C:\good"))
+    );
+    let mut bad = vec![
+        "http://box/x".to_string(),
+        "file://box".to_string(),
+        format!("file://box{prefix}/a%0Ab"),
+        format!("file://box{prefix}/%FF"),
+    ];
+    if cfg!(windows) {
+        // 服务器上 Unix 的路径、盘符后面不是分隔符
+        bad.extend([
+            "file://box/home/me".to_string(),
+            "file://box/C:x".to_string(),
+        ]);
+    }
+    for text in bad {
+        term.feed(format!("\x1b]7;{text}\x07").as_bytes());
+        assert_eq!(reported(&term), good, "{text:?}");
+    }
+}
+
+/// 每个提示符开始（OSC 133;A）时清掉，等这个提示符重新报；副屏里的不理
+#[test]
+fn directory_reports_last_until_the_next_prompt() {
+    let mut term = Terminal::new(40, 4);
+    let prefix = if cfg!(windows) { "/C:" } else { "" };
+    term.feed(format!("\x1b]7;file://box{prefix}/old\x07").as_bytes());
+    term.feed(b"\x1b]133;A\x07");
+    assert_eq!(term.reported_directory(), None, "新的提示符，还没报");
+    term.feed(format!("\x1b]7;file://box{prefix}/new\x07$ \x1b]133;B\x07").as_bytes());
+    assert_eq!(
+        reported(&term).map(|(_, path)| path),
+        Some(native(r"C:\new"))
+    );
+    term.feed(format!("\x1b[?1049h\x1b]7;file://box{prefix}/vim\x07\x1b[?1049l").as_bytes());
+    assert_eq!(
+        reported(&term).map(|(_, path)| path),
+        Some(native(r"C:\new"))
+    );
+}
+
+/// ConEmu 的 OSC 9;9 是当前目录（引号可有可无），不弹通知；Windows 上网络路径不收
+#[test]
+fn osc_9_9_reports_the_directory_instead_of_an_alert() {
+    let mut term = Terminal::new(40, 4);
+    let windows = native(r"C:\Windows");
+    term.feed(format!("\x1b]9;9;\"{}\"\x07", windows.display()).as_bytes());
+    assert!(term.take_alerts().is_empty(), "不是通知");
+    assert_eq!(reported(&term), Some((String::new(), windows.clone())));
+    if cfg!(windows) {
+        term.feed(b"\x1b]9;9;C:/Users/me/\x1b\\");
+        assert_eq!(
+            reported(&term).map(|(_, path)| path),
+            Some(r"C:\Users\me".into())
+        );
+        term.feed(b"\x1b]9;9;\\\\server\\share\x07");
+        term.feed(b"\x1b]9;9;relative\x07");
+        assert_eq!(
+            reported(&term).map(|(_, path)| path),
+            Some(r"C:\Users\me".into()),
+            "网络路径、相对路径不收"
+        );
+    }
+    assert!(term.take_alerts().is_empty());
+}
+
 #[test]
 fn tab_stops_can_be_set_and_cleared() {
     let mut term = Terminal::new(40, 2);

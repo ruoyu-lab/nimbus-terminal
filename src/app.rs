@@ -295,8 +295,16 @@ impl Session {
         self.remeasure_from.set(Some(current));
     }
 
-    /// shell 现在所在的目录（存下来下次启动在这里开）
+    /// shell 现在所在的目录（存下来下次启动在这里开；点相对路径时从这里算）。
+    /// 本机的会话先看 shell 集成报的（OSC 7）：PowerShell 的 `cd` 不改进程的当前目录，问进程问不准。
+    /// 这个提示符没报、报的是别的机器（在里面 ssh 到了服务器），再问 pty
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
+        if self.local.get()
+            && let Some(reported) = self.terminal.borrow().reported_directory()
+            && is_this_machine(&reported.host)
+        {
+            return Some(reported.path.clone());
+        }
         self.pty.borrow().as_ref()?.working_directory()
     }
 
@@ -498,6 +506,43 @@ impl Session {
         }
         (self.hooks.exited)(code);
     }
+}
+
+/// shell 报目录时写的主机是不是这台机器：没写、`localhost`、本机的名字（不分大小写，只比第一段：
+/// `mac.local` 和 `mac` 算同一台）
+fn is_this_machine(host: &str) -> bool {
+    let first = |name: &str| name.split('.').next().unwrap_or("").to_string();
+    host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host_name().is_some_and(|name| first(&name).eq_ignore_ascii_case(&first(host)))
+}
+
+/// 本机的名字：Windows 是 `COMPUTERNAME`（和 PowerShell 的 `[Environment]::MachineName` 一样）
+#[cfg(windows)]
+fn host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
+/// 本机的名字（`gethostname`）
+#[cfg(unix)]
+fn host_name() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: 往栈上的缓冲里写，长度如实给；名字放不下时可能不以 0 结尾，下面找不到 0 就当没有
+    let failed = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0;
+    if failed {
+        return None;
+    }
+    let end = buffer.iter().position(|byte| *byte == 0)?;
+    String::from_utf8(buffer[..end].to_vec())
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn host_name() -> Option<String> {
+    None
 }
 
 /// 会话读 shell 的任务记在这里。这个作用域没有父级，菜单、页面卸掉都不会释放它；
