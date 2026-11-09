@@ -49,5 +49,6 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 
 - 只在 Unix 上跑的测试用 `#[cfg(unix)]` 标好（真 shell、`sh` 跑的协议测试、符号链接、sftp 实验室）。
 - Windows 上的真 shell 测试：`pty::windows` 的测试起 cmd、Windows PowerShell 5.1（大小、环境变量、中文、目录、Ctrl-C、命令标记和退出码、OSC 7、图片透传）。
-  PowerShell 7 这台机器上没装，没测过。
+  装了 PowerShell 7 的机器上，集成脚本的两个测试再用它跑一遍（`pwsh_integration_*`；实测 7.6.9，winget 装的商店版，
+  程序是 `WindowsApps` 里的别名，`CreateProcessW` 起得来）；没装就跳过。
 - 好几个工作树共用一个 `target` 时，`cargo test` 可能跑的是别的工作树刚编出来的测试程序（同一个路径、同一个哈希），看一下测试总数对不对。

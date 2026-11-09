@@ -1005,14 +1005,35 @@ mod tests {
             .map(|directory| (directory.host.clone(), directory.path.clone()))
     }
 
-    /// 按 Nimbus 起它的方式起 Windows PowerShell（`-NoLogo`、集成脚本的 `-NoExit -Command`），
+    /// Windows PowerShell 5.1（系统自带）
+    fn windows_powershell() -> PathBuf {
+        system_root().join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+    }
+
+    /// PowerShell 7：这台机器上装了才有（商店版是 `WindowsApps` 里的别名），没装的测试直接跳过
+    fn powershell_7() -> Option<PathBuf> {
+        let found = crate::pty::shells()
+            .into_iter()
+            .find(|shell| shell.id == "pwsh" && shell.installed)
+            .map(|shell| PathBuf::from(shell.program));
+        if found.is_none() {
+            eprintln!("没装 PowerShell 7，跳过");
+        }
+        found
+    }
+
+    /// 按 Nimbus 起它的方式起 PowerShell（`-NoLogo`、集成脚本的 `-NoExit -Command`），
     /// 只多一个 `-NoProfile`：不跑这台机器上用户自己的配置文件。`before` 是加载脚本之前先跑的命令（定义提示符之类）。
     /// 脚本装在名字带单引号、空格、中文的目录里，命令行和 PowerShell 的引号都要对。返回 shell 和临时目录
-    fn integrated_powershell(label: &str, before: &str, columns: u16) -> (Live, PathBuf) {
+    fn integrated_powershell(
+        program: &Path,
+        label: &str,
+        before: &str,
+        columns: u16,
+    ) -> (Live, PathBuf) {
         let root = crate::store::tests::scratch(label);
         let store = crate::store::Store::at(root.join("it's 中文 dir"));
         let installed = crate::shell::install(&store).expect("装得上");
-        let program = system_root().join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
         let mut config = super::super::Config::shell(program.to_string_lossy(), columns, 24);
         crate::shell::integrate(&installed, &mut config);
         assert_eq!(config.arguments[..3], ["-NoLogo", "-NoExit", "-Command"]);
@@ -1028,7 +1049,19 @@ mod tests {
     /// 回车敲空行不算一条命令；`cd` 以后 OSC 7 报的是新目录（进程的当前目录不跟着变，只有它准）
     #[test]
     fn powershell_integration_marks_commands_and_reports_the_directory() {
-        let (mut shell, root) = integrated_powershell("powershell-integration", "", 160);
+        marks_commands_and_reports_the_directory(&windows_powershell(), "powershell-integration");
+    }
+
+    /// 同上，PowerShell 7
+    #[test]
+    fn pwsh_integration_marks_commands_and_reports_the_directory() {
+        if let Some(program) = powershell_7() {
+            marks_commands_and_reports_the_directory(&program, "pwsh-integration");
+        }
+    }
+
+    fn marks_commands_and_reports_the_directory(program: &Path, label: &str) {
+        let (mut shell, root) = integrated_powershell(program, label, "", 160);
         let host = std::env::var("COMPUTERNAME").expect("有 COMPUTERNAME");
         let start = system_root();
         shell.wait("第一个提示符", |terminal| {
@@ -1092,8 +1125,20 @@ mod tests {
     /// 用户自己的提示符包得住：文字照样显示，看到的 `$?` 也是上一条命令的（主题靠它变色）
     #[test]
     fn powershell_integration_keeps_the_users_prompt() {
+        keeps_the_users_prompt(&windows_powershell(), "powershell-prompt");
+    }
+
+    /// 同上，PowerShell 7
+    #[test]
+    fn pwsh_integration_keeps_the_users_prompt() {
+        if let Some(program) = powershell_7() {
+            keeps_the_users_prompt(&program, "pwsh-prompt");
+        }
+    }
+
+    fn keeps_the_users_prompt(program: &Path, label: &str) {
         let prompt = "function global:prompt { if ($?) { 'good> ' } else { 'bad> ' } }; ";
-        let (mut shell, root) = integrated_powershell("powershell-prompt", prompt, 80);
+        let (mut shell, root) = integrated_powershell(program, label, prompt, 80);
         shell.wait("第一个提示符", at_prompt);
         assert_eq!(prompt_text(&shell.terminal), "good>");
         assert_eq!(shell.run("cmd /c exit 2").exit, Some(2));
