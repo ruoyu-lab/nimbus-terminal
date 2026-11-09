@@ -32,7 +32,7 @@ Built from scratch on the [Aureole](https://github.com/ruoyu-lab/aureole) UI fra
 
 ## Install
 
-macOS only for now (Linux uses the same `forkpty` interface but is untested on a desktop; Windows builds but the ConPTY backend is not written yet, see docs/windows.md). Requires Rust 1.90+.
+macOS only for now (Linux uses the same `forkpty` interface but is untested on a desktop; on Windows the local terminal works through ConPTY, but there is no installer yet and SSH monitoring, the files page and shell integration are still in progress, see docs/windows.md). Requires Rust 1.90+.
 
 ```bash
 git clone https://github.com/ruoyu-lab/nimbus-terminal.git

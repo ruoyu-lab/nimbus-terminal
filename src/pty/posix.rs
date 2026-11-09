@@ -15,14 +15,6 @@ use std::sync::{Arc, Mutex};
 use super::queue::{ByteQueue, Chunk, Producer};
 use super::{Config, Pty, PtyBackend};
 
-/// 子进程会自己去读这些环境变量，我们只负责在 `exec` 之前把它们设好
-const ENVIRONMENT: &[(&str, &str)] = &[
-    // 仿真层按 xterm 的口径实现，报这个 shell 才会发 256 色和真彩
-    ("TERM", "xterm-256color"),
-    ("COLORTERM", "truecolor"),
-    ("TERM_PROGRAM", "Nimbus"),
-];
-
 /// 从 Finder / Dock 启动的应用没有 `LANG`，shell 会退回 C 语言环境：中文显示成问号、
 /// 行编辑按字节退格。当前环境里没有一个明确的 UTF-8 区域设置时补一个
 fn locale_fallback() -> Option<(&'static str, &'static str)> {
@@ -182,20 +174,8 @@ pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
         .transpose()
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "目录名里有 0 字节"))?;
     // `fork` 之后不再分配内存，所以所有字符串现在就备好
-    // 白底黑字是 `0;15`，深底浅字是 `15;0`（`前景;背景` 的色号）。vim、bat 这类程序靠它猜背景深浅，
-    // 不给就当深色背景，配出浅色的字落在白底上
-    let color_hint = (
-        "COLORFGBG",
-        if config.dark_background {
-            "15;0"
-        } else {
-            "0;15"
-        },
-    );
-    let variables: Vec<(CString, CString)> = ENVIRONMENT
-        .iter()
-        .copied()
-        .chain(std::iter::once(color_hint))
+    let variables: Vec<(CString, CString)> = super::terminal_variables(config.dark_background)
+        .into_iter()
         .chain(locale_fallback())
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .chain(config.environment.iter().cloned())

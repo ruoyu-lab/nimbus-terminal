@@ -78,7 +78,7 @@
 
 ## 安装
 
-目前只支持 **macOS**（pty 用的是 `forkpty`，Linux 同一套接口但没有在桌面上测过；Windows 能编译但还不能用，ConPTY 还没写，进度和清单见 [docs/windows.md](docs/windows.md)）。
+目前只支持 **macOS**（pty 用的是 `forkpty`，Linux 同一套接口但没有在桌面上测过；Windows 上本机终端已经能用（ConPTY），还没打包，SSH 的监控和文件页、shell 集成等还在做，进度和清单见 [docs/windows.md](docs/windows.md)）。
 
 ### 下载
 
@@ -156,7 +156,7 @@ cargo test
 
 | 层 | 职责 |
 | --- | --- |
-| `pty` | 起子进程、搬字节、改窗口大小（跨平台的接缝是 `PtyBackend`：`posix` 在用，`windows` 只有骨架） |
+| `pty` | 起子进程、搬字节、改窗口大小（跨平台的接缝是 `PtyBackend`：类 Unix 是 `posix`，Windows 是 `windows`（ConPTY）） |
 | `vt` | 把字节流解析成屏幕模型：解析器、屏幕、键盘和鼠标的编码，加查找（`search`）、命令标记（`marks`）、图片（`image`：iTerm2、Kitty、Sixel） |
 | `view` | 把屏幕模型同步到框架的字符网格，管终端配色 |
 | `links` | 在一行文字里认出网址和文件路径 |

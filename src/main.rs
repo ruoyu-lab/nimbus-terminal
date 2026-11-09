@@ -1,7 +1,7 @@
 //! Nimbus：用 Aureole 框架写的终端。
 //!
 //! 分层，从下往上看：
-//! - `pty`：起子进程、搬字节、改窗口大小（跨平台的接缝在 `pty::PtyBackend`，目前只有类 Unix 的实现）
+//! - `pty`：起子进程、搬字节、改窗口大小（跨平台的接缝在 `pty::PtyBackend`：类 Unix 用 `forkpty`，Windows 用 ConPTY）
 //! - `target`：会话连到哪里（本机、SSH 服务器、Docker 容器）；`ssh`、`docker` 是各自的命令层，`remote` 按目标分发
 //! - `vt`：把字节流解析成屏幕模型（不认识界面）；键盘、鼠标的编码也在这里
 //! - `view`：把屏幕模型同步到 `CharGrid`（不认识字节）；终端配色也在这里

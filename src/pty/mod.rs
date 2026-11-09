@@ -1,7 +1,7 @@
 //! pty 层：起一个子进程，把它的终端接到我们手上。
 //!
 //! 跨平台的接缝是 [`PtyBackend`]：类 Unix 走 `forkpty`（[`posix`]，在 macOS 上跑，Linux 是同一套代码），
-//! Windows 走 ConPTY（[`windows`]，现在只有骨架，调用会直接报错，而不是编出一个能过但跑不对的二进制）。
+//! Windows 走 ConPTY（[`windows`]）。
 //! 加一个平台只要在这里加一个后端文件，再接到 [`spawn`] 和 [`default_shell`]，上面的代码不用动。
 //!
 //! 数据走两条线：
@@ -10,8 +10,6 @@
 
 #[cfg(unix)]
 mod posix;
-// ConPTY 后端写出来之前，Windows 上这些都没人用
-#[cfg_attr(not(unix), allow(dead_code))]
 mod queue;
 #[cfg(windows)]
 mod windows;
@@ -68,8 +66,20 @@ impl Pty {
     }
 }
 
+/// 子进程会自己去读这些环境变量：每个后端起进程时都设上，后面再接 [`Config::environment`]
+fn terminal_variables(dark_background: bool) -> [(&'static str, &'static str); 4] {
+    [
+        // 仿真层按 xterm 的口径实现，报这个 shell 才会发 256 色和真彩
+        ("TERM", "xterm-256color"),
+        ("COLORTERM", "truecolor"),
+        ("TERM_PROGRAM", "Nimbus"),
+        // 白底黑字是 `0;15`，深底浅字是 `15;0`（`前景;背景` 的色号）。vim、bat 这类程序靠它猜背景深浅，
+        // 不给就当深色背景，配出浅色的字落在白底上
+        ("COLORFGBG", if dark_background { "15;0" } else { "0;15" }),
+    ]
+}
+
 /// 起一个子进程要说的东西
-#[cfg_attr(not(unix), allow(dead_code))]
 pub struct Config {
     /// 要跑的程序，一般是 `$SHELL`
     pub program: String,
