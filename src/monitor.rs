@@ -6,12 +6,12 @@
 //!
 //! 只支持 Linux（读 `/proc`）；别的系统（macOS、BSD 服务器）会明确说「暂不支持」，不显示错的数字。
 
-/// 在远端跑的脚本：每一段前面一行 `@@名字`，后面是原样的输出。
-/// 只用最朴素的 `sh` 语法，并且整条放进单引号：远端用户的登录 shell 可能是 bash、zsh、fish、csh，
-/// ssh 会把这条命令交给它去解释，里面不能有哪个 shell 会另外理解的字符（`!`、反引号、`$(…)`）
-pub const REMOTE_COMMAND: &str = "sh -c 'echo @@stat; head -1 /proc/stat; echo @@mem; \
+/// 在远端跑的脚本（交给常驻通道的 `sh`）：每一段前面一行 `@@名字`，后面是原样的输出。
+/// 只用最朴素的 `sh` 语法。以前是整条交给 `ssh` 当命令行，要躲开远端登录 shell（fish、csh）会另外理解的字符；
+/// 现在直接写进 `sh` 的标准输入，不经过登录 shell，不用再躲
+pub const MONITOR_SCRIPT: &str = "echo @@stat; head -1 /proc/stat; echo @@mem; \
 grep -E \"^(MemTotal|MemFree|MemAvailable|Buffers|Cached):\" /proc/meminfo; echo @@disk; \
-df -Pk / | tail -1; echo @@load; cat /proc/loadavg; echo @@up; cat /proc/uptime'";
+df -Pk / | tail -1; echo @@load; cat /proc/loadavg; echo @@up; cat /proc/uptime";
 
 /// 保留多少个 CPU 采样画曲线：每 2 秒一个，两分钟
 pub const HISTORY: usize = 60;
@@ -23,17 +23,24 @@ pub struct CpuTimes {
     pub total: u64,
 }
 
-/// 一次读到的原始数据
+/// CPU 的一次采样：服务器给的是累计时间（两次算差），容器给的是算好的百分比（`docker stats`）
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CpuSample {
+    Times(CpuTimes),
+    Percent(f32),
+}
+
+/// 一次读到的原始数据。磁盘、负载、运行时间不是每个目标都有（容器没有按容器算的负载），没有就是 `None`
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
-    pub cpu: CpuTimes,
-    /// 内存、磁盘的单位都是 KiB
+    pub cpu: CpuSample,
+    /// 内存的单位是 KiB
     pub mem_total: u64,
     pub mem_available: u64,
-    pub disk_total: u64,
-    pub disk_used: u64,
-    pub load: [f32; 3],
-    pub uptime: u64,
+    /// 磁盘（总量、已用），单位 KiB
+    pub disk: Option<(u64, u64)>,
+    pub load: Option<[f32; 3]>,
+    pub uptime: Option<u64>,
 }
 
 /// 这次没取到数据的原因
@@ -86,12 +93,21 @@ pub fn parse(output: &str) -> Result<Reading, Failure> {
     let mem_total = *memory.get("MemTotal").ok_or_else(|| bad("内存数据"))?;
     // 老内核没有 MemAvailable：用空闲加缓存估
     let mem_available = memory.get("MemAvailable").copied().unwrap_or_else(|| {
-        ["MemFree", "Buffers", "Cached"].iter().filter_map(|name| memory.get(*name)).sum()
+        ["MemFree", "Buffers", "Cached"]
+            .iter()
+            .filter_map(|name| memory.get(*name))
+            .sum()
     });
 
     let disk = section("disk");
-    let disk_fields: Vec<&str> = disk.last().map(|line| line.split_whitespace().collect()).unwrap_or_default();
-    let (disk_total, disk_used) = match (disk_fields.get(1).and_then(|text| number(text)), disk_fields.get(2).and_then(|text| number(text))) {
+    let disk_fields: Vec<&str> = disk
+        .last()
+        .map(|line| line.split_whitespace().collect())
+        .unwrap_or_default();
+    let (disk_total, disk_used) = match (
+        disk_fields.get(1).and_then(|text| number(text)),
+        disk_fields.get(2).and_then(|text| number(text)),
+    ) {
         (Some(total), Some(used)) => (total, used),
         _ => return Err(bad("磁盘数据")),
     };
@@ -99,7 +115,12 @@ pub fn parse(output: &str) -> Result<Reading, Failure> {
     let load_line = section("load");
     let load: Vec<f32> = load_line
         .first()
-        .map(|line| line.split_whitespace().take(3).filter_map(|text| text.parse().ok()).collect())
+        .map(|line| {
+            line.split_whitespace()
+                .take(3)
+                .filter_map(|text| text.parse().ok())
+                .collect()
+        })
         .unwrap_or_default();
     let [one, five, fifteen] = load[..] else {
         return Err(bad("负载数据"));
@@ -111,19 +132,24 @@ pub fn parse(output: &str) -> Result<Reading, Failure> {
         .map_or(0, |seconds| seconds.max(0.0) as u64);
 
     Ok(Reading {
-        cpu: CpuTimes { busy: total.saturating_sub(idle), total },
+        cpu: CpuSample::Times(CpuTimes {
+            busy: total.saturating_sub(idle),
+            total,
+        }),
         mem_total,
         mem_available: mem_available.min(mem_total),
-        disk_total,
-        disk_used: disk_used.min(disk_total),
-        load: [one, five, fifteen],
-        uptime,
+        disk: Some((disk_total, disk_used.min(disk_total))),
+        load: Some([one, five, fifteen]),
+        uptime: Some(uptime),
     })
 }
 
 /// 两次读数之间 CPU 忙了百分之几（0..=100）。要两次才算得出；间隔里时间没走（或者远端重启计数回零）算不出
 pub fn cpu_percent(before: CpuTimes, now: CpuTimes) -> Option<f32> {
-    let total = now.total.checked_sub(before.total).filter(|total| *total > 0)?;
+    let total = now
+        .total
+        .checked_sub(before.total)
+        .filter(|total| *total > 0)?;
     let busy = now.busy.saturating_sub(before.busy).min(total);
     Some(busy as f32 / total as f32 * 100.0)
 }
@@ -131,14 +157,14 @@ pub fn cpu_percent(before: CpuTimes, now: CpuTimes) -> Option<f32> {
 /// 界面要显示的一份数据
 #[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
-    /// 第一次读还没有上一次可比，所以是 `None`
+    /// 累计时间的采样第一次读还没有上一次可比，所以是 `None`；百分比的采样第一次就有
     pub cpu: Option<f32>,
     pub mem_used: u64,
     pub mem_total: u64,
-    pub disk_used: u64,
-    pub disk_total: u64,
-    pub load: [f32; 3],
-    pub uptime: u64,
+    /// 磁盘（总量、已用），单位 KiB；这个目标取不到就是 `None`
+    pub disk: Option<(u64, u64)>,
+    pub load: Option<[f32; 3]>,
+    pub uptime: Option<u64>,
 }
 
 /// 监控现在的状态
@@ -168,8 +194,18 @@ impl Monitor {
     pub fn apply(&mut self, result: Result<Reading, Failure>) {
         match result {
             Ok(reading) => {
-                let cpu = self.previous.and_then(|before| cpu_percent(before, reading.cpu));
-                self.previous = Some(reading.cpu);
+                let cpu = match reading.cpu {
+                    CpuSample::Times(now) => {
+                        let percent = self.previous.and_then(|before| cpu_percent(before, now));
+                        self.previous = Some(now);
+                        percent
+                    }
+                    // 已经是百分比，不用基准；累计时间的基准留着也没意义了
+                    CpuSample::Percent(percent) => {
+                        self.previous = None;
+                        Some(percent)
+                    }
+                };
                 if let Some(percent) = cpu {
                     self.cpu_history.push(percent);
                     if self.cpu_history.len() > HISTORY {
@@ -180,8 +216,7 @@ impl Monitor {
                     cpu,
                     mem_used: reading.mem_total - reading.mem_available,
                     mem_total: reading.mem_total,
-                    disk_used: reading.disk_used,
-                    disk_total: reading.disk_total,
+                    disk: reading.disk,
                     load: reading.load,
                     uptime: reading.uptime,
                 });
@@ -207,7 +242,11 @@ pub fn size(kib: u64) -> String {
         value /= 1024.0;
         unit += 1;
     }
-    if value >= 100.0 || unit == 0 { format!("{value:.0} {}", UNITS[unit]) } else { format!("{value:.1} {}", UNITS[unit]) }
+    if value >= 100.0 || unit == 0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// 运行时间：`3 天 4 小时`、`5 小时 12 分`、`7 分`
@@ -245,18 +284,30 @@ Cached:          4096000 kB
     #[test]
     fn a_linux_sample_is_parsed() {
         let reading = parse(SAMPLE).expect("能解析");
-        assert_eq!(reading.cpu, CpuTimes { busy: 4705 + 150 + 1120 + 30, total: 4705 + 150 + 1120 + 16250 + 520 + 30 });
-        assert_eq!((reading.mem_total, reading.mem_available), (16_384_000, 8_192_000));
-        assert_eq!((reading.disk_total, reading.disk_used), (102_400_000, 40_960_000));
-        assert_eq!(reading.load, [0.52, 0.61, 0.70]);
-        assert_eq!(reading.uptime, 273_600);
+        assert_eq!(
+            reading.cpu,
+            CpuSample::Times(CpuTimes {
+                busy: 4705 + 150 + 1120 + 30,
+                total: 4705 + 150 + 1120 + 16250 + 520 + 30
+            })
+        );
+        assert_eq!(
+            (reading.mem_total, reading.mem_available),
+            (16_384_000, 8_192_000)
+        );
+        assert_eq!(reading.disk, Some((102_400_000, 40_960_000)));
+        assert_eq!(reading.load, Some([0.52, 0.61, 0.70]));
+        assert_eq!(reading.uptime, Some(273_600));
     }
 
     /// 没有 MemAvailable 的老内核：用空闲加缓冲加缓存
     #[test]
     fn old_kernels_without_memavailable_are_estimated() {
         let text = SAMPLE.replace("MemAvailable:    8192000 kB\n", "");
-        assert_eq!(parse(&text).expect("能解析").mem_available, 2_048_000 + 512_000 + 4_096_000);
+        assert_eq!(
+            parse(&text).expect("能解析").mem_available,
+            2_048_000 + 512_000 + 4_096_000
+        );
     }
 
     /// 不是 Linux（macOS 服务器、BSD）：`/proc/stat` 不存在，只说「暂不支持」，不拿错的数字糊弄
@@ -272,7 +323,10 @@ Cached:          4096000 kB
         for text in [
             "@@stat\ncpu  1 2\n@@mem\n@@disk\n@@load\n@@up\n",
             &SAMPLE.replace("0.52 0.61 0.70", "x y z"),
-            &SAMPLE.replace("/dev/vda1       102400000 40960000  56320000      43% /", "df: error"),
+            &SAMPLE.replace(
+                "/dev/vda1       102400000 40960000  56320000      43% /",
+                "df: error",
+            ),
             &SAMPLE.replace("MemTotal:       16384000 kB\n", ""),
         ] {
             assert!(matches!(parse(text), Err(Failure::Failed(_))), "{text}");
@@ -282,20 +336,41 @@ Cached:          4096000 kB
     /// 内存、磁盘的「已用」不能超过总量（读数跳动时），不然进度条会画出界
     #[test]
     fn used_never_exceeds_total() {
-        let text = SAMPLE.replace("MemAvailable:    8192000 kB", "MemAvailable:   99999999 kB").replace("40960000", "999999999");
+        let text = SAMPLE
+            .replace("MemAvailable:    8192000 kB", "MemAvailable:   99999999 kB")
+            .replace("40960000", "999999999");
         let reading = parse(&text).expect("能解析");
         assert_eq!(reading.mem_available, reading.mem_total);
-        assert_eq!(reading.disk_used, reading.disk_total);
+        let (total, used) = reading.disk.expect("有磁盘");
+        assert_eq!(used, total);
     }
 
     #[test]
     fn cpu_percent_is_the_busy_share_of_the_interval() {
-        let (before, now) = (CpuTimes { busy: 100, total: 1000 }, CpuTimes { busy: 150, total: 1100 });
+        let (before, now) = (
+            CpuTimes {
+                busy: 100,
+                total: 1000,
+            },
+            CpuTimes {
+                busy: 150,
+                total: 1100,
+            },
+        );
         assert_eq!(cpu_percent(before, now), Some(50.0));
         assert_eq!(cpu_percent(now, now), None, "时间没走算不出");
         assert_eq!(cpu_percent(now, before), None, "计数回零（远端重启）算不出");
         // 忙的增量比总增量大（读数抖动）也不会超过 100%
-        assert_eq!(cpu_percent(before, CpuTimes { busy: 900, total: 1100 }), Some(100.0));
+        assert_eq!(
+            cpu_percent(
+                before,
+                CpuTimes {
+                    busy: 900,
+                    total: 1100
+                }
+            ),
+            Some(100.0)
+        );
     }
 
     /// 第一次读没有基准，没有 CPU；第二次有；曲线最多保留 `HISTORY` 个
@@ -303,31 +378,72 @@ Cached:          4096000 kB
     fn the_monitor_needs_two_readings_for_cpu_and_caps_the_history() {
         let mut monitor = Monitor::default();
         assert_eq!(monitor.status, Status::Waiting);
-        let reading = |busy, total| Reading { cpu: CpuTimes { busy, total }, ..parse(SAMPLE).expect("能解析") };
+        let reading = |busy, total| Reading {
+            cpu: CpuSample::Times(CpuTimes { busy, total }),
+            ..parse(SAMPLE).expect("能解析")
+        };
         monitor.apply(Ok(reading(0, 100)));
         assert_eq!(monitor.status, Status::Live);
-        assert_eq!(monitor.latest.as_ref().and_then(|snapshot| snapshot.cpu), None);
-        assert_eq!(monitor.latest.as_ref().map(|snapshot| snapshot.mem_used), Some(16_384_000 - 8_192_000));
+        assert_eq!(
+            monitor.latest.as_ref().and_then(|snapshot| snapshot.cpu),
+            None
+        );
+        assert_eq!(
+            monitor.latest.as_ref().map(|snapshot| snapshot.mem_used),
+            Some(16_384_000 - 8_192_000)
+        );
         monitor.apply(Ok(reading(50, 200)));
-        assert_eq!(monitor.latest.as_ref().and_then(|snapshot| snapshot.cpu), Some(50.0));
+        assert_eq!(
+            monitor.latest.as_ref().and_then(|snapshot| snapshot.cpu),
+            Some(50.0)
+        );
         for step in 0..(HISTORY as u64 + 10) {
             monitor.apply(Ok(reading(100 + step, 300 + step * 2)));
         }
         assert_eq!(monitor.cpu_history.len(), HISTORY);
     }
 
+    /// 百分比的采样（docker stats）：第一次就有 CPU，不用等第二次；没有磁盘、负载、运行时长的目标就不显示这几块
+    #[test]
+    fn percent_samples_have_cpu_immediately_and_optional_fields_stay_none() {
+        let mut monitor = Monitor::default();
+        monitor.apply(Ok(Reading {
+            cpu: CpuSample::Percent(42.5),
+            mem_total: 1024,
+            mem_available: 512,
+            disk: None,
+            load: None,
+            uptime: None,
+        }));
+        assert_eq!(monitor.status, Status::Live);
+        let snapshot = monitor.latest.expect("有数据");
+        assert_eq!(snapshot.cpu, Some(42.5));
+        assert_eq!(monitor.cpu_history, [42.5]);
+        assert_eq!((snapshot.mem_used, snapshot.mem_total), (512, 1024));
+        assert_eq!(snapshot.disk, None);
+        assert_eq!(snapshot.load, None);
+        assert_eq!(snapshot.uptime, None);
+    }
+
     /// 断线再连上：第一次不能拿断线前的基准去算（中间隔了不知道多久），断线时保留最后的数字
     #[test]
     fn a_failure_resets_the_cpu_baseline_but_keeps_the_last_numbers() {
         let mut monitor = Monitor::default();
-        let reading = |busy, total| Reading { cpu: CpuTimes { busy, total }, ..parse(SAMPLE).expect("能解析") };
+        let reading = |busy, total| Reading {
+            cpu: CpuSample::Times(CpuTimes { busy, total }),
+            ..parse(SAMPLE).expect("能解析")
+        };
         monitor.apply(Ok(reading(0, 100)));
         monitor.apply(Ok(reading(50, 200)));
         monitor.apply(Err(Failure::NotConnected));
         assert_eq!(monitor.status, Status::NotConnected);
         assert!(monitor.latest.is_some(), "最后的数字还在");
         monitor.apply(Ok(reading(5000, 9000)));
-        assert_eq!(monitor.latest.as_ref().and_then(|snapshot| snapshot.cpu), None, "断线后的第一次没有基准");
+        assert_eq!(
+            monitor.latest.as_ref().and_then(|snapshot| snapshot.cpu),
+            None,
+            "断线后的第一次没有基准"
+        );
         monitor.apply(Err(Failure::Unsupported));
         assert_eq!(monitor.status, Status::Unsupported);
         monitor.apply(Err(Failure::Failed("超时".into())));
@@ -346,14 +462,17 @@ Cached:          4096000 kB
         assert_eq!(uptime(273_600), "3 天 4 小时");
     }
 
-    /// 脚本里不能有哪个 shell 会另外理解的字符：它会被远端用户的登录 shell（可能是 fish、csh）解释
+    /// 脚本能被一个 `sh` 原样跑：在本机的 `sh` 上跑一遍，每一段的标记都在（本机不是 Linux 时 `/proc` 的命令会报错，
+    /// 但脚本本身的结构——分段标记的顺序——不依赖它们成功）
     #[test]
-    fn the_remote_command_is_one_quoted_sh_invocation_without_shell_specials() {
-        assert!(REMOTE_COMMAND.starts_with("sh -c '") && REMOTE_COMMAND.ends_with('\''));
-        let inside = &REMOTE_COMMAND[7..REMOTE_COMMAND.len() - 1];
-        assert!(!inside.contains('\''), "单引号里不能再有单引号");
-        for special in ['!', '`', '$', '\\', '\n'] {
-            assert!(!inside.contains(special), "{special:?}");
-        }
+    fn the_monitor_script_prints_its_sections_in_order() {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(MONITOR_SCRIPT)
+            .output()
+            .expect("跑得了");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let markers: Vec<&str> = text.lines().filter(|line| line.starts_with("@@")).collect();
+        assert_eq!(markers, ["@@stat", "@@mem", "@@disk", "@@load", "@@up"]);
     }
 }

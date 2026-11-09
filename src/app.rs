@@ -73,11 +73,13 @@ pub struct Launch {
     pub shell: Option<String>,
     /// 终端底色是深色
     pub dark_background: bool,
-    /// 服务器会话的连接复用套接字（监控借它）；本机、或者目录不可用时是 `None`
+    /// SSH 会话的连接复用套接字（监控借它）；别的会话、或者目录不可用时是 `None`
     pub control: Option<std::path::PathBuf>,
+    /// 远端会话（SSH、容器）一开始进哪个目录（绝对路径）；`None` 是主目录
+    pub remote_directory: Option<String>,
 }
 
-/// 起一个会话：本机是登录 shell，服务器是 `ssh`
+/// 起一个会话：本机是登录 shell，服务器是 `ssh`，容器是 `docker exec`
 pub fn spawn(launch: &Launch) -> Spawned {
     let (columns, rows) = (launch.columns as u16, launch.rows as u16);
     let mut config = match &launch.target {
@@ -99,7 +101,24 @@ pub fn spawn(launch: &Launch) -> Spawned {
                 .control
                 .as_deref()
                 .filter(|path| crate::ssh::control_ready(path));
-            crate::ssh::config(host, columns, rows, control)
+            crate::ssh::config(
+                host,
+                columns,
+                rows,
+                control,
+                launch.remote_directory.as_deref(),
+            )
+        }
+        Target::Docker { container } => {
+            // 同主机名：再验一次，容器名绝不能被 `docker` 当成选项
+            if !crate::docker::is_valid_container(container) {
+                return Spawned {
+                    pty: None,
+                    queue: None,
+                    error: Some(format!("容器名不能用：{container}")),
+                };
+            }
+            crate::docker::config(container, columns, rows, launch.remote_directory.as_deref())
         }
     };
     // 起始目录只对本机有意思：服务器上没有这个目录
@@ -152,6 +171,10 @@ pub struct Session {
     bell_seen: Cell<u64>,
     /// 画面闪过几次（响铃设成「画面闪一下」时加一），视图盯着它
     flashes: Signal<u64>,
+    /// 外面（拖放、菜单）要这个终端拿键盘焦点的次数：视图盯着它，加一就聚焦。
+    /// 终端该不该聚焦（`wanted`）只在「聚焦的是哪个终端」变的时候重新算；拖放这类动作把焦点弄丢了，
+    /// 而聚焦的终端没变，所以需要另外一条路明确地要回来
+    focus_requests: Signal<u64>,
     /// 下一次画要把整屏的颜色重算（配色换了）
     repaint_all: Cell<bool>,
     /// 字体、字号变了、格子大小要重新量：记着变的时候网格的边界，边界变了才说明新的格子大小已经布局出来
@@ -227,6 +250,7 @@ impl Session {
             // 信号归当前的作用域，从命令面板、右键菜单里点出来的新标签，作用域一会儿就释放了，
             // 之后再读它就 panic（在鼠标事件的回调里就是直接 abort）：会话比任何界面都活得久，信号放在不挂界面的作用域里
             flashes: aureole::detached(|| signal(0)),
+            focus_requests: aureole::detached(|| signal(0)),
             repaint_all: Cell::new(false),
             remeasure_from: Cell::new(None),
             output_version: Cell::new(0),
@@ -711,6 +735,23 @@ impl Session {
         self.snap_to_bottom();
     }
 
+    /// 要这个终端拿回键盘焦点（从文件页拖了东西进来之后）
+    pub fn request_focus(&self) {
+        self.focus_requests.update(|requests| *requests += 1);
+    }
+
+    /// 把一个路径写在光标处（从文件页拖进来的）：按 shell 的规矩引好，后面跟一个空格，不按回车。
+    /// 路径带控制字符（换行会变成回车，远端的文件名能让你执行任何命令）就一个字也不写，返回 `false`
+    pub fn insert_path(&self, path: &str) -> bool {
+        let Some(word) = crate::files::shell_word(path) else {
+            return false;
+        };
+        self.grid.set_selection(None);
+        self.write(format!("{word} ").as_bytes());
+        self.snap_to_bottom();
+        true
+    }
+
     /// 输入法提交的文字
     fn commit_text(&self, text: &str) {
         self.grid.set_selection(None);
@@ -860,6 +901,14 @@ pub fn view(
     let on_change = wanted.clone();
     Effect::new(move || {
         if on_change() {
+            focus.focus();
+        }
+    });
+    // 明确要焦点（放下东西之后）：第一次（0）是刚建好，不算
+    let requested = session.focus_requests;
+    let on_request = wanted.clone();
+    Effect::new(move || {
+        if requested.get() > 0 && on_request() {
             focus.focus();
         }
     });

@@ -11,7 +11,7 @@ use crate::chrome::widgets::{directory_drop, outline_button};
 use crate::chrome::{GUTTER, STATUS_HEIGHT};
 use crate::icons::{Icon, icon};
 use crate::pane::{Axis, Pane};
-use crate::tabs::{Tab, Workspace};
+use crate::tabs::{RemotePath, Tab, Workspace};
 use crate::target::Target;
 use crate::theme::{card_bg, card_shadow, fg, hover, line, text_2, text_3};
 
@@ -144,6 +144,7 @@ fn pane_leaf(
     multi: bool,
 ) -> Element {
     let (focus, owner, tab_id) = (tab.focus, workspace.clone(), tab.id);
+    let (dropper, drop_session) = (workspace.clone(), session.clone());
     let focused = move || focus.get() == pane;
     // 右键菜单：点在哪、开没开
     let (open, at) = (signal(false), signal([0.0f32, 0.0]));
@@ -154,6 +155,14 @@ fn pane_leaf(
         .min_height(0)
         .clip(true)
         .on_pointer_down(move |_: &PointerEvent| owner.focus_pane(tab_id, pane))
+        // 从右侧文件页拖来的条目：把它的绝对路径写在这个终端的光标处（引好，不按回车）
+        .accepts_drop(|_: &RemotePath| true)
+        .on_drop(move |path: RemotePath, _: &DropEvent| {
+            dropper.focus_pane(tab_id, pane);
+            drop_session.insert_path(&path.0);
+            // 拖放把键盘焦点弄丢了：要回来，放完直接就能打字
+            drop_session.request_focus();
+        })
         // 拆分过时，聚焦的那个终端顶上一条深一点的线，别的是透明的
         .child_when(
             move || multi,
@@ -307,9 +316,19 @@ fn status_bar(workspace: &Rc<Workspace>) -> Element {
                 .gap(6)
                 .color(text_2())
                 .font_size(12)
-                // 本机是笔记本，服务器是机柜
-                .child_when(move || target().host().is_none(), || icon(Icon::Laptop, 14.0))
-                .child_when(move || target().host().is_some(), || icon(Icon::Server, 14.0))
+                // 本机是笔记本，服务器是机柜，容器是集装箱
+                .child_when(
+                    move || target().remote_name().is_none(),
+                    || icon(Icon::Laptop, 14.0),
+                )
+                .child_when(
+                    move || target().host().is_some(),
+                    || icon(Icon::Server, 14.0),
+                )
+                .child_when(
+                    move || target().container().is_some(),
+                    || icon(Icon::Box, 14.0),
+                )
                 .child(text(move || target().label()).name("status-target")),
         )
         .child(chip(Icon::Terminal).child(text(move || {

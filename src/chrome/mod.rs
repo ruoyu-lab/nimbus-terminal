@@ -111,6 +111,8 @@ fn frame(workspace: Rc<Workspace>) -> Element {
     );
     let connect_owner = workspace.clone();
     let connect_prompt = workspace.connect_prompt;
+    let docker_owner = workspace.clone();
+    let docker_prompt = workspace.docker_prompt;
     let (palette_open, renaming, folder_prompt, closing) = (
         workspace.palette_open,
         workspace.renaming,
@@ -187,6 +189,15 @@ fn frame(workspace: Rc<Workspace>) -> Element {
                 .backdrop(scrim())
                 .backdrop_transition(Tween::new(ms(160)).ease_out())
                 .on_dismiss(move |_| connect_prompt.set(false)),
+        )
+        .overlay(
+            docker_prompt,
+            Overlay::new(move || menu::docker_dialog(docker_owner.clone()))
+                .centered(true)
+                .modal(true)
+                .backdrop(scrim())
+                .backdrop_transition(Tween::new(ms(160)).ease_out())
+                .on_dismiss(move |_| docker_prompt.set(false)),
         )
         .overlay(
             move || closing.get().is_some(),

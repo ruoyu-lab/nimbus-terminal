@@ -17,12 +17,13 @@ use aureole::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{Hooks, Launch, PADDING, Session, Spawned};
+use crate::files::{self, FilesState, TransferState};
+use crate::monitor::{self, Monitor};
 use crate::pane::{Axis, Pane};
 use crate::settings::{
     Form, LastTab, Settings, ShellKind, SidebarStart, Startup, ThemeChoice, TitleSource,
 };
 use crate::store::Store;
-use crate::monitor::{self, Monitor};
 use crate::target::{PanelKind, Target};
 use crate::{chrome, view};
 
@@ -85,8 +86,12 @@ impl SettingsPage {
 /// 起一个会话：怎么起（连到哪、多少列行、哪个目录、哪个 shell）
 pub type SpawnFn = Rc<dyn Fn(&Launch) -> Spawned>;
 
-/// 取一次监控数据：主机、复用套接字 → 脚本的输出。在后台线程里调
-type Fetch = Arc<dyn Fn(&str, &Path) -> Result<String, monitor::Failure> + Send + Sync>;
+/// 取一次监控数据：目标、复用套接字（SSH 才有） → 读数。在后台线程里调
+type Fetch =
+    Arc<dyn Fn(&Target, Option<&Path>) -> Result<monitor::Reading, monitor::Failure> + Send + Sync>;
+
+/// 列出运行中的容器。在后台线程里调；测试里换成假的
+type ContainerLister = Arc<dyn Fn() -> Result<Vec<String>, monitor::Failure> + Send + Sync>;
 
 /// 一个标签
 #[derive(Clone)]
@@ -97,7 +102,7 @@ pub struct Tab {
     /// 聚焦的是哪个终端（排布里叶子的编号）：键盘打字、状态条、存目录都看它
     pub focus: Signal<u64>,
     pub target: Target,
-    /// 服务器标签的连接复用套接字：第一个终端的 `ssh` 是主连接，监控借它。本机标签没有
+    /// SSH 标签的连接复用套接字：第一个终端的 `ssh` 是主连接，监控借它。别的标签没有
     pub control: Option<PathBuf>,
     /// 归在哪个文件夹下面；没有就是直接列在「目标」下
     pub folder: Option<u64>,
@@ -142,6 +147,10 @@ pub struct FolderDrag {
     pub to: usize,
 }
 
+/// 从文件页拖一个条目时带的数据：它在服务器上的绝对路径。放进终端就是把路径（按 shell 的规矩引好）写在光标处
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemotePath(pub String);
+
 /// 拖文件夹时带的数据。单独一个类型：窗口里接标签的放置目标收的是 `u64`，不能把文件夹当成标签放下
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FolderId(pub u64);
@@ -172,6 +181,8 @@ struct Saved {
     tabs: Vec<SavedTab>,
     /// 手动连过的服务器（`~/.ssh/config` 里的不用存，每次启动重新读）
     hosts: Vec<String>,
+    /// 手动连过的容器（运行中的不用存，每次启动重新列）
+    containers: Vec<String>,
     /// 当前标签是 `tabs` 里的第几个
     active: Option<usize>,
     sidebar_width: Option<f32>,
@@ -189,8 +200,10 @@ struct SavedFolder {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SavedTab {
     folder: Option<u64>,
-    /// 服务器的主机名；本机的标签是 `None`
+    /// 服务器的主机名；不是服务器的标签是 `None`
     host: Option<String>,
+    /// 容器的名字；不是容器的标签是 `None`
+    container: Option<String>,
     /// 用户给起的名字；没起过就是 `None`
     title: Option<String>,
     /// 关掉时聚焦的那个终端的目录（没有 `layout` 的旧文件用它）
@@ -261,14 +274,29 @@ pub struct Workspace {
     pub hosts: Signal<Vec<String>>,
     /// 手动连过的那部分（要存下来）
     manual_hosts: RefCell<Vec<String>>,
+    /// 侧栏「容器」里列的：运行中的，加上手动连过的
+    pub containers: Signal<Vec<String>>,
+    /// 手动连过的那部分（要存下来）
+    manual_containers: RefCell<Vec<String>>,
     /// 「连接到服务器」的输入框开着没有
     pub connect_prompt: Signal<bool>,
+    /// 「连接到容器」的输入框开着没有
+    pub docker_prompt: Signal<bool>,
     /// 每个服务器标签的监控数据（只有看着监控页的标签才会更新）
     pub monitors: Signal<HashMap<u64, Monitor>>,
+    /// 每个服务器标签的文件页状态
+    pub files: Signal<HashMap<u64, FilesState>>,
+    /// 下载存到哪里（默认是「下载」目录）
+    pub download_dir: RefCell<PathBuf>,
+    /// 远端的列目录、下载、上传：平时按目标走 SSH 或 Docker，测试里换成假的
+    remote: RefCell<Arc<dyn crate::remote::Remote>>,
+    next_transfer: Cell<u64>,
     /// 有一次取数还没回来：不叠着发
     polling: Cell<bool>,
-    /// 怎么取数（后台线程里调）：平时借 ssh 连接跑脚本，测试里换成可控的
+    /// 怎么取数（后台线程里调）：平时按目标走 SSH 或 Docker，测试里换成可控的
     fetch: RefCell<Fetch>,
+    /// 怎么列容器（后台线程里调）：平时是 `docker ps`，测试里换成假的
+    container_lister: RefCell<ContainerLister>,
     /// 文件夹命名框：新建，或者在改哪一个
     pub folder_prompt: Signal<Option<FolderPrompt>>,
     /// 正在拖着的文件夹；没拖时是 `None`
@@ -370,10 +398,21 @@ impl Workspace {
             folders: signal(folders),
             hosts: signal(saved.hosts.clone()),
             manual_hosts: RefCell::new(saved.hosts.clone()),
+            containers: signal(saved.containers.clone()),
+            manual_containers: RefCell::new(saved.containers.clone()),
             connect_prompt: signal(false),
+            docker_prompt: signal(false),
             monitors: signal(HashMap::new()),
+            files: signal(HashMap::new()),
+            download_dir: RefCell::new(
+                crate::store::user_home()
+                    .map_or_else(|| PathBuf::from("."), |home| home.join("Downloads")),
+            ),
+            remote: RefCell::new(Arc::new(crate::remote::OverRemote)),
+            next_transfer: Cell::new(1),
             polling: Cell::new(false),
-            fetch: RefCell::new(Arc::new(crate::ssh::poll)),
+            fetch: RefCell::new(Arc::new(crate::remote::poll)),
+            container_lister: RefCell::new(Arc::new(crate::docker::list_containers)),
             folder_prompt: signal(None),
             folder_drag: signal(None),
             bar: signal(Vec::new()),
@@ -453,6 +492,20 @@ impl Workspace {
                         session.apply_scrollback();
                     }
                 }
+            }
+        });
+        // 「远程功能」开着就列一遍容器（启动时这里也会跑一次）；关了侧栏的「容器」整块不存在。
+        // 等界面跑起来再取：取容器名单的函数这时才能被换掉（测试里换成假的）
+        let this = self.this.clone();
+        Effect::new(move || {
+            if form.remote.get()
+                && let Some(workspace) = this.upgrade()
+            {
+                aureole::detached(|| {
+                    aureole::spawn_local(async move {
+                        workspace.refresh_containers();
+                    })
+                });
             }
         });
         form.persist(self.store.clone());
@@ -541,6 +594,7 @@ impl Workspace {
         let active = self.active.get_untracked();
         Saved {
             hosts: self.manual_hosts.borrow().clone(),
+            containers: self.manual_containers.borrow().clone(),
             folders: self
                 .folders
                 .get_untracked()
@@ -560,6 +614,7 @@ impl Workspace {
                     SavedTab {
                         folder: tab.folder,
                         host: tab.target.host().map(str::to_string),
+                        container: tab.target.container().map(str::to_string),
                         title: customs.get(&tab.id).cloned(),
                         directory: tab.session().working_directory(),
                         focus: layout.leaves().iter().position(|(id, _)| *id == focus),
@@ -577,6 +632,15 @@ impl Workspace {
     pub fn finish(&self) {
         self.save_now();
         self.finished.set(true);
+        // 后台的主连接要关掉（会话结束时没人替它们收尾），不然它们会在后台挂到兜底的超时
+        for tab in self.tabs.get_untracked() {
+            if let (Some(host), Some(control)) = (tab.target.host(), tab.control.as_deref()) {
+                crate::ssh::shutdown(host, control);
+            }
+            if let Some(container) = tab.target.container() {
+                crate::docker::shutdown(container);
+            }
+        }
     }
 
     /// 配置存在哪个目录；不落盘时是 `None`
@@ -649,13 +713,19 @@ impl Workspace {
             let layout = tab.layout.clone().unwrap_or(SavedPane::Pane {
                 directory: tab.directory.clone(),
             });
-            let target = tab
-                .host
-                .as_deref()
-                .and_then(crate::ssh::normalize)
-                .map_or(Target::Local, |host| Target::Ssh { host });
+            let target = match tab.container.as_deref().and_then(crate::docker::normalize) {
+                Some(container) => Target::Docker { container },
+                None => tab
+                    .host
+                    .as_deref()
+                    .and_then(crate::ssh::normalize)
+                    .map_or(Target::Local, |host| Target::Ssh { host }),
+            };
             if let Some(host) = target.host() {
                 self.remember_host(host);
+            }
+            if let Some(container) = target.container() {
+                self.remember_container(container);
             }
             let mut control = target.host().and_then(|_| crate::ssh::control_path(tab_id));
             let pane = self.build_pane(
@@ -713,6 +783,7 @@ impl Workspace {
                     target,
                     control.take(),
                     directory.clone(),
+                    None,
                     history,
                     true,
                 );
@@ -725,7 +796,8 @@ impl Workspace {
                 second,
             } => {
                 let first = self.build_pane(tab, folder, target, control, first, keep_output, flat);
-                let second = self.build_pane(tab, folder, target, control, second, keep_output, flat);
+                let second =
+                    self.build_pane(tab, folder, target, control, second, keep_output, flat);
                 Pane::split_node(
                     *axis,
                     ratio.clamp(crate::pane::RATIO_RANGE.0, crate::pane::RATIO_RANGE.1),
@@ -746,20 +818,20 @@ impl Workspace {
             .iter()
             .find(|tab| tab.id == self.active.get_untracked())
             .and_then(|tab| tab.folder);
-        let id = self.open(folder, Target::Local, None, None);
+        let id = self.open(folder, Target::Local, None, None, None);
         self.activate(id);
     }
 
     /// 新开一个不归任何文件夹的终端（直接列在「目标」下），用设置里的起始目录
     pub fn new_tab_loose(&self) {
-        let id = self.open(None, Target::Local, None, None);
+        let id = self.open(None, Target::Local, None, None, None);
         self.activate(id);
     }
 
     /// 在这个文件夹里新开一个本机终端，并把它展开。文件夹有目录就从那个目录起
     pub fn new_tab_in(&self, folder: u64) {
         self.reveal_folder(folder);
-        let id = self.open(Some(folder), Target::Local, None, None);
+        let id = self.open(Some(folder), Target::Local, None, None, None);
         self.activate(id);
     }
 
@@ -947,6 +1019,7 @@ impl Workspace {
         folder: Option<u64>,
         target: Target,
         directory: Option<PathBuf>,
+        remote_directory: Option<String>,
         history: Option<String>,
     ) -> u64 {
         let id = self.new_id();
@@ -957,6 +1030,7 @@ impl Workspace {
             &target,
             control.clone(),
             directory,
+            remote_directory,
             history,
             false,
         );
@@ -967,11 +1041,16 @@ impl Workspace {
     /// 新开一个连到服务器的标签并切过去。主机名不能用（空的、以 `-` 开头、带空白……）时什么也不做，返回 `false`。
     /// 手动连过的主机记下来，下次启动还在侧栏的「远程」里
     pub fn new_tab_ssh(&self, host: &str) -> bool {
+        self.new_tab_ssh_in(host, None)
+    }
+
+    /// 同上，并且一开始进远端的 `directory`（绝对路径）。目录不能用（相对路径、带控制字符）就进主目录
+    pub fn new_tab_ssh_in(&self, host: &str, directory: Option<String>) -> bool {
         let Some(host) = crate::ssh::normalize(host) else {
             return false;
         };
         self.remember_host(&host);
-        let id = self.open(None, Target::Ssh { host }, None, None);
+        let id = self.open(None, Target::Ssh { host }, None, directory, None);
         self.activate(id);
         true
     }
@@ -995,6 +1074,73 @@ impl Workspace {
         });
     }
 
+    /// 新开一个连到容器的标签并切过去。名字不能用（空的、以 `-` 开头、带空白……）时什么也不做，返回 `false`。
+    /// 手动连过的容器记下来，下次启动还在侧栏的「容器」里
+    pub fn new_tab_docker(&self, container: &str) -> bool {
+        self.new_tab_docker_in(container, None)
+    }
+
+    /// 同上，并且一开始进容器里的 `directory`（绝对路径）。目录不能用（相对路径、带控制字符）就进主目录
+    pub fn new_tab_docker_in(&self, container: &str, directory: Option<String>) -> bool {
+        let Some(container) = crate::docker::normalize(container) else {
+            return false;
+        };
+        self.remember_container(&container);
+        let id = self.open(None, Target::Docker { container }, None, directory, None);
+        self.activate(id);
+        true
+    }
+
+    fn remember_container(&self, container: &str) {
+        if self
+            .containers
+            .get_untracked()
+            .iter()
+            .any(|known| known == container)
+        {
+            return;
+        }
+        self.manual_containers
+            .borrow_mut()
+            .push(container.to_string());
+        self.containers
+            .update(|containers| containers.push(container.to_string()));
+    }
+
+    /// 重新列一遍运行中的容器（`docker ps`），和手动连过的、开着的标签用的合在一起：
+    /// 停了的容器只要还有标签开着就还列着，没有标签的就不列了。列不出来（docker 不在）就保持原样。
+    /// 在后台线程跑，不占界面
+    pub fn refresh_containers(self: &Rc<Self>) {
+        if !self.form.remote.get_untracked() {
+            return;
+        }
+        let this = Rc::downgrade(self);
+        let lister = self.container_lister.borrow().clone();
+        aureole::detached(|| {
+            aureole::spawn_blocking(move || lister()).then(move |result| {
+                let Some(workspace) = this.upgrade() else {
+                    return;
+                };
+                let Ok(found) = result else {
+                    return;
+                };
+                let mut names = workspace.manual_containers.borrow().clone();
+                let open = workspace
+                    .tabs
+                    .get_untracked()
+                    .iter()
+                    .filter_map(|tab| tab.target.container().map(str::to_string))
+                    .collect::<Vec<_>>();
+                for name in found.into_iter().chain(open) {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                workspace.containers.set(names);
+            })
+        });
+    }
+
     /// 起一个终端（会话），它属于标签 `tab`。返回它在标签里的编号和会话
     ///
     /// `waiting` 为真时服务器的会话不连，停在「已断开，按回车连接」（重启后恢复的）
@@ -1005,6 +1151,7 @@ impl Workspace {
         target: &Target,
         control: Option<PathBuf>,
         directory: Option<PathBuf>,
+        remote_directory: Option<String>,
         history: Option<String>,
         waiting: bool,
     ) -> (u64, Rc<Session>) {
@@ -1012,6 +1159,10 @@ impl Workspace {
         let shell = (self.form.shell.get_untracked() == ShellKind::Program)
             .then(|| self.form.shell_program.get_untracked().trim().to_string())
             .filter(|program| !program.is_empty());
+        let owns_connection = target
+            .host()
+            .zip(control.clone())
+            .map(|(host, control)| (host.to_string(), control));
         let launch = Launch {
             target: target.clone(),
             columns,
@@ -1019,16 +1170,17 @@ impl Workspace {
             // 起始目录只对本机有意思
             directory: match target {
                 Target::Local => self.start_directory(folder, directory),
-                Target::Ssh { .. } => None,
+                Target::Ssh { .. } | Target::Docker { .. } => None,
             },
             shell,
             dark_background: crate::theme::dark().get_untracked(),
             control,
+            remote_directory,
         };
-        let remote = target.host().is_some();
+        let remote = target.remote_name().is_some();
         let restoring = remote && waiting;
         let spawned = if restoring {
-            // 恢复的服务器会话先不连
+            // 恢复的远端会话先不连
             Spawned {
                 pty: None,
                 queue: None,
@@ -1057,6 +1209,11 @@ impl Workspace {
                 }
             }),
             exited: Rc::new(move |code| {
+                // 主连接在后台常驻，客户端结束了它还在：这个终端是主连接的主人（带着套接字）时，
+                // 它结束就把连接和通道一起收掉（重连时会开一条新的）
+                if let Some((host, control)) = &owns_connection {
+                    crate::ssh::shutdown_in_background(host, control);
+                }
                 // 正常退出（`exit`、Ctrl-D）这个终端就关（拆分出来的只关它，最后一个关标签）；出错退出留着，屏幕上有原因
                 if code == 0
                     && let Some(workspace) = for_exit.upgrade()
@@ -1076,7 +1233,7 @@ impl Workspace {
         };
         let session = Session::start(spawned, columns, rows, hooks, self.form, history.as_deref());
         if remote {
-            // 断线后按回车重连：用当时的大小再起一次 `ssh`
+            // 断线后按回车重连：用当时的大小再起一次 `ssh` / `docker exec`
             let (spawn, this) = (self.spawn.clone(), self.this.clone());
             session.set_reconnect(Rc::new(move || {
                 let mut launch = launch.clone();
@@ -1086,8 +1243,8 @@ impl Workspace {
                 spawn(&launch)
             }));
             if restoring {
-                let host = target.host().unwrap_or_default();
-                session.wait_for_reconnect(&format!("[已断开 {host}。按回车连接]"));
+                let name = target.remote_name().unwrap_or_default();
+                session.wait_for_reconnect(&format!("[已断开 {name}。按回车连接]"));
             }
         }
         (pane, session)
@@ -1139,8 +1296,16 @@ impl Workspace {
         };
         let directory = tab.session().working_directory();
         // 拆出来的终端各连各的，不抢主连接
-        let (pane, session) =
-            self.spawn_pane(tab.id, tab.folder, &tab.target, None, directory, None, false);
+        let (pane, session) = self.spawn_pane(
+            tab.id,
+            tab.folder,
+            &tab.target,
+            None,
+            directory,
+            None,
+            None,
+            false,
+        );
         let layout = tab.layout.get_untracked();
         tab.layout
             .set(layout.split(tab.focus.get_untracked(), axis, Pane::leaf(pane, session)));
@@ -1237,12 +1402,12 @@ impl Workspace {
             if self.form.title.get_untracked() == TitleSource::Reported && !reported.is_empty() {
                 reported
             } else {
-                // 服务器的会话默认叫主机名，一眼分得清是哪台
+                // 远端的会话默认叫目标的名字（主机名、容器名），一眼分得清是哪个
                 self.tabs
                     .get_untracked()
                     .iter()
                     .find(|tab| tab.id == id)
-                    .and_then(|tab| tab.target.host().map(str::to_string))
+                    .and_then(|tab| tab.target.remote_name().map(str::to_string))
                     .unwrap_or_else(|| DEFAULT_TITLE.to_string())
             }
         };
@@ -1333,11 +1498,25 @@ impl Workspace {
         for session in closed.sessions() {
             session.close();
         }
+        if let (Some(host), Some(control)) = (closed.target.host(), closed.control.as_deref()) {
+            crate::ssh::shutdown_in_background(host, control);
+        }
+        // 容器的通道是按容器共用的：还有别的标签用这个容器就留着
+        if let Some(container) = closed.target.container()
+            && !tabs
+                .iter()
+                .any(|tab| tab.target.container() == Some(container))
+        {
+            crate::docker::shutdown(container);
+        }
         self.unseen.update(|unseen| {
             unseen.remove(&id);
         });
         self.monitors.update(|monitors| {
             monitors.remove(&id);
+        });
+        self.files.update(|files| {
+            files.remove(&id);
         });
         let mut bar = self.bar.get_untracked();
         let slot = bar.iter().position(|&shown| shown == id);
@@ -1522,12 +1701,16 @@ impl Workspace {
         !self.settings_open.get() && self.panel_open.get() && self.has_panels()
     }
 
-    /// 现在该监控谁：当前标签是服务器、有复用套接字就返回（标签、主机、套接字）
-    pub fn monitor_plan(&self) -> Option<(u64, String, PathBuf)> {
+    /// 现在该监控谁：当前标签是远端（服务器、容器）就返回（标签、目标、SSH 的复用套接字）
+    pub fn monitor_plan(&self) -> Option<(u64, Target, Option<PathBuf>)> {
         let active = self.active.get_untracked();
-        let tab = self.tabs.get_untracked().into_iter().find(|tab| tab.id == active)?;
-        let host = tab.target.host()?.to_string();
-        Some((active, host, tab.control.clone()?))
+        let tab = self
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == active)?;
+        tab.target.remote_name()?;
+        Some((active, tab.target.clone(), tab.control.clone()))
     }
 
     /// 取一次监控数据，结果回来写进 `monitors`。上一次还没回来就不再发；
@@ -1536,7 +1719,7 @@ impl Workspace {
         if self.polling.get() || !self.form.remote.get_untracked() {
             return;
         }
-        let Some((tab, host, control)) = self.monitor_plan() else {
+        let Some((tab, target, control)) = self.monitor_plan() else {
             return;
         };
         self.polling.set(true);
@@ -1546,15 +1729,306 @@ impl Workspace {
         // 放在不挂界面的作用域里，页面来来去去它都会跑完
         let fetch = self.fetch.borrow().clone();
         aureole::detached(|| {
+            aureole::spawn_blocking(move || fetch(&target, control.as_deref())).then(
+                move |result| {
+                    let Some(workspace) = this.upgrade() else {
+                        return;
+                    };
+                    workspace.polling.set(false);
+                    workspace.apply_reading(tab, result);
+                },
+            )
+        });
+    }
+
+    // ---- 文件 ----
+
+    fn update_files<R>(&self, tab: u64, change: impl FnOnce(&mut FilesState) -> R) -> Option<R> {
+        if !self.has_tab(tab) {
+            return None;
+        }
+        let mut result = None;
+        self.files
+            .update(|files| result = Some(change(files.entry(tab).or_default())));
+        result
+    }
+
+    /// 读一个目录（`None` 是主目录）。结果回来写进状态；任务不绑在界面上（理由同 `poll_monitor`）
+    pub fn files_load(self: &Rc<Self>, dir: Option<String>) {
+        if !self.form.remote.get_untracked() {
+            return;
+        }
+        let Some((tab, target, control)) = self.monitor_plan() else {
+            return;
+        };
+        // 去过的目录先显示缓存的（马上就有，不等网络），后台照常重新读，读回来再换
+        let asked_home = dir.is_none();
+        let cached = self
+            .files
+            .get_untracked()
+            .get(&tab)
+            .and_then(|state| state.cached(dir.as_deref()));
+        let Some(request) = self.update_files(tab, |state| state.begin_load(cached)) else {
+            return;
+        };
+        let (this, remote) = (Rc::downgrade(self), self.remote.borrow().clone());
+        aureole::detached(|| {
             aureole::spawn_blocking(move || {
-                fetch(&host, &control).and_then(|text| monitor::parse(&text))
+                remote.list(&target, control.as_deref(), dir.as_deref())
+            })
+            .then(move |result| {
+                if let Some(workspace) = this.upgrade() {
+                    workspace
+                        .update_files(tab, |state| state.finish_load(request, asked_home, result));
+                }
+            })
+        });
+    }
+
+    /// 文件页挂上、换了标签、连接恢复时调：还没读过、或者上次因为没连上而没读成，就读
+    pub fn files_ensure_loaded(self: &Rc<Self>) {
+        let Some((tab, ..)) = self.monitor_plan() else {
+            return;
+        };
+        let (status, path) = self
+            .files
+            .get_untracked()
+            .get(&tab)
+            .map_or((files::Status::Idle, None), |state| {
+                (state.status.clone(), state.path.clone())
+            });
+        if matches!(status, files::Status::Idle | files::Status::NotConnected) {
+            self.files_load(path);
+        }
+    }
+
+    fn files_path(&self) -> Option<(u64, String)> {
+        let (tab, ..) = self.monitor_plan()?;
+        let path = self.files.get_untracked().get(&tab)?.path.clone()?;
+        Some((tab, path))
+    }
+
+    /// 现在这个目录里一个条目的完整远端路径
+    pub fn files_full_path(&self, name: &str) -> Option<String> {
+        let (_, path) = self.files_path()?;
+        files::is_safe_name(name).then(|| files::join(&path, name))
+    }
+
+    /// 在远端的某个目录里新开一个终端：`name` 是现在这个目录里的一个文件夹；`None` 是现在这个目录本身
+    pub fn files_new_terminal(&self, name: Option<&str>) {
+        let Some((_, target, _)) = self.monitor_plan() else {
+            return;
+        };
+        let Some((_, here)) = self.files_path() else {
+            return;
+        };
+        let directory = match name {
+            Some(name) if files::is_safe_name(name) => files::join(&here, name),
+            Some(_) => return,
+            None => here,
+        };
+        match target {
+            Target::Ssh { host } => {
+                self.new_tab_ssh_in(&host, Some(directory));
+            }
+            Target::Docker { container } => {
+                self.new_tab_docker_in(&container, Some(directory));
+            }
+            Target::Local => {}
+        }
+    }
+
+    /// 进一个子目录
+    pub fn files_open(self: &Rc<Self>, name: &str) {
+        if let Some((_, path)) = self.files_path()
+            && files::is_safe_name(name)
+        {
+            self.files_load(Some(files::join(&path, name)));
+        }
+    }
+
+    /// 回上一级
+    pub fn files_up(self: &Rc<Self>) {
+        if let Some((_, path)) = self.files_path() {
+            self.files_load(Some(files::parent(&path)));
+        }
+    }
+
+    /// 路径栏里输入了一个路径：`~` 是主目录，`/` 开头是绝对路径，别的当作相对现在这个目录的路径。
+    /// 空的什么也不做。能不能进去由远端的 `cd` 说了算（进不去会在页面上写原因）
+    pub fn files_go(self: &Rc<Self>, input: &str) {
+        let input = input.trim();
+        if input.is_empty() {
+            return;
+        }
+        let target = if input == "~" {
+            None
+        } else if input.starts_with('/') {
+            Some(input.to_string())
+        } else if let Some((_, current)) = self.files_path() {
+            Some(files::join(&current, input))
+        } else {
+            return;
+        };
+        self.files_load(target);
+    }
+
+    /// 重新读现在这个目录
+    pub fn files_refresh(self: &Rc<Self>) {
+        let path = self.files_path().map(|(_, path)| path);
+        self.files_load(path);
+    }
+
+    pub fn files_toggle_hidden(&self) {
+        if let Some((tab, ..)) = self.monitor_plan() {
+            self.update_files(tab, |state| state.show_hidden = !state.show_hidden);
+        }
+    }
+
+    pub fn files_clear_transfers(&self) {
+        if let Some((tab, ..)) = self.monitor_plan() {
+            self.update_files(tab, FilesState::clear_finished);
+        }
+    }
+
+    fn next_transfer_id(&self) -> u64 {
+        let id = self.next_transfer.get();
+        self.next_transfer.set(id + 1);
+        id
+    }
+
+    /// 下载现在这个目录里的一个条目到「下载」目录（本地已有同名的加序号，不覆盖）。文件夹整个下载
+    pub fn files_download(self: &Rc<Self>, name: &str) {
+        let Some((tab, target, control)) = self.monitor_plan() else {
+            return;
+        };
+        let Some((_, path)) = self.files_path() else {
+            return;
+        };
+        let kind = self.files.get_untracked().get(&tab).and_then(|state| {
+            state
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.kind)
+        });
+        let id = self.next_transfer_id();
+        let Some(kind) = kind.filter(|kind| *kind != files::Kind::Other) else {
+            self.update_files(tab, |state| {
+                state.fail_transfer(id, name, false, "这种文件不能下载")
+            });
+            return;
+        };
+        if !files::is_safe_name(name) {
+            self.update_files(tab, |state| {
+                state.fail_transfer(id, name, false, "这个文件名不能传（带控制字符）")
+            });
+            return;
+        }
+        self.update_files(tab, |state| state.start_transfer(id, name, false));
+        let (this, remote, into) = (
+            Rc::downgrade(self),
+            self.remote.borrow().clone(),
+            self.download_dir.borrow().clone(),
+        );
+        let remote_path = files::join(&path, name);
+        aureole::detached(|| {
+            aureole::spawn_blocking(move || {
+                remote.download(
+                    &target,
+                    control.as_deref(),
+                    &remote_path,
+                    kind == files::Kind::Dir,
+                    &into,
+                )
             })
             .then(move |result| {
                 let Some(workspace) = this.upgrade() else {
                     return;
                 };
-                workspace.polling.set(false);
-                workspace.apply_reading(tab, result);
+                let state = match result {
+                    Ok(saved) => TransferState::Done(format!("已存到 {}", saved.display())),
+                    Err(failure) => TransferState::Failed(failure_text(failure)),
+                };
+                workspace.update_files(tab, |files| files.finish_transfer(id, state));
+            })
+        });
+    }
+
+    /// 上传本地的文件或文件夹到现在这个远端目录。远端已有同名的不覆盖：那一项直接记一条失败，别的照传。
+    /// 传完（有成功的）重新读一次目录
+    pub fn files_upload(self: &Rc<Self>, paths: Vec<PathBuf>) {
+        let Some((tab, target, control)) = self.monitor_plan() else {
+            return;
+        };
+        let Some((_, directory)) = self.files_path() else {
+            return;
+        };
+        for local in paths {
+            let name = local
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let id = self.next_transfer_id();
+            let exists = self
+                .files
+                .get_untracked()
+                .get(&tab)
+                .is_some_and(|state| state.has_entry(&name));
+            if exists {
+                self.update_files(tab, |state| {
+                    state.fail_transfer(id, &name, true, "远端已有同名文件，没有覆盖")
+                });
+                continue;
+            }
+            if !files::is_safe_name(&name) {
+                self.update_files(tab, |state| {
+                    state.fail_transfer(id, &name, true, "这个文件名不能传（带控制字符）")
+                });
+                continue;
+            }
+            self.update_files(tab, |state| state.start_transfer(id, &name, true));
+            let (this, remote) = (Rc::downgrade(self), self.remote.borrow().clone());
+            let (target, control, directory) = (target.clone(), control.clone(), directory.clone());
+            aureole::detached(|| {
+                aureole::spawn_blocking(move || {
+                    remote.upload(&target, control.as_deref(), &local, &directory)
+                })
+                .then(move |result| {
+                    let Some(workspace) = this.upgrade() else {
+                        return;
+                    };
+                    let ok = result.is_ok();
+                    let state = match result {
+                        Ok(()) => TransferState::Done("已上传".to_string()),
+                        Err(failure) => TransferState::Failed(failure_text(failure)),
+                    };
+                    workspace.update_files(tab, |files| files.finish_transfer(id, state));
+                    if ok {
+                        workspace.files_refresh();
+                    }
+                })
+            });
+        }
+    }
+
+    /// 弹出系统的选择文件对话框，选好的上传
+    pub fn files_choose_upload(&self) {
+        let this = self.this.clone();
+        aureole::detached(|| {
+            aureole::spawn_local(async move {
+                let mut dialog = aureole::FileDialog::new().title("上传文件");
+                if let Some(home) = crate::store::user_home() {
+                    dialog = dialog.directory(home);
+                }
+                let paths = dialog.pick_files().await;
+                if paths.is_empty() {
+                    return;
+                }
+                if let Some(workspace) = this.upgrade() {
+                    workspace.files_upload(paths);
+                }
             })
         });
     }
@@ -1564,7 +2038,8 @@ impl Workspace {
         if !self.has_tab(tab) {
             return;
         }
-        self.monitors.update(|monitors| monitors.entry(tab).or_default().apply(result));
+        self.monitors
+            .update(|monitors| monitors.entry(tab).or_default().apply(result));
     }
 
     pub fn toggle_panel(&self) {
@@ -1686,6 +2161,15 @@ pub fn root() -> Element {
     workspace.restore();
     workspace.autosave();
     chrome::build(workspace)
+}
+
+/// 失败的原因，写给人看
+fn failure_text(failure: monitor::Failure) -> String {
+    match failure {
+        monitor::Failure::NotConnected => "终端的连接断了".to_string(),
+        monitor::Failure::Unsupported => "暂不支持".to_string(),
+        monitor::Failure::Failed(reason) => reason,
+    }
 }
 
 #[cfg(test)]

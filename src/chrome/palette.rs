@@ -86,6 +86,13 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
             "",
             Rc::new(move || connect.connect_prompt.set(true)),
         ));
+        let docker = workspace.clone();
+        list.push(command(
+            "cmd-docker",
+            "连接到容器…",
+            "",
+            Rc::new(move || docker.docker_prompt.set(true)),
+        ));
     }
     // 只有当前会话的目标带面板（连到服务器）时才有这一条
     if workspace.has_panels() {

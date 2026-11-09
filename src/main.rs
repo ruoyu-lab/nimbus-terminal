@@ -2,7 +2,7 @@
 //!
 //! 分层，从下往上看：
 //! - `pty`：起子进程、搬字节、改窗口大小（跨平台的接缝在 `pty::PtyBackend`，目前只有类 Unix 的实现）
-//! - `target`：会话连到哪里（现在只有本机）
+//! - `target`：会话连到哪里（本机、SSH 服务器、Docker 容器）；`ssh`、`docker` 是各自的命令层，`remote` 按目标分发
 //! - `vt`：把字节流解析成屏幕模型（不认识界面）；键盘、鼠标的编码也在这里
 //! - `view`：把屏幕模型同步到 `CharGrid`（不认识字节）；终端配色也在这里
 //! - `app`：一个终端会话：把三者接到一块网格上（按键、指针、滚轮、输入法、改大小）
@@ -12,14 +12,18 @@
 //! - `chrome`：窗口的外观：标题栏、侧栏、主卡片、状态条、命令面板（`theme` 是颜色，`icons` 是图标）
 
 mod app;
+mod channel;
 mod chrome;
 mod display;
+mod docker;
+mod files;
 mod icons;
 mod monitor;
 mod native;
 mod pane;
 mod product;
 mod pty;
+mod remote;
 mod settings;
 mod ssh;
 mod store;

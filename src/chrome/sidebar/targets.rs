@@ -33,7 +33,7 @@ pub(super) fn list(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
         .child(sessions(
             &loose,
             scrolling,
-            |tab| tab.folder.is_none() && tab.target.host().is_none(),
+            |tab| tab.folder.is_none() && tab.target.remote_name().is_none(),
             None,
         ))
         .child(column().gap(2).each(
@@ -122,6 +122,93 @@ fn host_block(workspace: &Rc<Workspace>, host: String, scrolling: Scrolling) -> 
                 &owner,
                 scrolling,
                 move |tab| tab.target.host() == Some(belongs.as_str()),
+                Some(FOLDER_SESSION_INDENT),
+            )
+        },
+    )
+}
+
+/// 「容器」：运行中的和手动连过的容器。没有容器、或者设置里关了「远程功能」时整块不存在。
+/// 点一个容器：它已经有会话就切过去，没有就连上去；右键可以再开一个会话。容器下面列它的会话
+pub(super) fn containers(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
+    let (containers, form, collapsed) = (workspace.containers, workspace.form, workspace.collapsed);
+    let (owner, refresh) = (workspace.clone(), workspace.clone());
+    column().child_when(
+        move || form.remote.get() && !containers.get().is_empty(),
+        move || {
+            let (owner, refresh) = (owner.clone(), refresh.clone());
+            column()
+                .name("containers")
+                .gap(2)
+                // 挂上时重新列一遍：命令行里新起的容器也出来
+                .on_mount(move || refresh.refresh_containers())
+                .child(section_label(collapsed, "容器"))
+                .child(column().gap(2).each(
+                    move || containers.get(),
+                    |container: &String| container.clone(),
+                    move |container| container_block(&owner, container, scrolling),
+                ))
+        },
+    )
+}
+
+fn container_block(workspace: &Rc<Workspace>, container: String, scrolling: Scrolling) -> Element {
+    let (collapsed, tabs) = (workspace.collapsed, workspace.tabs);
+    let (open, connect, again) = (workspace.clone(), workspace.clone(), workspace.clone());
+    let (name, menu_container, owner) = (container.clone(), container.clone(), workspace.clone());
+    let (online, belongs) = (container.clone(), container.clone());
+    let row = nav_named(collapsed, Icon::Box, container.clone())
+        .name(format!("container-{container}"))
+        .child_when(
+            move || {
+                !collapsed.get()
+                    && tabs
+                        .get()
+                        .iter()
+                        .any(|tab| tab.target.container() == Some(online.as_str()))
+            },
+            || rect().size(7, 7).radius(4).background(mark()),
+        )
+        .on_click(move || {
+            let existing = open
+                .tabs
+                .get_untracked()
+                .iter()
+                .find(|tab| tab.target.container() == Some(name.as_str()))
+                .map(|tab| tab.id);
+            match existing {
+                Some(id) => open.select(id),
+                None => {
+                    connect.new_tab_docker(&name);
+                }
+            }
+        });
+    let row = with_actions(
+        row,
+        format!("menu-container-{container}"),
+        vec![Action {
+            id: format!("new-session-container-{container}"),
+            label: "新建会话".to_string(),
+            // 等菜单卸掉再开，原因同主机菜单里的「新建会话」
+            run: Rc::new(move || {
+                let (workspace, container) = (again.clone(), menu_container.clone());
+                aureole::detached(|| {
+                    aureole::spawn_local(async move {
+                        aureole::sleep(ms(1)).await;
+                        workspace.new_tab_docker(&container);
+                    })
+                });
+            }),
+        }],
+    );
+    column().gap(1).child(row).child_when(
+        move || !collapsed.get(),
+        move || {
+            let belongs = belongs.clone();
+            sessions(
+                &owner,
+                scrolling,
+                move |tab| tab.target.container() == Some(belongs.as_str()),
                 Some(FOLDER_SESSION_INDENT),
             )
         },

@@ -384,7 +384,9 @@ pub(super) fn connect_dialog(workspace: Rc<Workspace>) -> Element {
                     if workspace.new_tab_ssh(&value) {
                         prompt.set(false);
                     } else {
-                        error.set(Some("主机名不能用：只能是字母、数字和 . _ - @ :，不能以 - 开头"));
+                        error.set(Some(
+                            "主机名不能用：只能是字母、数字和 . _ - @ :，不能以 - 开头",
+                        ));
                     }
                 }),
         )
@@ -392,6 +394,56 @@ pub(super) fn connect_dialog(workspace: Rc<Workspace>) -> Element {
         .child(
             text(move || error.get().unwrap_or("回车连接 · Esc 取消"))
                 .name("connect-hint")
+                .font_size(11)
+                .color(text_3())
+                .padding_x(16)
+                .padding_y(8),
+        ))
+}
+
+/// 「连接到容器」：填一个容器名或 ID，回车就 `docker exec` 进去。
+/// 名字不能用（空的、以 `-` 开头、带空白）就留在这里，写明原因
+pub(super) fn docker_dialog(workspace: Rc<Workspace>) -> Element {
+    let container = signal(String::new());
+    let error = signal(None::<&'static str>);
+    let prompt = workspace.docker_prompt;
+    pop(column()
+        .name("docker-dialog")
+        .width(380)
+        .radius(10)
+        .background(card_bg())
+        .shadow(popup_shadow())
+        .child(
+            text("连接到容器")
+                .font_size(12)
+                .color(text_3())
+                .padding_x(16)
+                .margin_top(12),
+        )
+        .child(
+            text_field(container)
+                .name("docker-field")
+                .placeholder("容器名或 ID")
+                .background(Color::TRANSPARENT)
+                .border(0, Color::TRANSPARENT)
+                .focus_ring(FocusRing::NONE)
+                .font_size(15)
+                .padding_x(16)
+                .padding_y(8)
+                .on_submit(move |value: String| {
+                    if workspace.new_tab_docker(&value) {
+                        prompt.set(false);
+                    } else {
+                        error.set(Some(
+                            "容器名不能用：只能是字母、数字和 . _ -，不能以 - 开头",
+                        ));
+                    }
+                }),
+        )
+        .child(rect().height(1).background(line()))
+        .child(
+            text(move || error.get().unwrap_or("回车连接 · Esc 取消"))
+                .name("docker-hint")
                 .font_size(11)
                 .color(text_3())
                 .padding_x(16)

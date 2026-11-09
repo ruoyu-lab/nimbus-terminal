@@ -36,6 +36,7 @@ pub(super) fn view(workspace: &Rc<Workspace>) -> Element {
         .child(section_label(collapsed, "目标"))
         .child(targets::list(workspace, scrolling))
         .child(targets::remote(workspace, scrolling))
+        .child(targets::containers(workspace, scrolling))
         .child(targets::blank(workspace));
     column()
         .grow(1)

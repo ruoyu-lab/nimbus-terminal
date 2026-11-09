@@ -13,7 +13,13 @@ pub enum Icon {
     PanelRight,
     Laptop,
     Server,
+    Box,
     Folder,
+    File,
+    Download,
+    Upload,
+    Refresh,
+    ArrowUp,
     Sliders,
     Columns,
     Rows,
@@ -45,9 +51,20 @@ impl Icon {
                 "M5 4h14a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z M5 13h14a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1z M8 7.5h.01 M8 16.5h.01"
             }
             Icon::Laptop => "M5 6h14a1 1 0 0 1 1 1v9H4V7a1 1 0 0 1 1-1z M2.5 19h19",
+            // 集装箱（Feather 的 box）
+            Icon::Box => {
+                "M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z M3.27 6.96L12 12.01l8.73-5.05 M12 22.08V12"
+            }
             Icon::Folder => {
                 "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"
             }
+            Icon::File => "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z M14 3v5h5",
+            Icon::Download => "M12 4v11 M7 10l5 5 5-5 M5 20h14",
+            Icon::Upload => "M12 16V5 M7 10l5-5 5 5 M5 20h14",
+            Icon::Refresh => {
+                "M20 11A8.1 8.1 0 0 0 4.5 9 M4 5v4h4 M4 13a8.1 8.1 0 0 0 15.5 2 M20 19v-4h-4"
+            }
+            Icon::ArrowUp => "M12 19V5 M5 12l7-7 7 7",
             Icon::Sliders => {
                 "M4 7h9 M17 7h3 M4 17h3 M11 17h9 M13 7a2 2 0 1 0 4 0a2 2 0 1 0-4 0 M7 17a2 2 0 1 0 4 0a2 2 0 1 0-4 0"
             }
