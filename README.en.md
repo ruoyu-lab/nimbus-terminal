@@ -41,6 +41,8 @@ cargo run --release            # run it
 scripts/bundle-macos.sh        # or build target/bundle/Nimbus.app
 ```
 
+On Windows, `scripts\bundle-windows.ps1` builds the installer. It first runs `scripts\fetch-conpty.ps1`, which downloads Microsoft's open-source ConPTY (`conpty.dll` and `OpenConsole.exe`, needed for Kitty and Sixel images) from nuget.org; run it once before `cargo run` and debug builds use it too.
+
 > **Note**: the Aureole framework is still a private repository, so the project can only be built by people who have access to it until the framework is made public.
 
 Configuration lives in `~/Library/Application Support/Nimbus/` (override with `NIMBUS_HOME`).

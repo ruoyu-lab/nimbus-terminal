@@ -9,7 +9,9 @@
 //! 关伪控制台（`ClosePseudoConsole`）要等输出管道被读空：所以读线程在取的那头没了以后也一直读到结尾（读到的丢掉），
 //! 句柄丢了时的关也放在后台线程上，界面不等。
 //!
-//! 在 Windows 11 上用系统自带的 ConPTY 实测。
+//! ConPTY 有两份可用（[`Api`]）：随包带的新版（微软开源的 `conpty.dll` 加 `OpenConsole.exe`，`scripts\fetch-conpty.ps1` 取来，
+//! 装在程序旁边的 `conpty\` 里），找不到就用系统自带的。系统自带的会把 Kitty 图片（APC）、Sixel（DCS）整段吃掉，
+//! 新版原样转发；字宽也能让它按和仿真层一样的规矩算。两份都在 Windows 11 上实测。
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString, c_void};
@@ -17,10 +19,10 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
@@ -32,6 +34,9 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
@@ -40,13 +45,131 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows_sys::core::HRESULT;
 
 use super::queue::{ByteQueue, Chunk, Producer};
 use super::{Config, Pty, PtyBackend};
 
+/// 用哪一份 ConPTY：建、改大小、关伪控制台的三个函数
+struct Api {
+    create: unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT,
+    resize: unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
+    close: unsafe extern "system" fn(HPCON),
+    /// 随包的那份在哪个目录；`None` 是系统自带的
+    bundled: Option<PathBuf>,
+}
+
+/// 新版 ConPTY 的标志：字宽按 `wcswidth` 的规矩一个字一个字地算，和仿真层（`unicode-width`）一样。
+/// 默认按字素簇算，emoji 组合（👨‍👩‍👧）两边算的宽度不一样，光标会错位。系统自带的不认这个标志，不给它
+const GLYPH_WIDTH_WCSWIDTH: u32 = 0x10;
+
+/// 系统自带的 ConPTY（kernel32 里的）
+static SYSTEM: Api = Api {
+    create: CreatePseudoConsole,
+    resize: ResizePseudoConsole,
+    close: ClosePseudoConsole,
+    bundled: None,
+};
+
+/// 起伪控制台用的那份：第一次用时选好，之后不变（见 [`Api::choose`]）
+fn api() -> &'static Api {
+    static CHOSEN: OnceLock<Option<Api>> = OnceLock::new();
+    CHOSEN.get_or_init(Api::choose).as_ref().unwrap_or(&SYSTEM)
+}
+
+impl Api {
+    /// 随包的那份在哪个目录；用的是系统自带的时是 `None`
+    #[cfg(test)]
+    fn bundled(&self) -> Option<&Path> {
+        self.bundled.as_deref()
+    }
+
+    /// 按顺序找随包的 ConPTY，第一个载得进来的就用它；都没有（`None`）用系统自带的：
+    /// 1. 环境变量 `NIMBUS_CONPTY`：`system` 是一定用系统自带的，别的当目录（调试、比较两份时用）
+    /// 2. 程序旁边的 `conpty\`：安装版、免安装版都放在这里
+    /// 3. 调试版再看源码目录里的 `vendor\conpty\`（`scripts\fetch-conpty.ps1` 取来的），`cargo run`、`cargo test` 用得上
+    fn choose() -> Option<Self> {
+        let mut candidates = Vec::new();
+        match std::env::var_os("NIMBUS_CONPTY").filter(|value| !value.is_empty()) {
+            Some(value) if value.eq_ignore_ascii_case("system") => return None,
+            Some(directory) => candidates.push(PathBuf::from(directory)),
+            None => {}
+        }
+        if let Some(beside) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|directory| directory.join("conpty")))
+        {
+            candidates.push(beside);
+        }
+        if cfg!(debug_assertions) {
+            candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join(r"vendor\conpty"));
+        }
+        candidates
+            .iter()
+            .find_map(|directory| Self::load(directory))
+    }
+
+    /// 载入 `directory` 里的 `conpty.dll`。它起的是同目录下的 `OpenConsole.exe`，两个是同一个包里配好的一对，
+    /// 缺一个就不用。DLL 用完整路径载，它依赖的只在它自己的目录和 System32 里找；载进来就不再放掉
+    fn load(directory: &Path) -> Option<Self> {
+        if !directory.join("OpenConsole.exe").is_file() {
+            return None;
+        }
+        let library = wide(directory.join("conpty.dll").as_os_str()).ok()?;
+        // SAFETY: 路径以 0 结尾；失败返回空
+        let module = unsafe {
+            LoadLibraryExW(
+                library.as_ptr(),
+                ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: 模块载着、永不放掉；名字以 0 结尾
+        let symbol = |name: &[u8]| unsafe { GetProcAddress(module, name.as_ptr()) };
+        let (create, resize, close) = (
+            symbol(b"ConptyCreatePseudoConsole\0")?,
+            symbol(b"ConptyResizePseudoConsole\0")?,
+            symbol(b"ConptyClosePseudoConsole\0")?,
+        );
+        // SAFETY: 这三个导出和系统的 CreatePseudoConsole、ResizePseudoConsole、ClosePseudoConsole 签名一样
+        // （包里的 conpty.h）；模块不放掉，函数一直有效
+        unsafe {
+            Some(Self {
+                create: std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT,
+                >(create),
+                resize: std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
+                >(resize),
+                close: std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    unsafe extern "system" fn(HPCON),
+                >(close),
+                bundled: Some(directory.to_path_buf()),
+            })
+        }
+    }
+
+    /// 建伪控制台时给的标志
+    fn flags(&self) -> u32 {
+        if self.bundled.is_some() {
+            GLYPH_WIDTH_WCSWIDTH
+        } else {
+            0
+        }
+    }
+}
+
 /// 伪控制台。关掉它会结束挂在上面的程序（像关掉终端窗口），只关一次：子进程自己退出、或者句柄都丢了，谁先到谁关
 struct Console {
     handle: Mutex<Option<HPCON>>,
+    /// 建它的那份 ConPTY：改大小、关都要用同一份
+    api: &'static Api,
 }
 
 impl Console {
@@ -61,7 +184,7 @@ impl Console {
         let handle = self.lock();
         if let Some(handle) = *handle {
             // SAFETY: 锁着，`close` 拿不走它，句柄还开着。改不动就算了（子进程可能正好退出），这里没有能报告的地方
-            let _failed = unsafe { ResizePseudoConsole(handle, size(columns, rows)) };
+            let _failed = unsafe { (self.api.resize)(handle, size(columns, rows)) };
         }
     }
 
@@ -71,7 +194,7 @@ impl Console {
         let handle = self.lock().take();
         if let Some(handle) = handle {
             // SAFETY: 句柄从 `Option` 里拿出来了，以后谁也拿不到它，只在这里关这一次
-            unsafe { ClosePseudoConsole(handle) };
+            unsafe { (self.api.close)(handle) };
         }
     }
 }
@@ -141,6 +264,11 @@ impl PtyBackend for Session {
 
 /// 起一个挂在伪控制台上的子进程，返回句柄和读字节的队列
 pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
+    spawn_on(api(), config)
+}
+
+/// 同上，指定用哪一份 ConPTY（测试里两份都要跑）
+fn spawn_on(api: &'static Api, config: Config) -> io::Result<(Pty, ByteQueue)> {
     restore_ctrl_c();
     let mut command_line = command_line(&config.program, &config.arguments)?;
     let environment = environment_block(&config)?;
@@ -156,11 +284,11 @@ pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
     let mut handle: HPCON = 0;
     // SAFETY: 两个管道句柄都开着（伪控制台复制一份自己用）；结果写到栈上的变量
     let result = unsafe {
-        CreatePseudoConsole(
+        (api.create)(
             size(config.columns, config.rows),
             input_read.as_raw_handle(),
             output_write.as_raw_handle(),
-            0,
+            api.flags(),
             &mut handle,
         )
     };
@@ -172,6 +300,7 @@ pub fn spawn(config: Config) -> io::Result<(Pty, ByteQueue)> {
     drop(output_write);
     let console = Arc::new(Console {
         handle: Mutex::new(Some(handle)),
+        api,
     });
 
     let child = match start_process(
@@ -1151,9 +1280,16 @@ mod tests {
 
     /// 让 PowerShell 原样写出 `sequence`（放在环境变量里带过去，不用管命令行的引号），读到它退出，喂给仿真层
     fn written_through_the_pseudoconsole(sequence: &str) -> Terminal {
-        let mut config = powershell("[Console]::Write($env:NIMBUS_SEQUENCE)");
+        written_through(api(), sequence)
+    }
+
+    /// 同上，指定用哪一份 ConPTY。输出先切成 UTF-8：不然本地编码（GBK）编不出的字（emoji）会写成问号
+    fn written_through(api: &'static Api, sequence: &str) -> Terminal {
+        let mut config = powershell(
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Console]::Write($env:NIMBUS_SEQUENCE)",
+        );
         config.environment = vec![("NIMBUS_SEQUENCE".to_string(), sequence.to_string())];
-        let (_pty, queue) = spawn(config).expect("起得来");
+        let (_pty, queue) = spawn_on(api, config).expect("起得来");
         let (output, _) = drain(&queue);
         let mut terminal = Terminal::new(80, 24);
         terminal.set_cell_pixels(10.0, 20.0);
@@ -1179,35 +1315,115 @@ mod tests {
     }
 
     /// 图片序列直接喂给仿真层能放出一张图（序列本身是好的），再看穿过伪控制台以后还有没有
-    fn assert_image_passes_through(sequence: &str) {
+    fn assert_image_passes_through(api: &'static Api, sequence: &str) {
         let mut direct = Terminal::new(80, 24);
         direct.set_cell_pixels(10.0, 20.0);
         direct.feed(sequence.as_bytes());
         assert_eq!(direct.placements().len(), 1, "直接喂能放出图");
-        let terminal = written_through_the_pseudoconsole(sequence);
-        assert_eq!(terminal.placements().len(), 1, "穿过伪控制台以后没有图了");
-    }
-
-    /// iTerm2 的内联图片（OSC 1337 File=…，1×1 的 PNG）：系统自带的 ConPTY 原样放过去（挪到了那一帧画面后面）
-    #[test]
-    fn iterm_images_pass_through_the_pseudoconsole() {
-        assert_image_passes_through(
-            "\x1b]1337;File=inline=1:iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==\x07",
+        let terminal = written_through(api, sequence);
+        assert_eq!(
+            terminal.placements().len(),
+            1,
+            "穿过伪控制台（{:?}）以后没有图了",
+            api.bundled()
         );
     }
 
-    /// Kitty 的图片（APC `_G…`，1×1 的 RGBA）
-    #[test]
-    #[ignore = "系统自带的 ConPTY 把 APC（Kitty 图片）整条吃掉；要随包带新版的 conpty.dll 和 OpenConsole.exe"]
-    fn kitty_images_pass_through_the_pseudoconsole() {
-        assert_image_passes_through("\x1b_Ga=T,f=32,s=1,v=1;/wAA/w==\x1b\\");
+    /// 随包的那份 ConPTY；没取来（没跑 `scripts\fetch-conpty.ps1`）、或者 `NIMBUS_CONPTY=system` 时测试跳过
+    fn bundled() -> Option<&'static Api> {
+        let api = api();
+        if api.bundled().is_none() {
+            eprintln!("没有随包的 ConPTY（先跑 scripts\\fetch-conpty.ps1），跳过");
+            return None;
+        }
+        Some(api)
     }
 
-    /// Sixel（DCS `q…`，4×6 的红块）
+    const KITTY: &str = "\x1b_Ga=T,f=32,s=1,v=1;/wAA/w==\x1b\\";
+    const SIXEL: &str = "\x1bPq#1;2;100;0;0#1!4~\x1b\\";
+
+    /// iTerm2 的内联图片（OSC 1337 File=…，1×1 的 PNG）：两份 ConPTY 都原样放过去（系统的挪到了那一帧画面后面）
     #[test]
-    #[ignore = "系统自带的 ConPTY 把 DCS（Sixel）整条吃掉；要随包带新版的 conpty.dll 和 OpenConsole.exe"]
-    fn sixel_images_pass_through_the_pseudoconsole() {
-        assert_image_passes_through("\x1bPq#1;2;100;0;0#1!4~\x1b\\");
+    fn iterm_images_pass_through_the_pseudoconsole() {
+        let image = "\x1b]1337;File=inline=1:iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==\x07";
+        assert_image_passes_through(&SYSTEM, image);
+        if let Some(api) = bundled() {
+            assert_image_passes_through(api, image);
+        }
+    }
+
+    /// Kitty 的图片（APC `_G…`，1×1 的 RGBA）：随包的新版原样转发
+    #[test]
+    fn kitty_images_pass_through_the_bundled_pseudoconsole() {
+        if let Some(api) = bundled() {
+            assert_image_passes_through(api, KITTY);
+        }
+    }
+
+    /// Sixel（DCS `q…`，4×6 的红块）：随包的新版原样转发
+    #[test]
+    fn sixel_images_pass_through_the_bundled_pseudoconsole() {
+        if let Some(api) = bundled() {
+            assert_image_passes_through(api, SIXEL);
+        }
+    }
+
+    /// 系统自带的 ConPTY 把 Kitty（APC）、Sixel（DCS）整段吃掉：这就是要随包带新版的原因。
+    /// 哪天系统的也放过去了，这个测试会失败，提醒改文档
+    #[test]
+    fn the_system_pseudoconsole_drops_kitty_and_sixel() {
+        for image in [KITTY, SIXEL] {
+            assert!(
+                written_through(&SYSTEM, image).placements().is_empty(),
+                "{image:?}"
+            );
+        }
+    }
+
+    /// 写出 `text` 以后，伪控制台说光标在第几列（程序用控制台 API 问的：PowerShell 编辑命令行时就靠它摆光标）
+    fn cursor_column_after(api: &'static Api, text: &str) -> String {
+        let mut config = powershell(
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Console]::Write($env:NIMBUS_SEQUENCE); [Console]::Write('column=' + [Console]::CursorLeft + ';')",
+        );
+        config.environment = vec![("NIMBUS_SEQUENCE".to_string(), text.to_string())];
+        let (_pty, queue) = spawn_on(api, config).expect("起得来");
+        let (output, _) = drain(&queue);
+        let start = output.find("column=").expect("报了列") + "column=".len();
+        let end = output[start..].find(';').expect("报了列") + start;
+        output[start..end].to_string()
+    }
+
+    /// 字宽两边一样：emoji 组合（👨‍👩‍👧，三个 emoji 用零宽连接符连起来）仿真层一个字一个字地算是 6 格，
+    /// 随包的 ConPTY 按 `wcswidth` 算（[`GLYPH_WIDTH_WCSWIDTH`]）也是 6 格，程序问到的光标位置和屏幕上的对得上；
+    /// 汉字两边都是两格
+    #[test]
+    fn the_bundled_pseudoconsole_measures_width_like_the_emulator() {
+        let Some(api) = bundled() else {
+            return;
+        };
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let mut terminal = Terminal::new(80, 24);
+        terminal.feed(family.as_bytes());
+        assert_eq!(terminal.screen().cursor.column, 6, "仿真层算 6 格");
+        assert_eq!(cursor_column_after(api, family), "6");
+        assert_eq!(cursor_column_after(api, "中文"), "4");
+    }
+
+    /// 调试版找得到源码目录里取来的那份时就用它（除非用环境变量指定了别的）；系统自带的那份照样能起程序、报退出码
+    #[test]
+    fn the_bundled_pseudoconsole_is_preferred_and_the_system_one_still_works() {
+        let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join(r"vendor\conpty");
+        if vendor.join("conpty.dll").is_file() && std::env::var_os("NIMBUS_CONPTY").is_none() {
+            assert_eq!(api().bundled(), Some(vendor.as_path()));
+        }
+        let (_pty, queue) = spawn_on(&SYSTEM, cmd("echo system-conpty & exit 3")).expect("起得来");
+        let (output, code) = drain(&queue);
+        assert!(output.contains("system-conpty"), "{output:?}");
+        assert_eq!(code, 3);
+        assert!(
+            Api::load(Path::new(r"C:\no\such\nimbus")).is_none(),
+            "目录里没有就不用"
+        );
     }
 
     /// 装了的第一个 WSL 发行版；没装 WSL、一个发行版都没有的，测试跳过

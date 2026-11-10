@@ -107,6 +107,9 @@ scripts/bundle-macos.sh
 scripts/release-macos.sh
 ```
 
+Windows 上打安装程序用 `scripts\bundle-windows.ps1`。它会先跑 `scripts\fetch-conpty.ps1`，从 nuget.org 取微软开源的新版 ConPTY（Kitty、Sixel 图片要靠它）；
+自己 `cargo run` 时也可以先跑一下这个脚本，调试版会用取来的那份。
+
 界面框架 Aureole 是 Git 依赖，`cargo` 会自己拉取，不需要另外装。
 
 > **注意**：Aureole 目前还是私有仓库，没有访问权限的话 `cargo` 拉不下来、编译不了。框架公开之前，这个项目只有能访问它的人才能构建。

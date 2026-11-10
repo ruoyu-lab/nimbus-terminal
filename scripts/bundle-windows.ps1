@@ -9,6 +9,9 @@
 # 往可执行文件的一份拷贝里写图标和包标识符（任务栏分组、系统通知认这个应用标识）、做安装程序。
 # 设置在 Cargo.toml 的 [package.metadata.bundle]。
 #
+# 安装程序带着新版的 ConPTY（conpty.dll 和 OpenConsole.exe，装在程序旁边的 conpty\ 里）：打包前先跑
+# fetch-conpty.ps1 把它们取到 vendor\conpty\（取过了就不再下载）。免安装的 zip 也要把这个 conpty\ 文件夹放在 exe 旁边。
+#
 # 两种安装程序，都装给当前用户、不要管理员权限，开始菜单的快捷方式带着应用标识（系统通知要它）：
 # - nsis：几 MB。要先装 cargo-packager，第一次打包时它还会自己下载 NSIS：
 #     cargo install cargo-packager --version 0.11.8 --locked
@@ -34,8 +37,24 @@ if ($Format -eq 'nsis') {
     }
 }
 
+# 新版的 ConPTY：Cargo.toml 的 resources 指着 vendor\conpty，没有它打包工具会报错
+& (Join-Path $PSScriptRoot 'fetch-conpty.ps1')
+if (-not $?) {
+    Fail '取不到新版的 ConPTY（见上面的错误）'
+}
+
 # 框架源码在哪：依赖图里 aureole 这个包的清单在 crates\aureole 下，打包工具在旁边的 crates\bundle
-$metadata = cargo metadata --format-version 1 | ConvertFrom-Json
+# cargo 输出的是 UTF-8（框架的包描述是中文）：Windows PowerShell 5.1 默认按本地编码（GBK）读，
+# 半个汉字会把后面的引号吃掉，JSON 就坏了。只列这台机器（Windows）上的依赖，小一半多
+$hostTriple = (rustc -vV | Select-String '^host: ').ToString().Substring(6).Trim()
+$encoding = [Console]::OutputEncoding
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+try {
+    $metadata = cargo metadata --format-version 1 --filter-platform $hostTriple | ConvertFrom-Json
+}
+finally {
+    [Console]::OutputEncoding = $encoding
+}
 if ($LASTEXITCODE -ne 0) {
     Fail 'cargo metadata 失败'
 }

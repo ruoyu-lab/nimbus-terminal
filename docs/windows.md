@@ -16,7 +16,7 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 | 服务器的监控、文件页 | Windows 自带的 OpenSSH 没有连接复用（`ControlMaster`）：面板另开只用密钥的连接（`BatchMode=yes`），只能输密码的服务器提示「需要密钥登录」，不反复重试 |
 | 路径 | 认 `C:\…`、`C:/…`、`.\…`、`..\…`、`~\…`、`\\服务器\共享\…`；拖进来的路径按这个终端起的 shell 引（PowerShell 单引号、cmd 双引号，能两边都对时用双引号）；文件页的上传下载换成 `C:/…` 交给 `sftp`；远端文件名里 Windows 不能有的字换成 `_`，跑不出下载目录 |
 | 字体 | 系统等宽（Cascadia Mono，Windows 10 上退到 Consolas）、Cascadia Mono、Consolas、Courier New |
-| 图片 | iTerm2 内联图片能用；Kitty（APC）、Sixel（DCS）被系统的 ConPTY 整段吃掉（测试标了 `#[ignore]`）。要支持得像 WezTerm 那样随包带新版的 `conpty.dll` 和 `OpenConsole.exe` |
+| 图片 | iTerm2 内联图片、Kitty、Sixel 都能用：Kitty（APC）、Sixel（DCS）要靠随包的新版 ConPTY（见下面「随包的 ConPTY」），系统自带的会把它们整段吃掉 |
 | 窗口 | 窗口按钮按 Windows 的样子自己画；侧栏透出系统材质（Mica，框架 `c2728f4` 起开着材质也不会多出系统的窗口按钮）；外框的底色盖得比 macOS 薄（深色 66%、浅色的白 19%），材质透得出来、字也清楚。Mica 只带桌面壁纸的颜色、不透出后面的窗口，窗口不在前台、或者系统设置里关了「透明效果」时是纯色。窗口位置按显示器记（Win32 枚举显示器） |
 | 打包 | `scripts\bundle-windows.ps1`：默认出 NSIS 安装程序（先要 `cargo install cargo-packager --version 0.11.8 --locked`，第一次还会下载 NSIS）；`-Format installer` 用框架自己的安装程序，不用下载。编译时（`build.rs`）就把图标和应用标识写进可执行文件 |
 | 通知 | 应用标识 `com.ruoyu-lab.nimbus` 在启动时声明；Windows 要先登记过这个标识才显示通知，安装程序建开始菜单快捷方式时会登记 |
@@ -49,10 +49,28 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 - **环境变量**：`COLORTERM`、`TERM_PROGRAM`、`COLORFGBG` 经 `WSLENV` 传进去（`TERM` WSL 自己设成 `xterm-256color`）；用户原来的 `WSLENV` 接在前面。
 - 实测：Ubuntu（WSL 2.7.11，内核 6.18）里的 bash。zsh 的那段只读过代码，没在 WSL 里跑过。
 
+## 随包的 ConPTY
+
+系统自带的 ConPTY（kernel32 里的那份）会把 Kitty 图片（APC）、Sixel（DCS）整段吃掉。安装包带着微软开源的新版：
+NuGet 包 `Microsoft.Windows.Console.ConPTY`（MIT，源码在 microsoft/terminal）里的 `conpty.dll` 和它起的 `OpenConsole.exe`，
+装在程序旁边的 `conpty\` 里，再加一份许可证。
+
+- **取来**：`scripts\fetch-conpty.ps1` 下载固定的版本（现在是 1.25.260930003），核对包的 SHA-256 和两个文件的微软签名，放进
+  `vendor\conpty\`（不进 Git）。`bundle-windows.ps1` 打包前会先跑它；`Cargo.toml` 里 `[package.metadata.bundle]` 的 `resources`
+  指着这个目录，两种安装程序都把它装在 exe 旁边。免安装的 zip 也要带上这个 `conpty\` 文件夹。
+  换版本时两个文件要来自同一个包：它们之间的协议没有版本检查，不配套会出怪问题。
+- **用哪一份**（`pty::windows::Api`，第一次起伪控制台时选定）：环境变量 `NIMBUS_CONPTY`（`system` 是一定用系统的，别的当目录）→
+  程序旁边的 `conpty\` → 调试版再看源码目录里的 `vendor\conpty\`（`cargo run`、`cargo test` 用它）→ 都没有就用系统自带的，照样能用，只是没有那两种图片。
+  DLL 用完整路径载，它依赖的只在它自己的目录和 System32 里找。
+- **字宽**：新版默认按字素簇算字宽，emoji 组合（👨‍👩‍👧）算 2 格，仿真层一个字一个字地算是 6 格，程序问到的光标位置（PowerShell 编辑命令行时就靠它）
+  和屏幕上的对不上。所以建伪控制台时给 `PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH`，两边都按 `wcswidth` 算；系统自带的不认这个标志，不给它。
+- **进程**：`OpenConsole.exe` 是 Nimbus 的子进程（系统的那份是 `conhost.exe`），没有窗口；关会话时跟着退出。
+- 实测：两份各跑一遍全部测试都过；真程序里 PowerShell 7 输出的 Sixel、Kitty 图片都显示出来，换成系统的就没了。
+
 ## ConPTY 后端的几处实测结论
 
-- **透传**：系统自带的 ConPTY 会重画屏幕。命令标记（OSC 133）、OSC 7、ConEmu 的 OSC 9;9 原样过来；
-  超链接（OSC 8）被改写成 `8;id=…;网址`、结束的那条挪到后面，仿真层照样认得；图片见上表。
+- **透传**：ConPTY 会重画屏幕。命令标记（OSC 133）、OSC 7、ConEmu 的 OSC 9;9 原样过来；
+  超链接（OSC 8）被改写成 `8;id=…;网址`、结束的那条挪到后面，仿真层照样认得；图片见上表。两份 ConPTY 都是这样。
 - **启动时的请求**：ConPTY 一起来就发 `CSI ?9001h`（win32 输入模式）和 `CSI ?1004h`（焦点事件）；前一个仿真层不认、忽略，按键照常走 VT。
 - **Ctrl+C**：「忽略 Ctrl+C」这个标志会从父进程一路继承下来。Nimbus 自己是被一个忽略它的程序起的时候（一些启动器、跑测试的那一串），
   伪控制台里按 Ctrl+C 就停不下任何程序，所以每次起子进程之前先把自己的恢复成默认（`restore_ctrl_c`）。
@@ -77,5 +95,7 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
   程序是 `WindowsApps` 里的别名，`CreateProcessW` 起得来）；没装就跳过。
 - 装了 WSL 发行版的机器上，`wsl_*` 的测试用第一个发行版真的起 bash（加 `-u root`，不管建没建过用户）：命令标记、OSC 7、`cd`、起始目录、
   进不去的目录、不带集成；会话层的测试再点一下 `\\wsl.localhost` 下面的文件。没装就跳过。
+- 两份 ConPTY 都要测：先跑 `scripts\fetch-conpty.ps1`，`cargo test` 用的是随包的那份（Kitty、Sixel 透传、字宽的测试只在它上面跑，
+  没取来就跳过）；再 `NIMBUS_CONPTY=system cargo test` 用系统自带的跑一遍。系统的那份吃掉 Kitty、Sixel 有专门的测试，哪天系统放过去了它会失败，提醒改文档。
 - `.gitattributes` 让 `assets/shell/` 里的 bash、zsh 脚本一直是 LF：它们原样嵌进程序、在 Linux 里跑，Windows 上默认的 CRLF 检出会让 bash 报错。
 - 好几个工作树共用一个 `target` 时，`cargo test` 可能跑的是别的工作树刚编出来的测试程序（同一个路径、同一个哈希），看一下测试总数对不对。

@@ -21,7 +21,7 @@ jobs:
       - run: cargo clippy --all-targets
       - run: cargo build --release
 
-  # Windows 现在只能编译（ConPTY 后端还没写，见 docs/windows.md）：先保证它一直编得过
+  # Windows 上先保证编得过。测试要真的 shell、WSL 和随包的 ConPTY（scripts\fetch-conpty.ps1），在本机跑，见 docs/windows.md
   windows:
     runs-on: windows-latest
     steps:

@@ -11,8 +11,13 @@
   bash、zsh 自动加载 shell 集成（命令标记、命令跑完通知、命令历史），当前目录跟得上 `cd`：拆分、恢复从那里起，
   Ctrl 点击 `/…`、`~/…` 经 `\\wsl.localhost` 打开；拖进来的 `C:\…` 写成 `/mnt/c/…`；关标签前问「有程序在跑」看命令标记。
   还没建过 Linux 用户的发行版先让 WSL 问用户名和密码
+- Windows 上能显示 Kitty、Sixel 图片：安装包带上微软开源的新版 ConPTY（`conpty.dll` 和 `OpenConsole.exe`，装在程序旁边的 `conpty\`），
+  系统自带的会把这两种图片吃掉。`scripts\fetch-conpty.ps1` 按固定版本下载、核对哈希和微软签名，打包脚本会先跑它；没有这两个文件时退回系统自带的。
+  新版按和仿真层一样的规矩算字宽，带 emoji 组合的命令行光标不再错位
 
 ### 修正
+
+- 用 Windows PowerShell 5.1 跑 `scripts\bundle-windows.ps1` 时读不了 `cargo metadata`（按本地编码读 UTF-8 的中文描述，JSON 坏了）
 
 - bash 的 shell 集成：`PROMPT_COMMAND` 里别的命令（比如 Ubuntu 的 systemd 加的那条）会被当成用户敲的命令，命令标记全乱
 - 在 Windows 上检出时 bash、zsh 的集成脚本变成 CRLF：加了 `.gitattributes`，一直用 LF

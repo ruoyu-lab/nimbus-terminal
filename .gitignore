@@ -2,3 +2,4 @@
 /target-release
 .idea
 .DS_Store
+/vendor
