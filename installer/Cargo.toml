@@ -1,0 +1,20 @@
+[package]
+name = "nimbus-installer"
+version.workspace = true
+edition = "2024"
+rust-version = "1.90"
+description = "Nimbus 在 Windows 上的安装程序：框架的安装引擎（解压、回滚、升级、卸载、快捷方式），界面自己画"
+license = "MIT"
+publish = false
+
+[dependencies]
+# 和终端用同一个框架提交。不要默认特性：安装程序用不到字符网格、分词词典，小几 MB
+aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "7f997ec", default-features = false }
+aureole-installer = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "7f997ec" }
+
+[target.'cfg(windows)'.dependencies]
+# 把「应用和功能」里的版本号补成完整的（见 main.rs 的 FullVersion）
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
+
+[dev-dependencies]
+aureole = { git = "https://github.com/ruoyu-lab/aureole-framework.git", rev = "7f997ec", default-features = false, features = ["testing"] }

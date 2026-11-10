@@ -1,7 +1,7 @@
 ﻿# 打包成 Windows 的安装程序，放在 <target>\release\bundle\ 下面
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\bundle-windows.ps1                     # NSIS 安装程序（默认）
-#   powershell -ExecutionPolicy Bypass -File scripts\bundle-windows.ps1 -Format installer   # 框架自己画的安装程序
+#   powershell -ExecutionPolicy Bypass -File scripts\bundle-windows.ps1 -Format installer   # Nimbus 自己的安装程序（installer/）
 #   powershell -ExecutionPolicy Bypass -File scripts\bundle-windows.ps1 -DebugBuild         # 调试版（编得快，带控制台窗口）
 #
 # 用的是界面框架 Aureole 的打包工具（cargo bundle）。不用另外装：它就在 cargo 拉下来的框架源码里，
@@ -15,7 +15,7 @@
 # 两种安装程序，都装给当前用户、不要管理员权限，开始菜单的快捷方式带着应用标识（系统通知要它）：
 # - nsis：几 MB。要先装 cargo-packager，第一次打包时它还会自己下载 NSIS：
 #     cargo install cargo-packager --version 0.11.8 --locked
-# - installer：框架画的向导，不用装别的；带着框架，大一些
+# - installer：界面是 Nimbus 自己画的（installer/，一页、正中一个按钮），引擎是框架的；不用装别的，带着框架，大一些
 param(
     [ValidateSet('nsis', 'installer')]
     [string]$Format = 'nsis',

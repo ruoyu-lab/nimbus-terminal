@@ -1,6 +1,13 @@
+# 两个包：终端本身（这里），和 Windows 的安装程序（installer/）。版本号写在一处，安装程序显示的就是终端的版本
+[workspace]
+members = ["installer"]
+
+[workspace.package]
+version = "0.2.1-beta"
+
 [package]
 name = "nimbus-terminal"
-version = "0.2.1-beta"
+version.workspace = true
 edition = "2024"
 rust-version = "1.90"
 description = "用 Aureole 框架写的终端：自研 pty 和 xterm 仿真，屏幕用框架的字符网格画"
@@ -23,6 +30,10 @@ icon = "assets/icon-windows.png"
 # 装在程序旁边的 conpty\：新版的 ConPTY（scripts\fetch-conpty.ps1 取来，bundle-windows.ps1 会先跑它）。
 # 这些设置只有 Windows 的打包用；macOS 的 .app 由 scripts/bundle-macos.sh 自己拼
 resources = ["vendor/conpty"]
+
+# 安装程序用自己的界面（installer/），不用框架默认的向导
+[package.metadata.bundle.installer]
+package = "nimbus-installer"
 
 [dependencies]
 # 只用公开 API，不改框架。现在用的是私有仓库 master 上的提交（带 Windows 上改大小、标题栏、输入、材质的改进），

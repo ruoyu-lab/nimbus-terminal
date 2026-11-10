@@ -472,6 +472,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aureole-installer"
+version = "0.0.1-beta.2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+dependencies = [
+ "aureole",
+ "flate2",
+ "serde_json",
+ "windows",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "aureole-platform"
 version = "0.0.1-beta.2"
 source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
@@ -1800,6 +1812,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "nimbus-installer"
+version = "0.2.1-beta"
+dependencies = [
+ "aureole",
+ "aureole-installer",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

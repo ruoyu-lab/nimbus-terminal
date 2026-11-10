@@ -19,7 +19,8 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 | 图片 | iTerm2 内联图片、Kitty、Sixel 都能用：Kitty（APC）、Sixel（DCS）要靠随包的新版 ConPTY（见下面「随包的 ConPTY」），系统自带的会把它们整段吃掉 |
 | 窗口 | 窗口按钮按 Windows 的样子自己画；侧栏透出系统材质（Mica，框架 `c2728f4` 起开着材质也不会多出系统的窗口按钮）；外框的底色盖得比 macOS 薄（深色 66%、浅色的白 19%），材质透得出来、字也清楚。Mica 只带桌面壁纸的颜色、不透出后面的窗口，窗口不在前台、或者系统设置里关了「透明效果」时是纯色。窗口位置按显示器记（Win32 枚举显示器） |
 | 打包 | `scripts\bundle-windows.ps1`：默认出 NSIS 安装程序（先要 `cargo install cargo-packager --version 0.11.8 --locked`，第一次还会下载 NSIS）；`-Format installer` 用框架自己的安装程序，不用下载。编译时（`build.rs`）就把图标和应用标识写进可执行文件 |
-| 通知 | 应用标识 `com.ruoyu-lab.nimbus` 在启动时声明；Windows 要先登记过这个标识才显示通知，安装程序建开始菜单快捷方式时会登记 |
+| 通知 | 应用标识 `com.ruoyu-lab.nimbus` 在启动时声明；Windows 要先登记过这个标识才显示通知，安装程序建开始菜单快捷方式时会登记（实测快捷方式带着这个标识；通知弹不弹还没在安装版里看过） |
+| 安装程序（`-Format installer`） | 界面是自己画的（`installer/`，见下面「安装程序」）：一页、正中一个按钮，样子参考比邻（bilin-desk）的安装程序；解压、回滚、升级、卸载、快捷方式、「应用和功能」的登记用框架的安装引擎。实测（Windows 11）：装给当前用户，在 `%LOCALAPPDATA%\Programs\Nimbus`，开始菜单、桌面各一个快捷方式，「应用和功能」里一条（版本号是完整的 `0.2.1-beta`）；`--silent` 一秒装完。从 0.2.1-beta 覆盖升级：多出 `conpty\`，卸载信息还是一条，快捷方式不变；程序开着时升级会拒绝（「正被使用」），旧版不受影响。卸载把文件、快捷方式、卸载信息都清掉，不碰配置目录。**框架的问题**：打开卸载程序又关掉（没卸），安装目录里的 `uninstall.exe` 也会被删掉，之后「应用和功能」里卸载不了（框架的 `delete_self_later` 不管卸没卸都删），要在框架里改 |
 | Docker 目标 | 代码在 Windows 上编译、子进程不弹窗口；这台机器没装 Docker，没验证 |
 
 ## WSL
@@ -48,6 +49,20 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 - **忙不忙**：WSL 里的进程 Windows 这边看不到，只看命令标记（有一条命令开始了、还没结束）；没有 shell 集成时当它不忙，关的时候不问。
 - **环境变量**：`COLORTERM`、`TERM_PROGRAM`、`COLORFGBG` 经 `WSLENV` 传进去（`TERM` WSL 自己设成 `xterm-256color`）；用户原来的 `WSLENV` 接在前面。
 - 实测：Ubuntu（WSL 2.7.11，内核 6.18）里的 bash。zsh 的那段只读过代码，没在 WSL 里跑过。
+
+## 安装程序
+
+`installer/` 是工作区里的第二个包（`nimbus-installer`），`Cargo.toml` 的 `[package.metadata.bundle.installer]` 让打包工具用它当安装程序，
+后面接上终端本身。装好以后它也是安装目录里的 `uninstall.exe`。
+
+- **界面**（`installer/src/ui.rs`）：560 × 360 的固定窗口，不要系统的标题栏，右上角自己画最小化、关闭，整个窗口按住能拖。
+  正中是图标、「Nimbus」和版本号、一句介绍，下面一个按钮「立即安装」，再下面一行小字「安装到 …  更改」和「在桌面上创建快捷方式」。
+  装的时候按钮换成一根细进度条和百分比，装完图标换成对勾、按钮换成「打开 Nimbus」。目录里装过时写「会从 0.2.0 更新到 …」、按钮叫「立即更新」。
+  失败、取消都能「再试一次」；Nimbus 开着时说「关掉它以后再试一次」。卸载是同一个样子，说清楚设置会留着。
+  颜色是终端的那几档灰，深浅跟着系统。
+- **引擎**：框架的 `aureole_installer::Setup`。只多一个步骤（`FullVersion`）：框架给系统登记的版本号去掉了 `-beta`，这里改回完整的。
+- **看样子**：`NIMBUS_INSTALLER_SHOTS=目录 cargo test -p nimbus-installer screenshots`，每种状态浅色、深色各存一张图。
+- 命令行和框架的一样：`--silent`、`--dir 目录`、`--no-desktop-shortcut`、`--no-menu-shortcut`。
 
 ## 随包的 ConPTY
 
