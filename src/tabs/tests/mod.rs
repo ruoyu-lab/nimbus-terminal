@@ -207,8 +207,7 @@ pub(super) fn right_click_named(harness: &Harness, name: &str) {
 /// 本机标签没起名、程序也没报标题时叫什么：Windows 上是默认 shell 的名字（Windows PowerShell……），别的平台是「终端」
 pub(super) fn local_title() -> String {
     crate::pty::shell_name(&crate::pty::default_shell())
-        .unwrap_or(DEFAULT_TITLE)
-        .to_string()
+        .unwrap_or_else(|| DEFAULT_TITLE.to_string())
 }
 
 /// 点浮层里的菜单项（浮层里的元素用窗口坐标点）

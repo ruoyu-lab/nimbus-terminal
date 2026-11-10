@@ -257,7 +257,8 @@ fn action_menu(menu_name: String, open: Signal<bool>, actions: Rc<Vec<Action>>) 
 }
 
 /// 新建会话的下拉（Windows）：命令提示符、Windows PowerShell、PowerShell 7 各一项，点了按那个 shell 开新标签。
-/// 没装的灰着、写「未安装」，点不了。点 `element` 弹出，挂在它下面，再点一下收起
+/// 没装的灰着、写「未安装」，点不了。装了 WSL 的发行版时，分隔线下面再列每个发行版。
+/// 点 `element` 弹出，挂在它下面，再点一下收起
 pub(super) fn with_shell_menu(element: Element, workspace: &Rc<Workspace>) -> Element {
     let open = signal(false);
     let owner = workspace.clone();
@@ -283,7 +284,21 @@ fn shell_menu(workspace: &Rc<Workspace>, open: Signal<bool>) -> Element {
         .background(card_bg())
         .shadow(popup_shadow())
         .focus_arrows(Direction::Column);
+    let mut wsl_section = false;
     for shell in crate::pty::shells() {
+        if !wsl_section && crate::wsl::distribution(&shell.program).is_some() {
+            wsl_section = true;
+            menu = menu
+                .child(rect().height(1).margin_y(3).background(line()))
+                .child(
+                    text("WSL")
+                        .name("menu-shells-wsl")
+                        .font_size(11)
+                        .color(text_3())
+                        .padding_x(10)
+                        .padding_y(2),
+                );
+        }
         let item = row()
             .name(format!("menu-shell-{}", shell.id))
             .align(Align::Center)

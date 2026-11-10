@@ -116,15 +116,21 @@ fn commands(workspace: &Rc<Workspace>) -> Vec<Command> {
             Rc::new(move || settings.open_settings()),
         ),
     ];
-    // Windows 上装了的每种 shell 一条：「新建会话：Windows PowerShell」（没装的只在新建的下拉里灰着列出来）
+    // Windows 上装了的每种 shell 一条：「新建会话：Windows PowerShell」（没装的只在新建的下拉里灰着列出来）；
+    // WSL 的发行版后面带上「（WSL）」，搜 wsl 找得到
     for shell in crate::pty::shells()
         .into_iter()
         .filter(|shell| shell.installed)
     {
+        let label = if crate::wsl::distribution(&shell.program).is_some() {
+            format!("新建会话：{}（WSL）", shell.name)
+        } else {
+            format!("新建会话：{}", shell.name)
+        };
         let (owner, program) = (workspace.clone(), shell.program);
         list.push(command(
             &format!("cmd-new-tab-{}", shell.id),
-            &format!("新建会话：{}", shell.name),
+            &label,
             "",
             Rc::new(move || owner.new_tab_with_shell(&program)),
         ));

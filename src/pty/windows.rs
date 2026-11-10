@@ -1209,4 +1209,179 @@ mod tests {
     fn sixel_images_pass_through_the_pseudoconsole() {
         assert_image_passes_through("\x1bPq#1;2;100;0;0#1!4~\x1b\\");
     }
+
+    /// 装了的第一个 WSL 发行版；没装 WSL、一个发行版都没有的，测试跳过
+    fn wsl_distribution() -> Option<String> {
+        let found = crate::wsl::distributions()
+            .into_iter()
+            .next()
+            .map(|distribution| distribution.name);
+        if found.is_none() {
+            eprintln!("没装 WSL 的发行版，跳过");
+        }
+        found
+    }
+
+    /// 按 Nimbus 起它的方式起 WSL 的发行版（引导脚本；`integrated` 时带集成脚本，装在名字带空格、中文的目录里），
+    /// 只多一个 `-u root`：测试不管这台机器上建没建过 Linux 用户。返回 shell 和临时目录
+    fn wsl_shell(
+        distribution: &str,
+        label: &str,
+        directory: Option<&Path>,
+        integrated: bool,
+    ) -> (Live, PathBuf) {
+        let root = crate::store::tests::scratch(label);
+        let store = crate::store::Store::at(root.join("中文 dir"));
+        let installed = crate::shell::install(&store).expect("装得上");
+        let integration = integrated.then_some(installed.as_path());
+        let mut config = crate::wsl::config_for_test(distribution, directory, integration);
+        config
+            .arguments
+            .splice(2..2, ["-u".to_string(), "root".to_string()]);
+        (Live::start(config), root)
+    }
+
+    /// WSL 里的 shell 报的 Linux 目录：（主机，路径）
+    fn reported_linux(terminal: &Terminal) -> Option<(String, String)> {
+        terminal
+            .reported_linux_directory()
+            .map(|directory| (directory.host.clone(), directory.path.clone()))
+    }
+
+    /// 屏幕上的字（每行去掉结尾的空格）
+    fn screen(terminal: &Terminal) -> String {
+        terminal
+            .screen()
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .filter(|cell| cell.width != 0)
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// WSL 里的 bash 经过引导脚本、伪控制台：提示符带着命令标记，报的目录是 Linux 的写法（主机是这台机器）、`cd` 跟得上
+    /// （带空格、中文的目录也对）；退出码原样报；跑着命令时「有命令在跑」；终端的环境变量传进去了；`exit` 正常退出
+    #[test]
+    fn wsl_integration_marks_commands_and_reports_the_directory() {
+        let Some(distribution) = wsl_distribution() else {
+            return;
+        };
+        let (mut shell, root) = wsl_shell(&distribution, "wsl-integration", None, true);
+        let host = std::env::var("COMPUTERNAME").expect("有 COMPUTERNAME");
+        shell.wait("第一个提示符", |terminal| {
+            at_prompt(terminal) && terminal.reported_linux_directory().is_some()
+        });
+        assert_eq!(
+            reported_linux(&shell.terminal),
+            Some((host.clone(), "/root".to_string())),
+            "从主目录起"
+        );
+        assert!(
+            shell.terminal.reported_directory().is_none(),
+            "不当本机的目录"
+        );
+        shell.run("mkdir -p '/tmp/nimbus 中文'");
+        let moved = shell.run("cd '/tmp/nimbus 中文'");
+        assert_eq!(moved.exit, Some(0));
+        assert_eq!(
+            reported_linux(&shell.terminal),
+            Some((host, "/tmp/nimbus 中文".to_string()))
+        );
+        assert_eq!(shell.run("false").exit, Some(1));
+        let echoed = shell.run("echo \"[$COLORTERM $TERM_PROGRAM $TERM]\"");
+        assert_eq!(echoed.exit, Some(0));
+        assert!(
+            screen(&shell.terminal).contains("[truecolor Nimbus xterm-256color]"),
+            "{}",
+            screen(&shell.terminal)
+        );
+        shell.pty.write(b"sleep 2\r").expect("写得进去");
+        shell.wait("sleep 开始", Terminal::command_running);
+        shell.wait("sleep 结束", |terminal| {
+            at_prompt(terminal) && finished(terminal, "sleep 2").is_some()
+        });
+        assert!(!shell.terminal.command_running());
+        assert_eq!(shell.exit(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 起始目录：这个发行版自己的共享路径进 Linux 里的那个目录，Windows 的目录进 `/mnt/c/…`；
+    /// 进不去的报一句「进不了这个目录」、留在主目录，不退出
+    #[test]
+    fn wsl_starts_in_the_requested_directory_or_falls_back_home() {
+        let Some(distribution) = wsl_distribution() else {
+            return;
+        };
+        let cases = [
+            (
+                format!(r"\\wsl.localhost\{distribution}\tmp"),
+                "/tmp",
+                false,
+            ),
+            (r"C:\Windows".to_string(), "/mnt/c/Windows", false),
+            (
+                format!(r"\\wsl.localhost\{distribution}\no-such-nimbus-dir"),
+                "/root",
+                true,
+            ),
+        ];
+        for (index, (directory, expected, refused)) in cases.into_iter().enumerate() {
+            let (mut shell, root) = wsl_shell(
+                &distribution,
+                &format!("wsl-directory-{index}"),
+                Some(Path::new(&directory)),
+                true,
+            );
+            shell.wait(&format!("{directory} 的提示符"), |terminal| {
+                at_prompt(terminal) && terminal.reported_linux_directory().is_some()
+            });
+            assert_eq!(
+                reported_linux(&shell.terminal)
+                    .map(|(_, path)| path)
+                    .as_deref(),
+                Some(expected),
+                "{directory}"
+            );
+            assert_eq!(
+                screen(&shell.terminal).contains("nimbus: 进不了这个目录"),
+                refused,
+                "{directory}：{}",
+                screen(&shell.terminal)
+            );
+            assert_eq!(shell.exit(), 0);
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// 关了 shell 集成：引导脚本照样进目录、起登录 shell，只是没有命令标记
+    #[test]
+    fn wsl_without_integration_is_a_plain_login_shell() {
+        let Some(distribution) = wsl_distribution() else {
+            return;
+        };
+        let directory = format!(r"\\wsl.localhost\{distribution}\etc");
+        let (mut shell, root) = wsl_shell(
+            &distribution,
+            "wsl-plain",
+            Some(Path::new(&directory)),
+            false,
+        );
+        shell
+            .pty
+            .write(b"echo \"[$(pwd) $((40 + 2))]\"\r")
+            .expect("写得进去");
+        shell.wait("命令的输出", |terminal| {
+            screen(terminal).contains("[/etc 42]")
+        });
+        assert!(!shell.terminal.has_command_marks());
+        assert_eq!(shell.exit(), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

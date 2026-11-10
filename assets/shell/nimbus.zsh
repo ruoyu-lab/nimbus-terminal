@@ -6,6 +6,27 @@
 typeset -g NIMBUS_SHELL_INTEGRATION_LOADED=1
 autoload -Uz add-zsh-hook
 
+# WSL 里还要报当前目录（OSC 7）：Windows 那边看不到 Linux 里进程的目录。别处终端自己问得到，不报
+if [[ -n $WSL_DISTRO_NAME ]]; then
+  __nimbus_cwd() {
+    emulate -L zsh
+    local LC_ALL=C encoded= ch hex
+    local -i i
+    for (( i = 1; i <= ${#PWD}; i++ )); do
+      ch=$PWD[i]
+      if [[ $ch == [a-zA-Z0-9/._~-] ]]; then
+        encoded+=$ch
+      else
+        printf -v hex '%02X' "'$ch"
+        encoded+="%${hex: -2}"
+      fi
+    done
+    printf '\e]7;file://%s%s\a' "$HOST" "$encoded"
+  }
+else
+  __nimbus_cwd() { :; }
+fi
+
 __nimbus_ran=
 __nimbus_precmd() {
   local ret=$?
@@ -15,6 +36,7 @@ __nimbus_precmd() {
   fi
   __nimbus_ran=
   printf '\e]133;A\a'
+  __nimbus_cwd
   if [[ $PS1 != *$'\e]133;B\a'* ]]; then
     PS1="${PS1}%{"$'\e]133;B\a'"%}"
   fi

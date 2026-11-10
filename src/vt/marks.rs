@@ -55,6 +55,16 @@ pub struct ReportedDirectory {
     pub path: PathBuf,
 }
 
+/// Windows 上 shell 报来的 Unix 写法的目录（WSL 里的 shell 报 `/home/me`）：本机用不了这种写法，
+/// 要知道是哪个发行版才换得成 Windows 的（见 `crate::wsl::to_windows`）
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinuxDirectory {
+    /// 同 [`ReportedDirectory::host`]
+    pub host: String,
+    /// `/` 开头的绝对路径，结尾的 `/` 去掉了（根目录留着）
+    pub path: String,
+}
+
 /// 最多记这么多条命令，再多挤掉最旧的
 const MAX_COMMANDS: usize = 2000;
 /// 命令文字最长这么多字符
@@ -77,6 +87,7 @@ impl Terminal {
                 self.integrated = true;
                 // 新的提示符：目录等它重新报（见 `reported_directory`）
                 self.directory = None;
+                self.linux_directory = None;
                 // 上一个提示符没跑过命令（直接按了回车、Ctrl-C）：不留
                 if self
                     .commands
@@ -287,13 +298,27 @@ impl Terminal {
     }
 
     /// OSC 7：`file://主机/路径`，路径按百分号解码；Windows 上 `/C:/x` 是 `C:\x`。
-    /// 不是绝对路径的不收；副屏（vim、less）里的不理，和命令标记一样
+    /// 不是绝对路径的不收；副屏（vim、less）里的不理，和命令标记一样。
+    /// Windows 上没有盘符的 `/home/me` 另外记下（见 [`Self::reported_linux_directory`]），不当本机的目录
     pub(super) fn report_directory(&mut self, text: &str) {
         if self.on_alternate {
             return;
         }
-        if let Some(directory) = parse_file_uri(text) {
-            self.directory = Some(directory);
+        let Some((host, path)) = parse_file_uri(text) else {
+            return;
+        };
+        // Windows 的写法是 `/C:/x`：盘符前面那个斜杠去掉
+        let local = if cfg!(windows) {
+            path.strip_prefix('/').unwrap_or(&path)
+        } else {
+            &path
+        };
+        if let Some(local) = absolute_directory(local) {
+            self.directory = Some(ReportedDirectory { host, path: local });
+        } else if cfg!(windows)
+            && let Some(path) = linux_directory(&path)
+        {
+            self.linux_directory = Some(LinuxDirectory { host, path });
         }
     }
 
@@ -318,10 +343,23 @@ impl Terminal {
     pub fn reported_directory(&self) -> Option<&ReportedDirectory> {
         self.directory.as_ref()
     }
+
+    /// Windows 上 shell 报的 Unix 写法的目录（OSC 7 里没有盘符的 `/home/me`）：WSL 里的 shell 报的就是这种。
+    /// 和 [`Self::reported_directory`] 一样，每个提示符开始时清掉；别的平台上一直是 `None`
+    pub fn reported_linux_directory(&self) -> Option<&LinuxDirectory> {
+        self.linux_directory.as_ref()
+    }
+
+    /// 有一条命令开始执行了（C）、还没结束（D）：WSL 里的程序 Windows 这边看不到，「前台有没有程序在跑」靠它
+    pub fn command_running(&self) -> bool {
+        self.commands
+            .last()
+            .is_some_and(|last| last.output_start.is_some() && last.output_end.is_none())
+    }
 }
 
-/// `file://主机/路径` → 主机和本机写法的路径
-fn parse_file_uri(text: &str) -> Option<ReportedDirectory> {
+/// `file://主机/路径` → 主机和百分号解过的路径
+fn parse_file_uri(text: &str) -> Option<(String, String)> {
     const SCHEME: &str = "file://";
     if text.len() > MAX_DIRECTORY
         || !text
@@ -335,17 +373,16 @@ fn parse_file_uri(text: &str) -> Option<ReportedDirectory> {
     if host.chars().any(char::is_control) {
         return None;
     }
-    let decoded = percent_decode(path)?;
-    // Windows 的写法是 `/C:/x`：盘符前面那个斜杠去掉
-    let local = if cfg!(windows) {
-        decoded.strip_prefix('/').unwrap_or(&decoded)
-    } else {
-        &decoded
-    };
-    Some(ReportedDirectory {
-        host: host.to_string(),
-        path: absolute_directory(local)?,
-    })
+    Some((host.to_string(), percent_decode(path)?))
+}
+
+/// Unix 写法的绝对目录：`/` 开头、不带控制字符，去掉结尾的 `/`（根目录留着）
+fn linux_directory(path: &str) -> Option<String> {
+    if !path.starts_with('/') || path.chars().any(char::is_control) {
+        return None;
+    }
+    let trimmed = path.trim_end_matches('/');
+    Some(if trimmed.is_empty() { "/" } else { trimmed }.to_string())
 }
 
 /// `%xx` 换回字节，再按 UTF-8 读。不成样的 `%`（后面不是两位十六进制）原样留着：有的 shell 报的路径没有编码

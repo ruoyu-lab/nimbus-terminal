@@ -146,6 +146,8 @@ pub struct Terminal {
     integrated: bool,
     /// shell 报的当前目录（OSC 7、ConEmu 的 OSC 9;9），每个提示符开始时清掉
     directory: Option<marks::ReportedDirectory>,
+    /// Windows 上 shell 报的 Unix 写法的目录（WSL 里的 shell），同样每个提示符开始时清掉
+    linux_directory: Option<marks::LinuxDirectory>,
     /// 结束了、还没被取走的命令
     finished: Vec<marks::Finished>,
     /// 屏幕上的图片
@@ -184,6 +186,7 @@ impl Terminal {
             commands: Vec::new(),
             integrated: false,
             directory: None,
+            linux_directory: None,
             finished: Vec::new(),
             images: image::Images::new(),
             charsets: [Charset::Ascii; 2],

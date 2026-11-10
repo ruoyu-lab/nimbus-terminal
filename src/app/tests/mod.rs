@@ -7,6 +7,8 @@ mod images;
 mod marks;
 mod mouse;
 mod selection;
+#[cfg(windows)]
+mod wsl;
 
 use std::sync::Arc;
 

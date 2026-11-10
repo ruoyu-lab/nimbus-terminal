@@ -308,10 +308,29 @@ impl Session {
         self.shell_program.borrow().clone()
     }
 
+    /// 起的是 WSL 的哪个发行版（本机的终端、起的是 `wsl:发行版` 时才有）
+    pub(crate) fn wsl_distribution(&self) -> Option<String> {
+        if !self.local.get() {
+            return None;
+        }
+        let program = self.shell_program()?;
+        crate::wsl::distribution(&program).map(str::to_string)
+    }
+
     /// shell 现在所在的目录（存下来下次启动在这里开；点相对路径时从这里算）。
     /// 本机的会话先看 shell 集成报的（OSC 7）：PowerShell 的 `cd` 不改进程的当前目录，问进程问不准。
-    /// 这个提示符没报、报的是别的机器（在里面 ssh 到了服务器），再问 pty
+    /// 这个提示符没报、报的是别的机器（在里面 ssh 到了服务器），再问 pty。
+    ///
+    /// WSL 的发行版只看报的（Linux 的写法，换成 `\\wsl.localhost\发行版\…`）：`wsl.exe` 这个进程的目录是起它时的
+    /// Windows 目录，和 WSL 里的 shell 在哪无关
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
+        if let Some(distribution) = self.wsl_distribution() {
+            let terminal = self.terminal.borrow();
+            let reported = terminal
+                .reported_linux_directory()
+                .filter(|reported| is_this_machine(&reported.host))?;
+            return crate::wsl::to_windows(&distribution, &reported.path);
+        }
         if self.local.get()
             && let Some(reported) = self.terminal.borrow().reported_directory()
             && is_this_machine(&reported.host)
@@ -331,8 +350,12 @@ impl Session {
         self.terminal.borrow().transcript(max_lines)
     }
 
-    /// 前台有没有 shell 之外的程序在跑
+    /// 前台有没有 shell 之外的程序在跑。WSL 里的进程 Windows 这边看不到：靠命令标记（有一条命令开始了、还没结束），
+    /// 没有 shell 集成就当没有
     pub fn is_busy(&self) -> bool {
+        if self.wsl_distribution().is_some() {
+            return self.terminal.borrow().command_running();
+        }
         self.pty.borrow().as_ref().is_some_and(Pty::is_busy)
     }
 

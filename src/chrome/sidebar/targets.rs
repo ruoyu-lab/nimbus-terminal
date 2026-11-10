@@ -29,11 +29,16 @@ pub(super) fn list(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
     let (rows, loose) = (workspace.clone(), workspace.clone());
     column()
         .gap(2)
-        // 没归进文件夹的会话：图标和文件夹的图标对齐，收起侧栏时也在，只剩图标
+        // 没归进文件夹的会话：图标和文件夹的图标对齐，收起侧栏时也在，只剩图标。
+        // WSL 的会话列在「WSL」里它的发行版下面
         .child(sessions(
             &loose,
             scrolling,
-            |tab| tab.folder.is_none() && tab.target.remote_name().is_none(),
+            |tab| {
+                tab.folder.is_none()
+                    && tab.target.remote_name().is_none()
+                    && tab.wsl_distribution().is_none()
+            },
             None,
         ))
         .child(column().gap(2).each(
@@ -41,6 +46,96 @@ pub(super) fn list(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
             |folder: &Folder| folder.id,
             move |folder| folder_block(&rows, folder.id, scrolling),
         ))
+}
+
+/// 「WSL」（Windows）：这台机器上装了的发行版，和「容器」一个样子。一个都没装时整块不存在；
+/// 侧栏挂上时（启动、从设置页回来）重新列一遍，新装的发行版也出来。
+/// 点一个发行版：它已经有会话就切过去，没有就开一个；右键可以再开一个会话。发行版下面列它的会话
+pub(super) fn wsl(workspace: &Rc<Workspace>, scrolling: Scrolling) -> Element {
+    let (distributions, collapsed) = (workspace.distributions, workspace.collapsed);
+    let (owner, refresh) = (workspace.clone(), workspace.clone());
+    column()
+        .on_mount(move || refresh.refresh_distributions())
+        .child_when(
+            move || !distributions.get().is_empty(),
+            move || {
+                let owner = owner.clone();
+                column()
+                    .name("wsl")
+                    .gap(2)
+                    .child(section_label(collapsed, "WSL"))
+                    .child(column().gap(2).each(
+                        move || distributions.get(),
+                        |distribution: &String| distribution.clone(),
+                        move |distribution| distribution_block(&owner, distribution, scrolling),
+                    ))
+            },
+        )
+}
+
+fn distribution_block(
+    workspace: &Rc<Workspace>,
+    distribution: String,
+    scrolling: Scrolling,
+) -> Element {
+    let (collapsed, tabs) = (workspace.collapsed, workspace.tabs);
+    let (open, again, owner) = (workspace.clone(), workspace.clone(), workspace.clone());
+    let (name, menu_name) = (distribution.clone(), distribution.clone());
+    let (online, belongs) = (distribution.clone(), distribution.clone());
+    let row = nav_named(collapsed, Icon::Laptop, distribution.clone())
+        .name(format!("wsl-{distribution}"))
+        .child_when(
+            move || {
+                !collapsed.get()
+                    && tabs
+                        .get()
+                        .iter()
+                        .any(|tab| tab.wsl_distribution() == Some(online.as_str()))
+            },
+            || rect().size(7, 7).radius(4).background(mark()),
+        )
+        .on_click(move || {
+            let existing = open
+                .tabs
+                .get_untracked()
+                .iter()
+                .find(|tab| tab.wsl_distribution() == Some(name.as_str()))
+                .map(|tab| tab.id);
+            match existing {
+                Some(id) => open.select(id),
+                None => open.new_tab_wsl(&name),
+            }
+        });
+    let row = with_actions(
+        row,
+        format!("menu-wsl-{distribution}"),
+        vec![Action {
+            id: format!("new-session-wsl-{distribution}"),
+            label: "新建会话".to_string(),
+            // 等菜单卸掉再开，原因同文件夹菜单里的「创建会话」
+            run: Rc::new(move || {
+                let (workspace, distribution) = (again.clone(), menu_name.clone());
+                aureole::detached(|| {
+                    aureole::spawn_local(async move {
+                        aureole::sleep(ms(1)).await;
+                        workspace.new_tab_wsl(&distribution);
+                    })
+                });
+            }),
+        }],
+    );
+    column().gap(1).child(row).child_when(
+        move || !collapsed.get(),
+        move || {
+            let belongs = belongs.clone();
+            sessions(
+                &owner,
+                scrolling,
+                move |tab| tab.wsl_distribution() == Some(belongs.as_str()),
+                Some(FOLDER_SESSION_INDENT),
+            )
+        },
+    )
 }
 
 /// 「远程」：`~/.ssh/config` 里的和手动连过的服务器。没有服务器、或者设置里关了「远程功能」时整块不存在。

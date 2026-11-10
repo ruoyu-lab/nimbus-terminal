@@ -56,7 +56,7 @@ strip = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# ConPTY、起子进程、问子进程（当前目录、下面有没有程序在跑）、列显示器。和框架依赖树里的是同一版，
+# ConPTY、起子进程、问子进程（当前目录、下面有没有程序在跑）、列显示器、读注册表（装了哪些 WSL 发行版）。和框架依赖树里的是同一版，
 # 用到的特性框架也都开着，不会让它多编一遍
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -69,6 +69,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Kernel",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",

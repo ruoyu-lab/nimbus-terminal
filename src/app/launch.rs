@@ -68,10 +68,22 @@ pub struct Launch {
 /// 起一个会话：本机是登录 shell，服务器是 `ssh`，容器是 `docker exec`
 pub fn spawn(launch: &Launch) -> Spawned {
     let (columns, rows) = (launch.columns as u16, launch.rows as u16);
+    // WSL 的发行版：起始目录、集成脚本都交给 `wsl.exe` 里的引导脚本，下面不再按本机的程序处理
+    let wsl = match (&launch.target, &launch.shell) {
+        (Target::Local, Some(program)) => crate::wsl::distribution(program),
+        _ => None,
+    };
     let mut config = match &launch.target {
-        Target::Local => match &launch.shell {
-            Some(program) => pty::Config::shell(program, columns, rows),
-            None => pty::Config::login_shell(columns, rows),
+        Target::Local => match (&launch.shell, wsl) {
+            (_, Some(distribution)) => crate::wsl::config(
+                distribution,
+                launch.directory.as_deref(),
+                launch.integration.as_deref(),
+                columns,
+                rows,
+            ),
+            (Some(program), None) => pty::Config::shell(program, columns, rows),
+            (None, None) => pty::Config::login_shell(columns, rows),
         },
         Target::Ssh { host } => {
             // 界面那边已经验过一次；这里再验一次，主机名绝不能被 `ssh` 当成选项
@@ -108,12 +120,12 @@ pub fn spawn(launch: &Launch) -> Spawned {
         }
     };
     // 起始目录只对本机有意思：服务器上没有这个目录
-    if let (Target::Local, Some(directory)) = (&launch.target, &launch.directory) {
+    if let (Target::Local, Some(directory), None) = (&launch.target, &launch.directory, wsl) {
         config.working_directory = Some(directory.clone());
     }
     config.dark_background = launch.dark_background;
     // shell 集成：zsh 加环境变量，Windows 上的 PowerShell 加参数；认的是要起的程序，设置里指定的别的 shell 不动
-    if let (Target::Local, Some(directory)) = (&launch.target, &launch.integration) {
+    if let (Target::Local, Some(directory), None) = (&launch.target, &launch.integration, wsl) {
         crate::shell::integrate(directory, &mut config);
     }
     match pty::spawn(config).map_err(|error| error.to_string()) {

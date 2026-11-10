@@ -79,7 +79,7 @@
 ## 安装
 
 正式发布的版本目前只有 **macOS**（pty 用的是 `forkpty`，Linux 同一套接口但没有在桌面上测过）。
-Windows 上已经能日常用（ConPTY；命令提示符、Windows PowerShell、PowerShell 7 都能选），但界面框架现在依赖的是私有仓库，
+Windows 上已经能日常用（ConPTY；命令提示符、Windows PowerShell、PowerShell 7 和装了的 WSL 发行版都能选），但界面框架现在依赖的是私有仓库，
 外面暂时编译不了；和 macOS 的差别见 [docs/windows.md](docs/windows.md)。
 
 ### 下载

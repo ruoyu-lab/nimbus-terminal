@@ -2,6 +2,7 @@
 //! 不改用户的任何配置文件：
 //! - zsh：靠 `ZDOTDIR` 垫片
 //! - Windows 上的 PowerShell（5.1 和 7）：`-NoExit -Command` 在配置文件之后加载脚本
+//! - WSL 里的 bash、zsh：`wsl.exe` 里的引导脚本加载（见 [`crate::wsl`]），bash 用 `--init-file`
 //!
 //! 别的 shell 手动 `source` 同目录下的脚本。加一个 shell：在 `assets/shell/` 放它的脚本，再在 [`integrate`] 里认出它、让它起来时加载。
 
@@ -145,6 +146,18 @@ mod tests {
         assert!(environment(&installed, "/bin/bash").is_empty());
         assert!(environment(&installed, "/usr/local/bin/fish").is_empty());
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// bash、zsh 的脚本也在 Linux（WSL）里跑：不管在哪个平台检出、编译，都不能带回车（见 `.gitattributes`）
+    #[test]
+    fn posix_scripts_have_unix_line_endings() {
+        for (name, script) in [
+            ("nimbus.zsh", ZSH),
+            ("nimbus.bash", BASH),
+            (".zshenv", ZSHENV),
+        ] {
+            assert!(!script.contains('\r'), "{name} 带着回车");
+        }
     }
 
     /// 单引号（直的、弯的）写两遍，别的原样

@@ -41,6 +41,7 @@ mod target;
 mod theme;
 mod view;
 mod vt;
+mod wsl;
 
 use aureole::{App, TitleBar, WindowMaterial};
 

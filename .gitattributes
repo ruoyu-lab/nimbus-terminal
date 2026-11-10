@@ -1,0 +1,4 @@
+# shell 集成脚本原样嵌进程序、在 Linux（WSL）里跑：不管在哪个平台检出都用 LF，bash 读到 CRLF 会报错
+assets/shell/*.bash text eol=lf
+assets/shell/*.zsh text eol=lf
+assets/shell/zdotdir/.zshenv text eol=lf

@@ -242,6 +242,41 @@ fn bad_directory_reports_are_ignored() {
     }
 }
 
+/// Windows 上没有盘符的 `/home/me`（WSL 里的 shell 报的）另外记下，不当本机的目录、不顶掉本机的；
+/// 同样每个提示符开始时清掉。别的平台上它就是本机的目录
+#[test]
+fn linux_directory_reports_are_kept_apart_on_windows() {
+    let mut term = Terminal::new(40, 4);
+    term.feed(b"\x1b]7;file://box/home/me/%E4%B8%AD/\x07");
+    let linux = || {
+        term.reported_linux_directory()
+            .map(|directory| (directory.host.clone(), directory.path.clone()))
+    };
+    if cfg!(windows) {
+        assert_eq!(
+            linux(),
+            Some(("box".to_string(), "/home/me/中".to_string()))
+        );
+        assert_eq!(term.reported_directory(), None);
+        term.feed(b"\x1b]7;file://box/C:/x\x07\x1b]7;file://box/\x07");
+        assert_eq!(reported(&term), Some(("box".to_string(), r"C:\x".into())));
+        assert_eq!(
+            term.reported_linux_directory()
+                .map(|directory| directory.path.as_str()),
+            Some("/"),
+            "根目录"
+        );
+        term.feed(b"\x1b]133;A\x07");
+        assert_eq!(term.reported_linux_directory(), None, "新的提示符，还没报");
+    } else {
+        assert_eq!(linux(), None);
+        assert_eq!(
+            reported(&term),
+            Some(("box".to_string(), "/home/me/中".into()))
+        );
+    }
+}
+
 /// 每个提示符开始（OSC 133;A）时清掉，等这个提示符重新报；副屏里的不理
 #[test]
 fn directory_reports_last_until_the_next_prompt() {

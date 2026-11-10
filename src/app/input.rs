@@ -137,10 +137,23 @@ impl Session {
     ///
     /// macOS、Linux 上是 `sh` 的规矩。Windows 上 cmd、PowerShell 的写法不一样，按这个终端起的那个程序算
     /// （见 [`Self::shell_program`]；在里面又开了另一个 shell 时会猜错，[`crate::files::local_word`] 尽量写成两边都对的样子，
-    /// 猜错了也只有带 `$`、`%` 这类字的名字受影响）
+    /// 猜错了也只有带 `$`、`%` 这类字的名字受影响）。
+    ///
+    /// WSL 的终端里写成 Linux 的路径（`C:\x` 是 `/mnt/c/x`），按 `sh` 的规矩引；换不过去的（共享路径）原样写
     pub fn drop_files(&self, paths: &[std::path::PathBuf]) -> bool {
         if !self.local.get() {
             return false;
+        }
+        if let Some(distribution) = self.wsl_distribution() {
+            let words: Vec<String> = paths
+                .iter()
+                .filter_map(|path| path.to_str())
+                .filter_map(|path| {
+                    let linux = crate::wsl::to_linux(&distribution, path);
+                    crate::files::shell_word(linux.as_deref().unwrap_or(path))
+                })
+                .collect();
+            return self.write_words(&words);
         }
         let shell = if cfg!(windows) {
             let program = self
@@ -155,6 +168,11 @@ impl Session {
             .filter_map(|path| path.to_str())
             .filter_map(|path| crate::files::local_word(path, shell))
             .collect();
+        self.write_words(&words)
+    }
+
+    /// 把引好的几个路径写在光标处，空格隔开、最后跟一个空格，不按回车。一个都没有就不写，返回 `false`
+    fn write_words(&self, words: &[String]) -> bool {
         if words.is_empty() {
             return false;
         }

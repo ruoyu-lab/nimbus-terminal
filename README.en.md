@@ -32,7 +32,7 @@ Built from scratch on the [Aureole](https://github.com/ruoyu-lab/aureole) UI fra
 
 ## Install
 
-Released builds are macOS only for now (Linux uses the same `forkpty` interface but is untested on a desktop). Windows is usable day to day through ConPTY, with Command Prompt, Windows PowerShell and PowerShell 7 to choose from, but the UI framework currently comes from a private repository, so it can't be built outside yet; differences from macOS are listed in docs/windows.md. Requires Rust 1.90+.
+Released builds are macOS only for now (Linux uses the same `forkpty` interface but is untested on a desktop). Windows is usable day to day through ConPTY, with Command Prompt, Windows PowerShell, PowerShell 7 and any installed WSL distribution to choose from, but the UI framework currently comes from a private repository, so it can't be built outside yet; differences from macOS are listed in docs/windows.md. Requires Rust 1.90+.
 
 ```bash
 git clone https://github.com/ruoyu-lab/nimbus-terminal.git

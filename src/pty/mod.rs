@@ -146,15 +146,15 @@ pub fn program_name(program: &str) -> Option<String> {
     }
 }
 
-/// 一种能起的 shell（Windows 上的命令提示符、Windows PowerShell、PowerShell 7）
+/// 一种能起的 shell（Windows 上的命令提示符、Windows PowerShell、PowerShell 7，还有装了的 WSL 发行版）
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct Shell {
-    /// 不会变的标识：`pwsh`、`powershell`、`cmd`，存进设置里用
-    pub id: &'static str,
-    /// 给人看的名字
-    pub name: &'static str,
-    /// 程序的完整路径；没装的是它通常该在的位置
+    /// 不会变的标识：`pwsh`、`powershell`、`cmd`，WSL 的发行版是 `wsl:发行版`
+    pub id: String,
+    /// 给人看的名字（WSL 的是发行版的名字）
+    pub name: String,
+    /// 程序的完整路径；没装的是它通常该在的位置。WSL 的发行版是 `wsl:发行版`（见 [`crate::wsl::program`]）
     pub program: String,
     /// 这台机器上有没有
     pub installed: bool,
@@ -167,21 +167,24 @@ const SHELL_NAMES: [(&str, &str); 3] = [
     ("cmd", "命令提示符"),
 ];
 
-/// 这个程序是哪种 shell，给人看的名字（`C:\…\powershell.exe` 是「Windows PowerShell」）。
-/// 只认 Windows 上那三种，别的（包括类 Unix 上的 shell）是 `None`
-pub fn shell_name(program: &str) -> Option<&'static str> {
+/// 这个程序是哪种 shell，给人看的名字（`C:\…\powershell.exe` 是「Windows PowerShell」，`wsl:Ubuntu` 是「Ubuntu」）。
+/// 只认 Windows 上那三种和 WSL 的发行版，别的（包括类 Unix 上的 shell）是 `None`
+pub fn shell_name(program: &str) -> Option<String> {
     if !cfg!(windows) {
         return None;
+    }
+    if let Some(distribution) = crate::wsl::distribution(program) {
+        return Some(distribution.to_string());
     }
     let id = program_name(program)?;
     SHELL_NAMES
         .iter()
         .find(|(known, _)| *known == id)
-        .map(|(_, name)| *name)
+        .map(|(_, name)| name.to_string())
 }
 
-/// 这台机器上能选的 shell，按推荐的顺序：PowerShell 7、Windows PowerShell、命令提示符。
-/// 没装的也列出来（`installed` 是假）。类 Unix 上是空的：那里只用 `$SHELL`（见 [`default_shell`]）
+/// 这台机器上能选的 shell，按推荐的顺序：PowerShell 7、Windows PowerShell、命令提示符，后面是装了的 WSL 发行版。
+/// 没装的 PowerShell 7 也列出来（`installed` 是假）。类 Unix 上是空的：那里只用 `$SHELL`（见 [`default_shell`]）
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn shells() -> Vec<Shell> {
     #[cfg(windows)]
@@ -208,15 +211,16 @@ fn windows_shells() -> Vec<Shell> {
     let cmd =
         variable("ComSpec").map_or_else(|| system_root.join(r"System32\cmd.exe"), PathBuf::from);
     let entry = |id: &'static str, program: &Path, installed| Shell {
-        id,
+        id: id.to_string(),
         name: SHELL_NAMES
             .iter()
             .find(|(known, _)| *known == id)
-            .map_or(id, |(_, name)| *name),
+            .map_or(id, |(_, name)| *name)
+            .to_string(),
         program: program.to_string_lossy().into_owned(),
         installed,
     };
-    vec![
+    let mut shells = vec![
         entry(
             "pwsh",
             pwsh.as_deref().unwrap_or(&pwsh_default),
@@ -224,7 +228,17 @@ fn windows_shells() -> Vec<Shell> {
         ),
         entry("powershell", &powershell, exists(&powershell)),
         entry("cmd", &cmd, exists(&cmd)),
-    ]
+    ];
+    shells.extend(crate::wsl::distributions().into_iter().map(|distribution| {
+        let program = crate::wsl::program(&distribution.name);
+        Shell {
+            id: program.clone(),
+            name: distribution.name,
+            program,
+            installed: true,
+        }
+    }));
+    shells
 }
 
 /// 在这几个目录里找 `name`，返回第一个找到的完整路径
@@ -251,14 +265,14 @@ fn home_directory() -> Option<PathBuf> {
 }
 
 /// 这个平台上用户默认的 shell：类 Unix 读 `$SHELL`；Windows 按 [`shells`] 的顺序取第一个装了的
-/// （PowerShell 7、Windows PowerShell、命令提示符），一个都找不到就交给系统去找 `cmd.exe`
+/// （PowerShell 7、Windows PowerShell、命令提示符；WSL 的发行版不算），一个都找不到就交给系统去找 `cmd.exe`
 pub fn default_shell() -> String {
     #[cfg(unix)]
     return std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     #[cfg(windows)]
     return shells()
         .into_iter()
-        .find(|shell| shell.installed)
+        .find(|shell| shell.installed && crate::wsl::distribution(&shell.program).is_none())
         .map_or_else(|| "cmd.exe".to_string(), |shell| shell.program);
     #[cfg(not(any(unix, windows)))]
     return String::new();
@@ -370,9 +384,24 @@ mod tests {
     #[test]
     fn windows_lists_its_shells_and_defaults_to_the_first_installed() {
         let shells = shells();
-        let ids: Vec<_> = shells.iter().map(|shell| shell.id).collect();
-        assert_eq!(ids, ["pwsh", "powershell", "cmd"]);
-        for shell in &shells {
+        let ids: Vec<_> = shells.iter().map(|shell| shell.id.as_str()).collect();
+        assert_eq!(ids[..3], ["pwsh", "powershell", "cmd"]);
+        // 后面是装了的 WSL 发行版，一个一项
+        let distributions: Vec<_> = crate::wsl::distributions()
+            .into_iter()
+            .map(|distribution| crate::wsl::program(&distribution.name))
+            .collect();
+        assert_eq!(ids[3..], distributions);
+        for shell in &shells[3..] {
+            assert!(shell.installed);
+            assert_eq!(shell.id, shell.program);
+            assert_eq!(
+                shell_name(&shell.program).as_deref(),
+                Some(shell.name.as_str())
+            );
+        }
+        let shells = &shells[..3];
+        for shell in shells {
             let program = std::path::Path::new(&shell.program);
             assert!(program.is_absolute(), "{shell:?}");
             assert_eq!(shell.installed, exists(program), "{shell:?}");

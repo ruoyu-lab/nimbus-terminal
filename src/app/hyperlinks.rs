@@ -111,13 +111,22 @@ impl Session {
     }
 
     /// 终端里写的路径对应本机的哪个已存在的文件：`~` 展开（Windows 上 `~\` 也算），
-    /// 相对路径从 shell 现在的目录算起。Windows 上的 `\\?\` 原样路径换回平常的写法（外壳不认它，也不给人看它）
+    /// 相对路径从 shell 现在的目录算起。Windows 上的 `\\?\` 原样路径换回平常的写法（外壳不认它，也不给人看它）。
+    ///
+    /// WSL 的终端里写的是 Linux 的路径：`/…` 换成 `\\wsl.localhost\发行版\…`（`/mnt/c/…` 是 `C:\…`），
+    /// `~/…` 是发行版里那个用户的主目录
     pub(super) fn resolve_path(&self, path: &str) -> Option<std::path::PathBuf> {
-        let home = path
-            .strip_prefix("~/")
-            .or_else(|| path.strip_prefix("~\\").filter(|_| cfg!(windows)));
-        let candidate = if let Some(rest) = home {
+        let wsl = self.wsl_distribution();
+        let home = path.strip_prefix("~/").or_else(|| {
+            path.strip_prefix("~\\")
+                .filter(|_| cfg!(windows) && wsl.is_none())
+        });
+        let candidate = if let (Some(rest), Some(distribution)) = (home, &wsl) {
+            crate::wsl::home(distribution)?.join(rest)
+        } else if let Some(rest) = home {
             crate::store::user_home()?.join(rest)
+        } else if let (true, Some(distribution)) = (path.starts_with('/'), &wsl) {
+            crate::wsl::to_windows(distribution, path)?
         } else if std::path::Path::new(path).is_absolute() {
             std::path::PathBuf::from(path)
         } else {

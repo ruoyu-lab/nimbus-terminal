@@ -100,6 +100,8 @@ type Fetch =
 
 /// 列出运行中的容器。在后台线程里调；测试里换成假的
 type ContainerLister = Arc<dyn Fn() -> Result<Vec<String>, monitor::Failure> + Send + Sync>;
+/// 列装了的 WSL 发行版（读注册表，很快，在主线程上调）
+type DistributionLister = Rc<dyn Fn() -> Vec<String>>;
 
 /// 一个标签
 #[derive(Clone)]
@@ -128,6 +130,14 @@ impl Tab {
             .session(self.focus.get_untracked())
             .or_else(|| layout.session(layout.first_id()))
             .expect("排布里至少有一个终端")
+    }
+
+    /// 起的是哪个 WSL 发行版（本机的标签、`shell` 是 `wsl:发行版` 时）：侧栏把它列在「WSL」里那个发行版的名下
+    pub fn wsl_distribution(&self) -> Option<&str> {
+        if self.target != Target::Local {
+            return None;
+        }
+        self.shell.as_deref().and_then(crate::wsl::distribution)
     }
 
     /// 这个标签里的所有会话
@@ -199,6 +209,10 @@ pub struct Workspace {
     pub containers: Signal<Vec<String>>,
     /// 手动连过的那部分（要存下来）
     manual_containers: RefCell<Vec<String>>,
+    /// 侧栏「WSL」里列的：这台机器上装了的发行版（只有 Windows 上有）
+    pub distributions: Signal<Vec<String>>,
+    /// 怎么列发行版：平时读注册表，测试里默认没有（这台机器装了什么不该影响测试），要的测试自己换
+    distribution_lister: RefCell<DistributionLister>,
     /// 「连接到服务器」的输入框开着没有
     pub connect_prompt: Signal<bool>,
     /// 「连接到容器」的输入框开着没有
@@ -327,6 +341,17 @@ impl Workspace {
             manual_hosts: RefCell::new(saved.hosts.clone()),
             containers: signal(saved.containers.clone()),
             manual_containers: RefCell::new(saved.containers.clone()),
+            distributions: signal(Vec::new()),
+            distribution_lister: RefCell::new(if cfg!(test) {
+                Rc::new(Vec::new)
+            } else {
+                Rc::new(|| {
+                    crate::wsl::distributions()
+                        .into_iter()
+                        .map(|distribution| distribution.name)
+                        .collect()
+                })
+            }),
             connect_prompt: signal(false),
             docker_prompt: signal(false),
             monitors: signal(HashMap::new()),
@@ -457,8 +482,13 @@ impl Workspace {
         self.activate(id);
     }
 
-    /// 和 [`Self::new_tab`] 一样，但起的是 `program` 这个 shell（Windows 上新建菜单里选的那种），不看设置
+    /// 和 [`Self::new_tab`] 一样，但起的是 `program` 这个 shell（Windows 上新建菜单里选的那种），不看设置。
+    /// WSL 的发行版见 [`Self::new_tab_wsl`]
     pub fn new_tab_with_shell(&self, program: &str) {
+        if let Some(distribution) = crate::wsl::distribution(program) {
+            self.new_tab_wsl(distribution);
+            return;
+        }
         let folder = self
             .tabs
             .get_untracked()
@@ -474,6 +504,27 @@ impl Workspace {
             None,
         );
         self.activate(id);
+    }
+
+    /// 开一个 WSL 发行版的会话。和容器的会话一样不归文件夹，侧栏把它列在「WSL」里这个发行版的名下
+    pub fn new_tab_wsl(&self, distribution: &str) {
+        let id = self.open(
+            None,
+            Target::Local,
+            Some(crate::wsl::program(distribution)),
+            None,
+            None,
+            None,
+        );
+        self.activate(id);
+    }
+
+    /// 重新列一遍装了的 WSL 发行版（侧栏挂上时：启动、从设置页回来）
+    pub fn refresh_distributions(&self) {
+        let found = (self.distribution_lister.borrow())();
+        if found != self.distributions.get_untracked() {
+            self.distributions.set(found);
+        }
     }
 
     /// 新开一个不归任何文件夹的终端（直接列在「目标」下），用设置里的起始目录
@@ -567,7 +618,7 @@ impl Workspace {
                     .and_then(|tab| {
                         tab.target.remote_name().map(str::to_string).or_else(|| {
                             let program = tab.session().shell_program()?;
-                            crate::pty::shell_name(&program).map(str::to_string)
+                            crate::pty::shell_name(&program)
                         })
                     })
                     .unwrap_or_else(|| DEFAULT_TITLE.to_string())
