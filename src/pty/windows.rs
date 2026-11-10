@@ -1426,6 +1426,76 @@ mod tests {
         );
     }
 
+    /// 在命令提示符里敲一行：等它回显出来，像终端那样按回车时补上「命令开始」，再等下一个提示符把它收尾
+    fn run_in_cmd(shell: &mut Live, line: &str) -> Command {
+        shell.pty.write(line.as_bytes()).expect("写得进去");
+        shell.wait(&format!("「{line}」回显"), |terminal| {
+            prompt_text(terminal).ends_with(line)
+        });
+        assert!(shell.terminal.start_command_on_enter(), "补上了命令开始");
+        shell.pty.write(b"\r").expect("写得进去");
+        shell.wait(&format!("「{line}」跑完"), |terminal| {
+            at_prompt(terminal) && finished(terminal, line).is_some()
+        });
+        finished(&shell.terminal, line).expect("跑完了").clone()
+    }
+
+    /// 命令提示符：`PROMPT` 包上标记以后（`shell::integrate`），提示符带着 A、B 和当前目录（OSC 9;9），原来的 `路径>` 还在；
+    /// 按回车时补上命令开始，下一个提示符的 D 把它收尾：命令的文字、输出都对，没有退出码；`cd` 以后报的是新目录
+    #[test]
+    fn cmd_prompts_are_marked_and_enter_starts_commands() {
+        let cmd = system_root().join(r"System32\cmd.exe");
+        let mut config = super::super::Config::shell(cmd.to_string_lossy(), 120, 24);
+        crate::shell::integrate(Path::new("unused"), &mut config);
+        assert!(
+            config
+                .environment
+                .iter()
+                .any(|(name, value)| name == "PROMPT" && value.contains("133;A")),
+            "{:?}",
+            config.environment
+        );
+        config.working_directory = Some(system_root());
+        let mut shell = Live::start(config);
+        shell.wait("第一个提示符", |terminal| {
+            at_prompt(terminal) && terminal.reported_directory().is_some()
+        });
+        assert!(shell.terminal.has_command_marks());
+        assert_eq!(
+            reported(&shell.terminal).map(|(_, path)| path),
+            Some(system_root())
+        );
+        assert!(
+            prompt_text(&shell.terminal).ends_with('>'),
+            "原来的提示符还在：{:?}",
+            prompt_text(&shell.terminal)
+        );
+        let echoed = run_in_cmd(&mut shell, "echo nimbus-cmd");
+        assert_eq!(echoed.exit, None, "cmd 拿不到退出码");
+        let index = shell.terminal.commands().len() - 2;
+        assert!(
+            shell
+                .terminal
+                .command_output(index)
+                .is_some_and(|output| output.trim() == "nimbus-cmd"),
+            "{:?}",
+            shell.terminal.command_output(index)
+        );
+        run_in_cmd(&mut shell, r"cd System32");
+        assert_eq!(
+            reported(&shell.terminal).map(|(_, path)| path),
+            Some(system_root().join("System32"))
+        );
+        // 空着按回车不算一条命令
+        let before = shell.terminal.commands().len();
+        assert!(!shell.terminal.start_command_on_enter());
+        shell.pty.write(b"\r").expect("写得进去");
+        shell.wait("空行之后的提示符", |terminal| {
+            at_prompt(terminal) && terminal.commands().len() == before
+        });
+        assert_eq!(shell.exit(), 0);
+    }
+
     /// 装了的第一个 WSL 发行版；没装 WSL、一个发行版都没有的，测试跳过
     fn wsl_distribution() -> Option<String> {
         let found = crate::wsl::distributions()

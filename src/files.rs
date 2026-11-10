@@ -401,6 +401,10 @@ pub enum Status {
     NotConnected,
     Unsupported,
     Failed(String),
+    /// 要用户输服务器的密码（见 [`crate::monitor::Failure::PasswordNeeded`]）
+    PasswordNeeded {
+        wrong: bool,
+    },
 }
 
 /// 一次传输
@@ -498,6 +502,9 @@ impl FilesState {
             Err(Failure::NotConnected) => self.status = Status::NotConnected,
             Err(Failure::Unsupported) => self.status = Status::Unsupported,
             Err(Failure::Failed(reason)) => self.status = Status::Failed(reason),
+            Err(Failure::PasswordNeeded { wrong }) => {
+                self.status = Status::PasswordNeeded { wrong };
+            }
         }
         true
     }

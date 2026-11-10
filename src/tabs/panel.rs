@@ -8,6 +8,7 @@ pub(super) fn failure_text(failure: monitor::Failure) -> String {
         monitor::Failure::NotConnected => "终端的连接断了".to_string(),
         monitor::Failure::Unsupported => "暂不支持".to_string(),
         monitor::Failure::Failed(reason) => reason,
+        monitor::Failure::PasswordNeeded { .. } => "要先在监控或文件页上输服务器的密码".to_string(),
     }
 }
 
@@ -76,6 +77,26 @@ impl Workspace {
                 },
             )
         });
+    }
+
+    /// 面板上输了服务器的密码（Windows，面板的连接要密码时）：记下来（只在内存里，退出就忘），
+    /// 这个标签的面板马上用它再连一次。空的、当前不是服务器的标签不管
+    pub fn submit_panel_password(self: &Rc<Self>, password: &str) {
+        let Some((tab, Target::Ssh { host }, Some(control))) = self.monitor_plan() else {
+            return;
+        };
+        if password.is_empty() {
+            return;
+        }
+        crate::ssh::use_password(&host, &control, password);
+        // 先显示「正在读取」，结果回来再换
+        self.monitors.update(|monitors| {
+            if let Some(monitor) = monitors.get_mut(&tab) {
+                monitor.status = monitor::Status::Waiting;
+            }
+        });
+        self.poll_monitor();
+        self.files_refresh();
     }
 
     /// 收下一次取数的结果（标签已经关了就丢掉）

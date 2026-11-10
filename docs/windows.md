@@ -11,16 +11,16 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 | 新建会话 | 加号旁边的小箭头选 shell：命令提示符、Windows PowerShell、PowerShell 7（没装的灰着写「未安装」），装了 WSL 的发行版时下面再列每个发行版；命令面板里也有。WSL 的发行版还列在侧栏的「WSL」里（见下面「WSL」）。标签记住自己的 shell，拆分、重启都跟着走；默认标题就是 shell 的名字 |
 | 默认 shell | 按 PowerShell 7 → Windows PowerShell → 命令提示符取第一个装了的（`pty::default_shell`）；设置里「指定程序」可以换 |
 | 快捷键 | Ctrl+Shift 代替 ⌘，例外：左右、上下分屏是 Alt+Shift+= / Alt+Shift+-，查找的下一处、上一处是 F3 / Shift+F3（查找框开着时），复制 Ctrl+Shift+C 或 Ctrl+Insert，粘贴 Ctrl+Shift+V 或 Shift+Insert，全选 Ctrl+Shift+A。单独的 Ctrl+C、Ctrl+A 照常给 shell。界面上的提示按平台写（`tabs::Shortcut`） |
-| 命令标记（shell 集成） | Windows PowerShell 5.1、PowerShell 7 自动加载 `assets/shell/nimbus.ps1`（`-NoExit -Command` 在配置文件之后读进来，不受执行策略限制，不改用户的任何文件）：发 OSC 133 的 A、B、C、D 和 OSC 7。命令提示符没有（cmd 发不出 C、D） |
-| 当前目录 | PowerShell 靠 OSC 7（它的 `cd` 不改进程目录）；命令提示符读进程的 PEB |
-| 服务器的监控、文件页 | Windows 自带的 OpenSSH 没有连接复用（`ControlMaster`）：面板另开只用密钥的连接（`BatchMode=yes`），只能输密码的服务器提示「需要密钥登录」，不反复重试 |
+| 命令标记（shell 集成） | Windows PowerShell 5.1、PowerShell 7 自动加载 `assets/shell/nimbus.ps1`（`-NoExit -Command` 在配置文件之后读进来，不受执行策略限制，不改用户的任何文件）：发 OSC 133 的 A、B、C、D 和 OSC 7。命令提示符：起它时把 `PROMPT` 环境变量包一层（`shell::cmd_prompt`，用户原来的提示符照旧），每个提示符发 D（不带退出码）、A、当前目录（OSC 9;9）、B；cmd 发不出 C，终端在提示符上按回车（提示符后面有字）时替它记下（`Terminal::start_command_on_enter`）。所以命令间跳转、复制上一条输出、命令历史、跑完通知都能用，只是没有退出码 |
+| 当前目录 | PowerShell 靠 OSC 7（它的 `cd` 不改进程目录）；命令提示符报 OSC 9;9，没有集成时读进程的 PEB |
+| 服务器的监控、文件页 | Windows 自带的 OpenSSH 没有连接复用（`ControlMaster`）：面板另开连接，平时只用密钥（`BatchMode=yes`）。服务器收密码（`Permission denied (…password…)`、`keyboard-interactive`）时，监控、文件页上出一个密码框，输一次两页都能用；之后面板的 `ssh`、`sftp` 带着它连（见下面「面板的密码」）。只收密钥的服务器还是提示「需要密钥登录」。被拒以后终端重连、或者输了密码之前不再去连，不反复撞认证 |
 | 路径 | 认 `C:\…`、`C:/…`、`.\…`、`..\…`、`~\…`、`\\服务器\共享\…`；拖进来的路径按这个终端起的 shell 引（PowerShell 单引号、cmd 双引号，能两边都对时用双引号）；文件页的上传下载换成 `C:/…` 交给 `sftp`；远端文件名里 Windows 不能有的字换成 `_`，跑不出下载目录 |
 | 字体 | 系统等宽（Cascadia Mono，Windows 10 上退到 Consolas）、Cascadia Mono、Consolas、Courier New |
 | 图片 | iTerm2 内联图片、Kitty、Sixel 都能用：Kitty（APC）、Sixel（DCS）要靠随包的新版 ConPTY（见下面「随包的 ConPTY」），系统自带的会把它们整段吃掉 |
 | 窗口 | 窗口按钮按 Windows 的样子自己画；侧栏透出系统材质（Mica，框架 `c2728f4` 起开着材质也不会多出系统的窗口按钮）；外框的底色盖得比 macOS 薄（深色 66%、浅色的白 19%），材质透得出来、字也清楚。Mica 只带桌面壁纸的颜色、不透出后面的窗口，窗口不在前台、或者系统设置里关了「透明效果」时是纯色。窗口位置按显示器记（Win32 枚举显示器） |
 | 打包 | `scripts\bundle-windows.ps1`：默认出 NSIS 安装程序（先要 `cargo install cargo-packager --version 0.11.8 --locked`，第一次还会下载 NSIS）；`-Format installer` 用框架自己的安装程序，不用下载。编译时（`build.rs`）就把图标和应用标识写进可执行文件 |
 | 通知 | 应用标识 `com.ruoyu-lab.nimbus` 在启动时声明；Windows 要先登记过这个标识才显示通知，安装程序建开始菜单快捷方式时会登记（实测快捷方式带着这个标识；通知弹不弹还没在安装版里看过） |
-| 安装程序（`-Format installer`） | 界面是自己画的（`installer/`，见下面「安装程序」）：一页、正中一个按钮，样子参考比邻（bilin-desk）的安装程序；解压、回滚、升级、卸载、快捷方式、「应用和功能」的登记用框架的安装引擎。实测（Windows 11）：装给当前用户，在 `%LOCALAPPDATA%\Programs\Nimbus`，开始菜单、桌面各一个快捷方式，「应用和功能」里一条（版本号是完整的 `0.2.1-beta`）；`--silent` 一秒装完。从 0.2.1-beta 覆盖升级：多出 `conpty\`，卸载信息还是一条，快捷方式不变；程序开着时升级会拒绝（「正被使用」），旧版不受影响。卸载把文件、快捷方式、卸载信息都清掉，不碰配置目录。**框架的问题**：打开卸载程序又关掉（没卸），安装目录里的 `uninstall.exe` 也会被删掉，之后「应用和功能」里卸载不了（框架的 `delete_self_later` 不管卸没卸都删），要在框架里改 |
+| 安装程序（`-Format installer`） | 界面是自己画的（`installer/`，见下面「安装程序」）：一页、正中一个按钮，样子参考比邻（bilin-desk）的安装程序；解压、回滚、升级、卸载、快捷方式、「应用和功能」的登记用框架的安装引擎。实测（Windows 11）：装给当前用户，在 `%LOCALAPPDATA%\Programs\Nimbus`，开始菜单、桌面各一个快捷方式，「应用和功能」里一条（版本号是完整的 `0.2.1-beta`）；`--silent` 一秒装完。从 0.2.1-beta 覆盖升级：多出 `conpty\`，卸载信息还是一条，快捷方式不变；程序开着时升级会拒绝（「正被使用」），旧版不受影响。卸载把文件、快捷方式、卸载信息都清掉，不碰配置目录。打开卸载程序又关掉（没卸）：`uninstall.exe` 留着，只删拷到临时目录的那份（框架 `22600fc` 起；以前连 `uninstall.exe` 一起删，之后「应用和功能」里卸载不了） |
 | Docker 目标 | 代码在 Windows 上编译、子进程不弹窗口；这台机器没装 Docker，没验证 |
 
 ## WSL
@@ -64,6 +64,22 @@ PowerShell 的命令标记，服务器的监控和文件页（密钥登录），
 - **看样子**：`NIMBUS_INSTALLER_SHOTS=目录 cargo test -p nimbus-installer screenshots`，每种状态浅色、深色各存一张图。
 - 命令行和框架的一样：`--silent`、`--dir 目录`、`--no-desktop-shortcut`、`--no-menu-shortcut`。
 
+## 面板的密码
+
+只能输密码的服务器，面板另开的连接靠 OpenSSH 的 `SSH_ASKPASS` 拿密码（`askpass` 模块）：
+
+- **取密码的程序就是 Nimbus 自己**：面板的 `ssh`、`sftp` 带上 `SSH_ASKPASS=nimbus-terminal.exe`、`SSH_ASKPASS_REQUIRE=force`
+  （OpenSSH 8.4 起；系统自带的是 9.5）和 `NIMBUS_ASKPASS=1`。Nimbus 这样被起来时 `main` 一开头就回答，不开窗口。
+- **密码不明文出现**：用 DPAPI（`CryptProtectData`，当前用户）加密成十六进制放进 `NIMBUS_ASKPASS_SECRET`，只有这个用户解得开。
+  密码本身按主机记在内存里，退出就忘。
+- **只回答问密码的提示**（`…'s password:`、键盘交互认证的 `Password:`）：问密钥口令、两步验证码、要不要信这台服务器的一律不答（退出码 1）。
+  带密码的连接设 `BatchMode=no`、`NumberOfPasswordPrompts=1`：只问一次，密码不对马上失败，忘掉这个密码，面板上写「密码不对，再输一次」。
+- **输一次**：同一台服务器的别的标签在等这个密码的，一起不再记着被拒。
+- 实测：系统的 OpenSSH 确实起 Nimbus 来要口令（拿带口令的测试密钥让 `ssh-keygen` 读，问口令时 Nimbus 拒绝、它报口令不对）；
+  发布版（窗口程序）当取密码的程序，`…'s password:` 时把解出来的密码写到标准输出、不开窗口。
+  **还没连真的只能输密码的服务器跑过**：`ssh::tests::a_password_only_server_is_refused_quickly_and_not_retried` 设上
+  `NIMBUS_SSH_PASSWORD_HOST`、`NIMBUS_SSH_PASSWORD`、`NIMBUS_SSH_ASKPASS_EXE`（编出来的 `nimbus-terminal.exe`）就能端到端测。
+
 ## 随包的 ConPTY
 
 系统自带的 ConPTY（kernel32 里的那份）会把 Kitty 图片（APC）、Sixel（DCS）整段吃掉。安装包带着微软开源的新版：
@@ -95,7 +111,7 @@ NuGet 包 `Microsoft.Windows.Console.ConPTY`（MIT，源码在 microsoft/termina
 
 ## 还没做、要在框架那边做的
 
-1. **框架依赖是私有仓库**：现在用的是 aureole-framework（私有）master 的 `7f997ec`，外部的人和 CI 都拉不到。
+1. **框架依赖是私有仓库**：现在用的是 aureole-framework（私有）master 的 `ec788ee`，外部的人和 CI 都拉不到。
    框架出了带 Windows 改进的公开版本以后换回公开的依赖。在那之前 CI 的两个任务都会在第一步失败。
 2. **混合缩放的多显示器**：窗口位置按显示器记，但窗口库按建窗口时那块显示器的缩放换算存下的位置；
    主屏 150%、副屏 100% 时在副屏上关掉、再打开，要看会不会开到一半在屏幕外面。

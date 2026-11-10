@@ -53,6 +53,8 @@ pub enum Failure {
     Unsupported,
     /// 别的：命令没跑起来、超时、输出看不懂。带一句能给人看的原因
     Failed(String),
+    /// 面板自己的连接要密码（Windows，见 `ssh` 和 `askpass`）：等用户在面板上输。`wrong` 是刚才输的不对
+    PasswordNeeded { wrong: bool },
 }
 
 /// 把脚本的输出解析成读数。不是 Linux（缺 `/proc/stat`）是 [`Failure::Unsupported`]，输出残缺是 [`Failure::Failed`]
@@ -178,6 +180,10 @@ pub enum Status {
     NotConnected,
     Unsupported,
     Failed(String),
+    /// 要用户输服务器的密码（见 [`Failure::PasswordNeeded`]）
+    PasswordNeeded {
+        wrong: bool,
+    },
 }
 
 /// 一个标签的监控：最近的读数、CPU 的历史曲线、状态
@@ -229,6 +235,7 @@ impl Monitor {
                     Failure::NotConnected => Status::NotConnected,
                     Failure::Unsupported => Status::Unsupported,
                     Failure::Failed(reason) => Status::Failed(reason),
+                    Failure::PasswordNeeded { wrong } => Status::PasswordNeeded { wrong },
                 };
             }
         }

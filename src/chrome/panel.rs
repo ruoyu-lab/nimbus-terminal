@@ -170,7 +170,9 @@ fn monitor_page(workspace: &Rc<Workspace>) -> Element {
             .cloned()
             .unwrap_or_default()
     };
-    let (status, body) = (current, current);
+    let (status, body, asking) = (current, current, current);
+    let wrong = move || matches!(asking().status, Status::PasswordNeeded { wrong: true });
+    let password_owner = workspace.clone();
     column()
         .name("monitor")
         .grow(1)
@@ -183,6 +185,10 @@ fn monitor_page(workspace: &Rc<Workspace>) -> Element {
             let _ = aureole::every(POLL_EVERY, move || poller.poll_monitor());
         })
         .child(status_line(status))
+        .child_when(
+            move || matches!(asking().status, Status::PasswordNeeded { .. }),
+            move || password_form(&password_owner, wrong),
+        )
         .child_when(move || body().latest.is_some(), move || stats(body))
 }
 
@@ -205,6 +211,7 @@ fn status_line(current: impl Fn() -> Monitor + Clone + 'static) -> Element {
             Status::NotConnected => ("未连接：终端连上之后这里才有数据。".to_string(), false),
             Status::Unsupported => ("暂不支持监控（需要 Linux）。".to_string(), false),
             Status::Failed(reason) => (format!("读取失败：{reason}"), false),
+            Status::PasswordNeeded { .. } => ("这台服务器要输密码。".to_string(), false),
         }
     };
     let (text_message, dot_message) = (message.clone(), message);
@@ -220,6 +227,61 @@ fn status_line(current: impl Fn() -> Monitor + Clone + 'static) -> Element {
                 .name("monitor-status")
                 .font_size(12)
                 .color(text_2()),
+        )
+}
+
+/// 面板自己的连接要密码时（Windows 上只能输密码的服务器）：输服务器的密码，回车或者点「连接」。
+/// 监控页、文件页都放这一块，输一次两页都能用；密码只记在内存里
+fn password_form(workspace: &Rc<Workspace>, wrong: impl Fn() -> bool + 'static) -> Element {
+    let secret = signal(String::new());
+    let (on_enter, on_click) = (workspace.clone(), workspace.clone());
+    column()
+        .name("panel-password")
+        .gap(8)
+        .width(pct(100))
+        .child(
+            text(move || {
+                if wrong() {
+                    "密码不对，再输一次。".to_string()
+                } else {
+                    "输一次，监控和文件页都能用。".to_string()
+                }
+            })
+            .name("panel-password-note")
+            .font_size(12)
+            .color(text_2()),
+        )
+        .child(
+            row()
+                .gap(8)
+                .align(Align::Center)
+                .child(
+                    text_field(secret)
+                        .password(true)
+                        .placeholder("服务器的密码")
+                        .name("panel-password-field")
+                        .grow(1)
+                        .min_width(0)
+                        .on_submit(move |value: String| {
+                            on_enter.submit_panel_password(&value);
+                            secret.set(String::new());
+                        }),
+                )
+                .child(
+                    outline_button(None, "连接")
+                        .name("panel-password-connect")
+                        .shrink(0)
+                        .padding_x(14)
+                        .on_click(move || {
+                            on_click.submit_panel_password(&secret.get_untracked());
+                            secret.set(String::new());
+                        }),
+                ),
+        )
+        .child(
+            text("只记在内存里，退出 Nimbus 就忘掉。")
+                .font_size(11)
+                .color(text_3()),
         )
 }
 
@@ -638,7 +700,7 @@ fn files_body(
     current: impl Fn() -> FilesState + Clone + 'static,
 ) -> Element {
     let (message, list, banner) = (current.clone(), current.clone(), current);
-    let owner = workspace.clone();
+    let (owner, password_owner) = (workspace.clone(), workspace.clone());
     column()
         .grow(1)
         .min_height(0)
@@ -665,17 +727,32 @@ fn files_body(
             },
             move || {
                 let message = message.clone();
+                let (asking, wrong) = (message.clone(), message.clone());
+                let password_owner = password_owner.clone();
                 column()
                     .grow(1)
                     .align(Align::Center)
                     .justify(Justify::Center)
                     .padding(16)
+                    .gap(14)
                     .child(
                         text(move || notice(&message()).unwrap_or_default())
                             .name("files-notice")
                             .font_size(12)
                             .color(text_2())
                             .text_align(TextAlign::Center),
+                    )
+                    .child_when(
+                        move || matches!(asking().status, files::Status::PasswordNeeded { .. }),
+                        move || {
+                            let wrong = wrong.clone();
+                            password_form(&password_owner, move || {
+                                matches!(
+                                    wrong().status,
+                                    files::Status::PasswordNeeded { wrong: true }
+                                )
+                            })
+                        },
                     )
             },
         )
@@ -726,6 +803,7 @@ fn notice(state: &FilesState) -> Option<String> {
             Some("暂不支持文件页（需要 GNU 的 find，一般的 Linux 都有）。".to_string())
         }
         Status::Failed(reason) if state.path.is_none() => Some(format!("读取失败：{reason}")),
+        Status::PasswordNeeded { .. } => Some("这台服务器要输密码。".to_string()),
         _ if state.path.is_some() && state.visible().is_empty() => Some("空目录".to_string()),
         _ => None,
     }

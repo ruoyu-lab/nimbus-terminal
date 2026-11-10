@@ -16,11 +16,15 @@
   新版按和仿真层一样的规矩算字宽，带 emoji 组合的命令行光标不再错位
 - Windows 的安装程序换成自己的界面（`installer/`）：一页、正中一个「立即安装」，装的时候是一根细进度条，装完「打开 Nimbus」；
   升级、失败、卸载都是同一个样子，颜色跟着系统的深浅。「应用和功能」里的版本号写完整的（带 `-beta`）
+- 命令提示符的命令标记：起 cmd 时把 `PROMPT` 包一层（原来的提示符照旧），报提示符和当前目录；cmd 发不出「命令开始」，
+  在提示符上按回车时终端替它记。命令间跳转、复制上一条输出、命令历史、跑完通知都能用了（没有退出码）
+- Windows 上只能输密码的服务器也能用监控和文件页：面板上出一个密码框，输一次两页都能用（只记在内存里）。
+  面板的 `ssh`、`sftp` 要密码时起 Nimbus 自己来答（`SSH_ASKPASS`），密码用 DPAPI 加密着传，只回答问密码的提示，只试一次
 
 ### 修正
 
 - 用 Windows PowerShell 5.1 跑 `scripts\bundle-windows.ps1` 时读不了 `cargo metadata`（按本地编码读 UTF-8 的中文描述，JSON 坏了）
-
+- Windows 上打开卸载程序又关掉（没卸），`uninstall.exe` 也被删掉、之后卸载不了：界面框架更新到 `ec788ee`（修在 `22600fc`）
 - bash 的 shell 集成：`PROMPT_COMMAND` 里别的命令（比如 Ubuntu 的 systemd 加的那条）会被当成用户敲的命令，命令标记全乱
 - 在 Windows 上检出时 bash、zsh 的集成脚本变成 CRLF：加了 `.gitattributes`，一直用 LF
 

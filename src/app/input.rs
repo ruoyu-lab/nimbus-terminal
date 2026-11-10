@@ -77,9 +77,25 @@ impl Session {
         event.prevent_builtin(Builtin::EDIT);
         // 打字、按方向键都是「继续用 shell 了」：选区作废，回看的话回到最新的输出
         self.grid.set_selection(None);
+        // 命令提示符发不出「命令开始」的标记：在提示符上按回车时替它记下
+        if matches!(event.key, Key::Named(NamedKey::Enter))
+            && event.modifiers.is_empty()
+            && self.marks_commands_on_enter()
+        {
+            self.terminal.borrow_mut().start_command_on_enter();
+        }
         self.write(&bytes);
         self.snap_to_bottom();
         true
+    }
+
+    /// 这个终端的 shell 只发提示符的标记、发不出「命令开始」，要在按回车时替它记（本机的命令提示符，见 `shell::environment`）
+    fn marks_commands_on_enter(&self) -> bool {
+        cfg!(windows)
+            && self.local.get()
+            && self
+                .shell_program()
+                .is_some_and(|program| crate::pty::program_name(&program).as_deref() == Some("cmd"))
     }
 
     /// 把剪贴板里的字粘贴进去

@@ -117,26 +117,13 @@ impl Terminal {
                 }
             }
             "C" => {
-                let Some(input) = self
-                    .commands
-                    .last()
-                    .filter(|last| last.output_start.is_none())
-                    .and_then(|last| last.input)
-                else {
-                    return;
-                };
                 // 输入的最后一行：光标在行首说明回车已经把光标送到下一行了
                 let last_line = if column == 0 {
                     here.saturating_sub(1)
                 } else {
                     here
                 };
-                let typed = self.text_between(input.0, last_line.max(input.0), input.1);
-                if let Some(last) = self.commands.last_mut() {
-                    last.output_start = Some(here);
-                    last.text = typed;
-                    last.started = Some(Instant::now());
-                }
+                self.start_command(here, last_line);
             }
             "D" => {
                 let exit = parts.next().and_then(|code| code.parse::<i32>().ok());
@@ -350,6 +337,52 @@ impl Terminal {
         self.linux_directory.as_ref()
     }
 
+    /// 提示符上的这条命令开始执行：输出从 `output_start` 这一行起，敲的命令从输入开始（B）读到 `last_line`。
+    /// 不在提示符上（没有 B、已经开始了）什么也不做，返回 `false`
+    fn start_command(&mut self, output_start: u64, last_line: u64) -> bool {
+        let Some(input) = self
+            .commands
+            .last()
+            .filter(|last| last.output_start.is_none())
+            .and_then(|last| last.input)
+        else {
+            return false;
+        };
+        let typed = self.text_between(input.0, last_line.max(input.0), input.1);
+        if let Some(last) = self.commands.last_mut() {
+            last.output_start = Some(output_start);
+            last.text = typed;
+            last.started = Some(Instant::now());
+        }
+        true
+    }
+
+    /// 用户在提示符上按了回车：替发不出命令开始（C）的 shell（命令提示符）补上这个标记。
+    /// 光标还在输入的那一行上（回车还没回显），输出从下一行起。提示符后面没敲字（空着按回车）不算一条命令；
+    /// 副屏里、不在提示符上（命令已经在跑了，比如 `pause` 等着按键）什么也不做。补上了返回 `true`
+    pub fn start_command_on_enter(&mut self) -> bool {
+        if self.on_alternate {
+            return false;
+        }
+        let Some(input) = self
+            .commands
+            .last()
+            .filter(|last| last.output_start.is_none())
+            .and_then(|last| last.input)
+        else {
+            return false;
+        };
+        let here = self.cursor_line_id();
+        if self
+            .text_between(input.0, here.max(input.0), input.1)
+            .trim()
+            .is_empty()
+        {
+            return false;
+        }
+        self.start_command(here + 1, here)
+    }
+
     /// 有一条命令开始执行了（C）、还没结束（D）：WSL 里的程序 Windows 这边看不到，「前台有没有程序在跑」靠它
     pub fn command_running(&self) -> bool {
         self.commands
@@ -457,6 +490,25 @@ mod tests {
         term.feed(b"\r\n\x1b]133;C\x07");
         term.feed(output.as_bytes());
         term.feed(format!("\x1b]133;D;{exit}\x07").as_bytes());
+    }
+
+    /// 发不出「命令开始」的 shell（命令提示符）：在提示符上按回车时补上，输出从下一行起，没有退出码；
+    /// 空着按回车、已经开始了、副屏里都不算
+    #[test]
+    fn enter_starts_a_command_for_shells_without_c() {
+        let mut term = Terminal::new(40, 8);
+        term.feed(b"\x1b]133;A\x07C:\\> \x1b]133;B\x07");
+        assert!(!term.start_command_on_enter(), "什么也没敲");
+        term.feed(b"dir");
+        assert!(term.start_command_on_enter());
+        assert!(!term.start_command_on_enter(), "已经开始了");
+        term.feed(b"\r\nout1\r\nout2\r\n\x1b]133;D\x07\x1b]133;A\x07C:\\> \x1b]133;B\x07");
+        assert_eq!(term.commands()[0].text, "dir");
+        assert_eq!(term.commands()[0].exit, None);
+        assert_eq!(term.command_output(0).as_deref(), Some("out1\nout2"));
+        assert_eq!(term.take_finished().len(), 1, "跑完了，可以通知");
+        term.feed(b"\x1b[?1049hvim");
+        assert!(!term.start_command_on_enter(), "副屏里不算");
     }
 
     #[test]

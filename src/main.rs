@@ -19,6 +19,7 @@
 )]
 
 mod app;
+mod askpass;
 mod channel;
 mod chrome;
 mod display;
@@ -76,6 +77,10 @@ fn log_panics(store: &store::Store) {
 }
 
 fn main() {
+    // 面板的 ssh 要密码时起的是 Nimbus 自己（Windows）：回答完就退出，不开窗口
+    if let Some(code) = askpass::main_if_asked() {
+        std::process::exit(code);
+    }
     log_panics(&store::Store::system());
     // 上次窗口在哪块显示器、多大、在哪：显示器变了（拔掉、换分辨率、换缩放）就按现在的重新摆，不会开到屏幕外面
     let plan = display::Memory::load(&store::Store::system()).plan(

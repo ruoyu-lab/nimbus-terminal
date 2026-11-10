@@ -192,6 +192,81 @@ fn failures_are_explained_on_the_page() {
     );
 }
 
+/// 面板自己的连接要密码（Windows 上只能输密码的服务器）：监控页上是密码框；输错了写「密码不对」；
+/// 输了点「连接」：记下这台服务器的密码，框清空，马上再取一次（回到「正在读取」）。文件页同样有这个框
+#[test]
+fn a_password_server_asks_for_its_password_on_the_panel() {
+    let (harness, workspace, _fake) = blank_with_traffic_lights(Store::none());
+    workspace.polling.set(true); // 不真的去连：这里只测界面
+    workspace.new_tab_ssh("lab-pass");
+    harness.frame();
+    harness.advance(secs(1.0));
+    workspace.apply_reading(1, Err(Failure::PasswordNeeded { wrong: false }));
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel-password").is_some());
+    assert_eq!(
+        harness.text("panel-password-note").as_deref(),
+        Some("输一次，监控和文件页都能用。")
+    );
+    assert!(
+        harness
+            .text("monitor-status")
+            .is_some_and(|status| status.contains("要输密码"))
+    );
+    // 看样子：`NIMBUS_PANEL_SHOTS=文件 cargo test a_password_server_asks` 存一张监控页的图
+    if let Some(out) = std::env::var_os("NIMBUS_PANEL_SHOTS") {
+        harness
+            .screenshot()
+            .save_png(std::path::PathBuf::from(out))
+            .expect("存截图");
+    }
+    workspace.apply_reading(1, Err(Failure::PasswordNeeded { wrong: true }));
+    harness.frame();
+    assert_eq!(
+        harness.text("panel-password-note").as_deref(),
+        Some("密码不对，再输一次。")
+    );
+    click(&harness, "panel-password-field");
+    harness.type_text("s3cret");
+    click(&harness, "panel-password-connect");
+    harness.advance(secs(0.5));
+    assert_eq!(
+        crate::ssh::take_password("lab-pass").as_deref(),
+        Some("s3cret")
+    );
+    assert_eq!(
+        workspace.monitors.get_untracked()[&1].status,
+        Status::Waiting,
+        "马上再取一次"
+    );
+    assert!(harness.bounds("panel-password").is_none());
+    // 文件页：读目录时服务器要密码，也是这个框
+    let remote = Arc::new(FakeRemote::default());
+    remote.fail_with(Some(Failure::PasswordNeeded { wrong: false }));
+    *workspace.remote.borrow_mut() = remote;
+    workspace.panel_tab.set(crate::target::PanelKind::Files);
+    harness.frame();
+    harness.advance(secs(1.0));
+    settle(&harness, || {
+        workspace
+            .files
+            .get_untracked()
+            .get(&1)
+            .is_some_and(|state| {
+                state.status == crate::files::Status::PasswordNeeded { wrong: false }
+            })
+    });
+    harness.frame();
+    harness.advance(secs(1.0));
+    assert!(harness.bounds("panel-password").is_some(), "文件页上也有");
+    assert!(
+        harness
+            .text("files-notice")
+            .is_some_and(|notice| notice.contains("要输密码"))
+    );
+}
+
 /// 标签关了，它的监控数据跟着清掉；已经关了的标签迟到的读数丢掉
 #[test]
 fn closing_a_tab_drops_its_monitor_data() {

@@ -418,7 +418,7 @@ dependencies = [
 [[package]]
 name = "aureole"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "aureole-controls",
  "aureole-core",
@@ -429,12 +429,12 @@ dependencies = [
 [[package]]
 name = "aureole-animation"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 
 [[package]]
 name = "aureole-controls"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "aureole-core",
  "aureole-reactive",
@@ -443,7 +443,7 @@ dependencies = [
 [[package]]
 name = "aureole-core"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "accesskit",
  "aureole-animation",
@@ -474,7 +474,7 @@ dependencies = [
 [[package]]
 name = "aureole-installer"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "aureole",
  "flate2",
@@ -486,7 +486,7 @@ dependencies = [
 [[package]]
 name = "aureole-platform"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "arboard",
  "block2 0.6.2",
@@ -512,7 +512,7 @@ dependencies = [
 [[package]]
 name = "aureole-reactive"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "slotmap",
  "tracing",
@@ -521,7 +521,7 @@ dependencies = [
 [[package]]
 name = "aureole-render"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "aureole-scene",
  "bytemuck",
@@ -535,7 +535,7 @@ dependencies = [
 [[package]]
 name = "aureole-runtime"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -554,7 +554,7 @@ dependencies = [
 [[package]]
 name = "aureole-scene"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "bytemuck",
 ]
@@ -562,7 +562,7 @@ dependencies = [
 [[package]]
 name = "aureole-testing"
 version = "0.0.1-beta.2"
-source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=7f997ec#7f997ecc5d9e472e2b3479cfe504c730ce7882e2"
+source = "git+https://github.com/ruoyu-lab/aureole-framework.git?rev=ec788ee#ec788ee2824fad280375980c93a202b9dd9f1c09"
 dependencies = [
  "accesskit",
  "aureole-core",

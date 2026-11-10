@@ -31,7 +31,7 @@ enum Sharing {
     /// 不用再认证（密码、两步验证、host key 都只在终端里问一次）。macOS、Linux 用这个
     Multiplexed,
     /// 面板自己另开连接，只用密钥、`ssh-agent` 认证（`BatchMode`：要密码就直接失败，不会卡在没人看得见的提示上）。
-    /// Windows 自带的 OpenSSH 不支持连接复用，只能这样；要密码的服务器，面板上写明白（[`KEY_LOGIN_NEEDED`]）
+    /// Windows 自带的 OpenSSH 不支持连接复用，只能这样；收密码的服务器，面板上请用户输一次（见 [`use_password`]）
     Separate,
 }
 
@@ -42,9 +42,9 @@ const SHARING: Sharing = if cfg!(unix) {
     Sharing::Separate
 };
 
-/// 要密码（或者两步验证）的服务器：Windows 上面板写这句
-const KEY_LOGIN_NEEDED: &str = "需要密钥登录。Windows 上监控和文件页要另开一条连接，只能用密钥或 ssh-agent，\
-不能输密码；配好之后重新连接终端再试";
+/// 只收密钥（不收密码）的服务器、面板的连接用不了用户的密钥时：Windows 上面板写这句。收密码的服务器请用户在面板上输（[`use_password`]）
+const KEY_LOGIN_NEEDED: &str = "需要密钥登录。这台服务器不收密码，Windows 上监控和文件页要另开一条连接，\
+只能用密钥或 ssh-agent；配好之后重新连接终端再试";
 
 /// 主机名最长多少：`ssh` 自己的上限是 255
 const HOST_MAX: usize = 255;
@@ -259,9 +259,57 @@ fn channels() -> std::sync::MutexGuard<
 /// macOS、Linux 不用它：那边看复用套接字在不在
 #[derive(Default)]
 struct Link {
-    /// 面板的连接被服务器拒绝认证过（要密码、两步验证）：记下给人看的原因，终端重连之前不再试。
+    /// 面板的连接被服务器拒绝认证过：终端重连（或者用户在面板上输了密码）之前不再试。
     /// 监控每 2 秒取一次数，每次都去撞一次认证的话，服务器那边（fail2ban 之类）会当成有人在猜密码，把这台机器封掉
-    refused: Option<String>,
+    refused: Option<Refusal>,
+}
+
+/// 面板的连接为什么被拒
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// 服务器收密码（`password`、`keyboard-interactive`）：等用户在面板上输。`wrong` 是带着密码去的、密码不对
+    Password { host: String, wrong: bool },
+    /// 别的（只收密钥、两步验证）：给人看的原因
+    Other(String),
+}
+
+/// Windows 上面板的连接要密码时，用户在面板上输的密码，按主机记（见 [`use_password`]）。只在内存里，退出就没了
+static PASSWORDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn passwords() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
+    PASSWORDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 用户在面板上输了 `host` 的密码（Windows）：记下来；在等这台服务器密码的面板连接（这个标签的、别的标签连同一台的）
+/// 不再记着被拒，下次取数带着密码去连（见 [`askpass`](crate::askpass)）
+pub fn use_password(host: &str, control: &Path, password: &str) {
+    passwords().insert(host.to_string(), password.to_string());
+    for (key, link) in links().iter_mut() {
+        let waiting =
+            matches!(&link.refused, Some(Refusal::Password { host: asked, .. }) if asked == host);
+        if waiting || key == control {
+            link.refused = None;
+        }
+    }
+    channels().remove(control);
+}
+
+/// 测试用：记着的这台服务器的密码；拿出来以后就忘掉
+#[cfg(test)]
+pub fn take_password(host: &str) -> Option<String> {
+    passwords().remove(host)
+}
+
+/// 让面板的 `ssh`、`sftp` 要密码时用记下的这台服务器的密码（Windows）。没记过、准备不了返回 `false`，命令原样（只用密钥）
+fn with_password(command: &mut std::process::Command, host: &str) -> bool {
+    SHARING == Sharing::Separate
+        && passwords()
+            .get(host)
+            .cloned()
+            .is_some_and(|password| crate::askpass::configure(command, &password))
 }
 
 static LINKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Link>>> =
@@ -282,7 +330,7 @@ fn connected(control: &Path) -> bool {
 }
 
 /// 面板现在能不能去连这个标签的服务器：终端不连着是 `NotConnected`；
-/// Windows 上认证被拒过，终端重连之前一直是那次的原因，不再去连
+/// Windows 上认证被拒过，终端重连（或者输了密码）之前一直是那次的结果，不再去连
 fn usable(control: &Path) -> Result<(), crate::monitor::Failure> {
     use crate::monitor::Failure;
     match SHARING {
@@ -290,26 +338,47 @@ fn usable(control: &Path) -> Result<(), crate::monitor::Failure> {
         Sharing::Multiplexed => Err(Failure::NotConnected),
         Sharing::Separate => match links().get(control) {
             None => Err(Failure::NotConnected),
-            Some(Link {
-                refused: Some(reason),
-            }) => Err(Failure::Failed(reason.clone())),
             Some(Link { refused: None }) => Ok(()),
+            Some(Link {
+                refused: Some(refusal),
+            }) => Err(refusal_failure(refusal)),
         },
     }
 }
 
-/// Windows 上面板自己连不上时，`ssh` 在标准错误里说的话 → 给人看的原因，和是不是认证被拒
-/// （要密码、两步验证：这种终端重连之前不再试）。`ssh` 认证失败一定写成
-/// `user@host: Permission denied (publickey,password).`，括号里是服务器接受的方式
-fn separate_failure(stderr: &str) -> (String, bool) {
-    if stderr.contains("Permission denied (") {
-        return (KEY_LOGIN_NEEDED.to_string(), true);
+/// 被拒的记录 → 面板上显示什么
+fn refusal_failure(refusal: &Refusal) -> crate::monitor::Failure {
+    match refusal {
+        Refusal::Password { wrong, .. } => {
+            crate::monitor::Failure::PasswordNeeded { wrong: *wrong }
+        }
+        Refusal::Other(reason) => crate::monitor::Failure::Failed(reason.clone()),
+    }
+}
+
+/// Windows 上面板自己连不上时，`ssh` 在标准错误里说的话 → 怎么个被拒法（终端重连、输密码之前不再试），
+/// 或者别的原因（下次还试）。`with_password` 是这次带着记下的密码去的。
+/// `ssh` 认证失败一定写成 `user@host: Permission denied (publickey,password).`，括号里是服务器接受的方式：
+/// 有 `password`、`keyboard-interactive` 的请用户输密码，只有 `publickey` 的只能配密钥
+fn separate_failure(host: &str, stderr: &str, with_password: bool) -> Result<Refusal, String> {
+    if let Some(start) = stderr.find("Permission denied (") {
+        let methods = &stderr[start + "Permission denied (".len()..];
+        let methods = &methods[..methods.find(')').unwrap_or(methods.len())];
+        return Ok(
+            if methods.contains("password") || methods.contains("keyboard-interactive") {
+                Refusal::Password {
+                    host: host.to_string(),
+                    wrong: with_password,
+                }
+            } else {
+                Refusal::Other(KEY_LOGIN_NEEDED.to_string())
+            },
+        );
     }
     if stderr.contains("Host key verification failed") {
         // 第一次连这台服务器，终端里还在问要不要信它；或者 host key 变了。终端那边会说清楚，确认之后这里自己就好
-        return (
+        return Err(
             "服务器的身份（host key）还没确认，或者和记下的对不上：看终端里 ssh 怎么说".to_string(),
-            false,
         );
     }
     // 别的（连不上、域名解析不了）：`ssh` 最后一句就是原因，前面的多半是警告
@@ -318,28 +387,31 @@ fn separate_failure(stderr: &str) -> (String, bool) {
         .map(str::trim)
         .rfind(|line| !line.is_empty())
         .unwrap_or("起不了通道");
-    (reason.chars().take(160).collect(), false)
+    Err(reason.chars().take(160).collect())
 }
 
 /// 面板的常驻通道要起的命令：`ssh 选项… -- host sh`，远端的 `sh` 一直开着。
-/// 套接字的路径不是 UTF-8（交不给 `ssh`）时是 `None`
+/// Windows 上记着这台服务器的密码时带上它（见 [`with_password`]）。套接字的路径不是 UTF-8（交不给 `ssh`）时是 `None`
 fn channel_command(sharing: Sharing, host: &str, control: &Path) -> Option<std::process::Command> {
     let mut command = std::process::Command::new("ssh");
+    let password = with_password(&mut command, host);
     command
         .args(extra_arguments())
-        .args(Transport::options(sharing, control)?)
+        .args(Transport::options(sharing, control, password)?)
         .args(["--", host, "sh"]);
     Some(command)
 }
 
 /// 开一条通道。macOS、Linux 借复用连接，起不来时套接字不在就是没连上；
-/// Windows 另开一条，起不来时看 `ssh` 怎么说，认证被拒就记下来（终端重连之前不再试）
+/// Windows 另开一条，起不来时看 `ssh` 怎么说：认证被拒就记下来（终端重连、输密码之前不再试），
+/// 带着密码还被拒就是密码不对，忘掉它
 fn start_channel(
     host: &str,
     control: &Path,
 ) -> Result<crate::channel::Channel, crate::monitor::Failure> {
     use crate::monitor::Failure;
     let command = channel_command(SHARING, host, control).ok_or(Failure::NotConnected)?;
+    let had_password = SHARING == Sharing::Separate && passwords().contains_key(host);
     crate::channel::Channel::start(command).map_err(|failed| match SHARING {
         Sharing::Multiplexed => {
             if control.exists() {
@@ -348,13 +420,19 @@ fn start_channel(
                 Failure::NotConnected
             }
         }
-        Sharing::Separate => {
-            let (reason, refused) = separate_failure(&failed.stderr);
-            if refused && let Some(link) = links().get_mut(control) {
-                link.refused = Some(reason.clone());
+        Sharing::Separate => match separate_failure(host, &failed.stderr, had_password) {
+            Ok(refusal) => {
+                if had_password {
+                    passwords().remove(host);
+                }
+                let failure = refusal_failure(&refusal);
+                if let Some(link) = links().get_mut(control) {
+                    link.refused = Some(refusal);
+                }
+                failure
             }
-            Failure::Failed(reason)
-        }
+            Err(reason) => Failure::Failed(reason),
+        },
     })
 }
 
@@ -517,12 +595,20 @@ impl Transport {
         )
     }
 
-    /// 自己另开连接用的选项（Windows）：只用密钥、agent 认证（`BatchMode`：要密码就直接失败，不会卡在没人看得见的提示上）；
+    /// 自己另开连接用的选项（Windows）：平时只用密钥、agent 认证（`BatchMode`：要密码就直接失败，不会卡在没人看得见的提示上）；
+    /// `password`（用户在面板上输过密码，命令已经带上了取密码的程序）时允许问，但只问一次，密码不对马上失败，不反复撞。
     /// 10 秒连不上就放弃；保活和终端一样；不碰连接复用（`~/.ssh/config` 里写了 `ControlMaster` 也不管，
     /// Windows 的 OpenSSH 用不了它）；不要终端（配置里写了 `RequestTTY` 的话，远端的 `sh` 会回显，搅乱通道的协议）
-    fn separate_options() -> Vec<String> {
-        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
-            .into_iter()
+    fn separate_options(password: bool) -> Vec<String> {
+        let authentication: &[&str] = if password {
+            &["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1"]
+        } else {
+            &["-o", "BatchMode=yes"]
+        };
+        authentication
+            .iter()
+            .copied()
+            .chain(["-o", "ConnectTimeout=10"])
             .chain(KEEPALIVE)
             .chain([
                 "-o",
@@ -536,12 +622,12 @@ impl Transport {
             .collect()
     }
 
-    /// 面板的 `ssh`、`sftp` 连服务器用的选项：借复用连接，或者自己另开一条。
+    /// 面板的 `ssh`、`sftp` 连服务器用的选项：借复用连接，或者自己另开一条（`password` 见 [`Self::separate_options`]）。
     /// 套接字的路径不是 UTF-8（交不给 `ssh`）时是 `None`
-    fn options(sharing: Sharing, control: &Path) -> Option<Vec<String>> {
+    fn options(sharing: Sharing, control: &Path, password: bool) -> Option<Vec<String>> {
         match sharing {
             Sharing::Multiplexed => Self::mux_options(control),
-            Sharing::Separate => Some(Self::separate_options()),
+            Sharing::Separate => Some(Self::separate_options(password)),
         }
     }
 
@@ -596,14 +682,15 @@ impl Transport {
     }
 }
 
-/// 传输要起的命令：`sftp -q 选项… -b - -- host`，批处理从标准输入读。连接的选项和常驻通道一样。
-/// 套接字的路径不是 UTF-8（交不给 `sftp`）时是 `None`
+/// 传输要起的命令：`sftp -q 选项… -b - -- host`，批处理从标准输入读。连接的选项和常驻通道一样
+/// （Windows 上记着这台服务器的密码时也带上它）。套接字的路径不是 UTF-8（交不给 `sftp`）时是 `None`
 fn sftp_command(sharing: Sharing, host: &str, control: &Path) -> Option<std::process::Command> {
     let mut command = std::process::Command::new("sftp");
+    let password = with_password(&mut command, host);
     command
         .arg("-q")
         .args(extra_arguments())
-        .args(Transport::options(sharing, control)?)
+        .args(Transport::options(sharing, control, password)?)
         .args(["-b", "-", "--", host]);
     Some(command)
 }
@@ -887,7 +974,7 @@ mod tests {
             let command = sftp_command(sharing, "prod-hk", control).expect("UTF-8");
             assert_eq!(command.get_program(), "sftp");
             let arguments = arguments_of(&command);
-            let options = Transport::options(sharing, control).expect("UTF-8");
+            let options = Transport::options(sharing, control, false).expect("UTF-8");
             let mut expected = vec!["-q".to_string()];
             expected.extend(extra_arguments());
             expected.extend(options);
@@ -896,32 +983,129 @@ mod tests {
         }
     }
 
-    /// Windows 上面板自己连不上：认证被拒（要密码、两步验证）写成「需要密钥登录」，并且记成不再试；
-    /// host key 没确认写明白；别的就是 `ssh` 的最后一句话（前面多半是警告）
+    /// Windows 上面板自己连不上：服务器收密码的请用户输（带着密码还被拒就是密码不对），只收密钥的写「需要密钥登录」，
+    /// 这两种都记成不再试；host key 没确认写明白；别的就是 `ssh` 的最后一句话（前面多半是警告），下次还试
     #[test]
-    fn a_refused_separate_connection_asks_for_key_login() {
+    fn a_refused_separate_connection_asks_for_a_password_or_a_key() {
+        let failure =
+            |stderr: &str, with_password| separate_failure("prod-hk", stderr, with_password);
         // Windows 自带的 OpenSSH 9.5 连一台只能输密码的服务器，原样是这句
-        let (reason, refused) = separate_failure(
-            "deploy@prod-hk: Permission denied (publickey,keyboard-interactive).\r\n",
-        );
-        assert!(refused, "认证被拒，终端重连之前不再试");
-        assert_eq!(reason, KEY_LOGIN_NEEDED);
-        assert!(reason.starts_with("需要密钥登录"));
-        let (reason, refused) = separate_failure("Host key verification failed.\r\n");
-        assert!(!refused, "终端里确认了 host key 就好，要接着试");
-        assert!(reason.contains("host key"), "{reason}");
-        let (reason, refused) = separate_failure(
-            "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
-             ssh: Could not resolve hostname nimbus-test.invalid: No such host is known. \n",
-        );
-        assert!(!refused);
+        let password_server =
+            "deploy@prod-hk: Permission denied (publickey,keyboard-interactive).\r\n";
+        let asked = |wrong| {
+            Ok(Refusal::Password {
+                host: "prod-hk".to_string(),
+                wrong,
+            })
+        };
+        assert_eq!(failure(password_server, false), asked(false));
         assert_eq!(
-            reason,
-            "ssh: Could not resolve hostname nimbus-test.invalid: No such host is known."
+            failure(password_server, true),
+            asked(true),
+            "带着密码还被拒：密码不对"
         );
-        assert_eq!(separate_failure(""), ("起不了通道".to_string(), false));
+        assert_eq!(
+            failure("u@h: Permission denied (publickey,password).\n", false),
+            asked(false)
+        );
+        assert_eq!(
+            failure("u@h: Permission denied (publickey).\n", false),
+            Ok(Refusal::Other(KEY_LOGIN_NEEDED.to_string())),
+            "只收密钥"
+        );
+        assert!(KEY_LOGIN_NEEDED.starts_with("需要密钥登录"));
+        let host_key = failure("Host key verification failed.\r\n", false);
+        assert!(
+            host_key
+                .as_ref()
+                .is_err_and(|reason| reason.contains("host key")),
+            "终端里确认了 host key 就好，要接着试：{host_key:?}"
+        );
+        assert_eq!(
+            failure(
+                "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
+                 ssh: Could not resolve hostname nimbus-test.invalid: No such host is known. \n",
+                false
+            ),
+            Err(
+                "ssh: Could not resolve hostname nimbus-test.invalid: No such host is known."
+                    .to_string()
+            )
+        );
+        assert_eq!(failure("", false), Err("起不了通道".to_string()));
         // 远端文件没权限（`sftp` 里也叫 Permission denied，但没有括号里的认证方式）不算认证被拒
-        assert!(!separate_failure("remote open \"/root/x\": Permission denied\n").1);
+        assert!(failure("remote open \"/root/x\": Permission denied\n", false).is_err());
+    }
+
+    /// 带着密码去连（Windows）：允许问，但只问一次；没有密码时照旧只用密钥
+    #[test]
+    fn a_remembered_password_allows_exactly_one_prompt() {
+        let control = Path::new("nimbus-1-2");
+        let plain = Transport::options(Sharing::Separate, control, false).expect("有");
+        assert!(plain.contains(&"BatchMode=yes".to_string()));
+        assert!(
+            !plain
+                .iter()
+                .any(|option| option.starts_with("NumberOfPasswordPrompts"))
+        );
+        let with = Transport::options(Sharing::Separate, control, true).expect("有");
+        assert!(with.contains(&"BatchMode=no".to_string()));
+        assert!(with.contains(&"NumberOfPasswordPrompts=1".to_string()));
+        assert!(!with.contains(&"BatchMode=yes".to_string()));
+    }
+
+    /// 在面板上输了密码：记下来，在等这台服务器密码的连接（这个标签的、别的标签的）不再记着被拒；
+    /// 别的服务器、别的原因被拒的不动
+    #[cfg(windows)]
+    #[test]
+    fn using_a_password_clears_the_refusals_that_waited_for_it() {
+        let (mine, other_tab, other_host, key_only) = (
+            control_path(9_200_001).expect("有"),
+            control_path(9_200_002).expect("有"),
+            control_path(9_200_003).expect("有"),
+            control_path(9_200_004).expect("有"),
+        );
+        let waiting = |host: &str| Refusal::Password {
+            host: host.to_string(),
+            wrong: false,
+        };
+        for (key, refusal) in [
+            (&mine, waiting("lab-a")),
+            (&other_tab, waiting("lab-a")),
+            (&other_host, waiting("lab-b")),
+            (&key_only, Refusal::Other(KEY_LOGIN_NEEDED.into())),
+        ] {
+            assert!(control_ready(key));
+            links().get_mut(key).expect("登记了").refused = Some(refusal);
+        }
+        assert_eq!(
+            usable(&mine),
+            Err(crate::monitor::Failure::PasswordNeeded { wrong: false })
+        );
+        use_password("lab-a", &mine, "secret");
+        assert!(
+            passwords()
+                .get("lab-a")
+                .is_some_and(|password| password == "secret")
+        );
+        assert_eq!(usable(&mine), Ok(()));
+        assert_eq!(
+            usable(&other_tab),
+            Ok(()),
+            "同一台服务器的别的标签也不用再输"
+        );
+        assert!(usable(&other_host).is_err(), "别的服务器还等着自己的密码");
+        assert!(usable(&key_only).is_err());
+        let mut command = std::process::Command::new("ssh");
+        assert!(with_password(&mut command, "lab-a"), "带上了取密码的程序");
+        assert!(!with_password(
+            &mut std::process::Command::new("ssh"),
+            "lab-b"
+        ));
+        passwords().remove("lab-a");
+        for key in [&mine, &other_tab, &other_host, &key_only] {
+            shutdown("lab", key);
+        }
     }
 
     /// 复用目录：自己的、0700 才用；权限松了、是符号链接都不用（别人能借走已经认证的连接）
@@ -994,7 +1178,8 @@ mod tests {
         assert!(!key.exists(), "不在磁盘上建东西");
         assert_eq!(transport.check(), Ok(()));
         // 假装面板刚才去连被拒了：之后取数、传输都直接给这句，不再去连（去连的话会是域名解析的错）
-        links().get_mut(&key).expect("登记了").refused = Some(KEY_LOGIN_NEEDED.into());
+        links().get_mut(&key).expect("登记了").refused =
+            Some(Refusal::Other(KEY_LOGIN_NEEDED.into()));
         assert_eq!(
             poll("prod-hk", &key),
             Err(Failure::Failed(KEY_LOGIN_NEEDED.into()))
@@ -1046,8 +1231,9 @@ mod tests {
 
     /// Windows 实验室：`NIMBUS_SSH_PASSWORD_HOST=主机` 指向一台只能输密码登录的服务器（本机的 sshd 就行），
     /// 可选 `NIMBUS_SSH_KNOWN_HOSTS=文件` 是认得它的 known_hosts（设了就不碰 `~/.ssh/known_hosts`）。
-    /// 面板要很快说「需要密钥登录」，不卡在密码提示上；之后不再去连。没设就跳过。
-    /// 单独跑：`cargo test ssh::tests::a_password_only`（加的参数是全局的，和别的测试一起跑会互相看到）
+    /// 面板要很快说「要密码」，不卡在密码提示上；之后不再去连。再设了 `NIMBUS_SSH_PASSWORD=密码` 的话：
+    /// 用它连（Nimbus 测试程序自己当取密码的程序要编出来的应用，这里用 `NIMBUS_SSH_ASKPASS_EXE` 指过去），要取得到数据。
+    /// 没设就跳过。单独跑：`cargo test ssh::tests::a_password_only`（加的参数是全局的，和别的测试一起跑会互相看到）
     #[cfg(not(unix))]
     #[test]
     fn a_password_only_server_is_refused_quickly_and_not_retried() {
@@ -1066,23 +1252,40 @@ mod tests {
         let key = control_path(9_100_003).expect("有名字");
         assert!(control_ready(&key));
         let started = Instant::now();
-        assert_eq!(
-            poll(&host, &key),
-            Err(Failure::Failed(KEY_LOGIN_NEEDED.into()))
-        );
+        let asked = Err(Failure::PasswordNeeded { wrong: false });
+        assert_eq!(poll(&host, &key), asked);
         let first = started.elapsed();
         assert!(first < Duration::from_secs(15), "不能卡住：{first:?}");
         let started = Instant::now();
-        assert_eq!(
-            poll(&host, &key),
-            Err(Failure::Failed(KEY_LOGIN_NEEDED.into()))
-        );
+        assert_eq!(poll(&host, &key), asked);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "第二次不再去连：{:?}",
             started.elapsed()
         );
-        println!("LAB 要密码的服务器：第一次 {first:?} 就说了需要密钥登录");
+        println!("LAB 要密码的服务器：第一次 {first:?} 就说了要密码");
+        // 带着密码连：测试程序当不了取密码的程序（它的 main 是测试的），要指向编出来的 nimbus-terminal.exe
+        if let (Ok(password), Ok(exe)) = (
+            std::env::var("NIMBUS_SSH_PASSWORD"),
+            std::env::var("NIMBUS_SSH_ASKPASS_EXE"),
+        ) {
+            // 取密码的程序指向编出来的应用（见 `askpass::helper`）
+            // SAFETY: 测试里单独跑（见上面），没有别的线程同时读写环境变量
+            unsafe { std::env::set_var("NIMBUS_TEST_ASKPASS_EXE", &exe) };
+            use_password(&host, &key, &password);
+            let started = Instant::now();
+            let reading = poll(&host, &key);
+            assert!(reading.is_ok(), "带着密码要连得上：{reading:?}");
+            println!("LAB 带着密码 {:?} 取到了数据", started.elapsed());
+            use_password(&host, &key, "definitely-not-the-password");
+            channels().remove(&key);
+            assert_eq!(
+                poll(&host, &key),
+                Err(Failure::PasswordNeeded { wrong: true }),
+                "密码不对"
+            );
+            assert!(take_password(&host).is_none(), "错的密码忘掉了");
+        }
         shutdown(&host, &key);
         // 加的参数是全局的：用完拿掉，别的测试看到的命令行还是原样
         TEST_ARGUMENTS

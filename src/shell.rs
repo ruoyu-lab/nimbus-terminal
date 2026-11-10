@@ -3,6 +3,8 @@
 //! - zsh：靠 `ZDOTDIR` 垫片
 //! - Windows 上的 PowerShell（5.1 和 7）：`-NoExit -Command` 在配置文件之后加载脚本
 //! - WSL 里的 bash、zsh：`wsl.exe` 里的引导脚本加载（见 [`crate::wsl`]），bash 用 `--init-file`
+//! - Windows 上的命令提示符：没有脚本，把 `PROMPT` 环境变量包一层（见 [`cmd_prompt`]）。它发不出「命令开始」，
+//!   终端在提示符上按回车时替它记
 //!
 //! 别的 shell 手动 `source` 同目录下的脚本。加一个 shell：在 `assets/shell/` 放它的脚本，再在 [`integrate`] 里认出它、让它起来时加载。
 
@@ -47,8 +49,12 @@ pub fn integrate(directory: &Path, config: &mut pty::Config) {
         .extend(arguments(directory, &config.program));
 }
 
-/// 起 `program` 时要加的环境变量。只有 zsh 要（`ZDOTDIR` 垫片）；别的 shell 是空的
+/// 起 `program` 时要加的环境变量：zsh 的 `ZDOTDIR` 垫片，Windows 上命令提示符的 `PROMPT`；别的 shell 是空的
 pub fn environment(directory: &Path, program: &str) -> Vec<(String, String)> {
+    if cfg!(windows) && pty::program_name(program).as_deref() == Some("cmd") {
+        let prompt = cmd_prompt(std::env::var("PROMPT").ok().as_deref());
+        return vec![("PROMPT".to_string(), prompt)];
+    }
     let is_zsh = Path::new(program)
         .file_name()
         .is_some_and(|name| name == "zsh");
@@ -73,6 +79,20 @@ pub fn environment(directory: &Path, program: &str) -> Vec<(String, String)> {
         ));
     }
     environment
+}
+
+/// 命令提示符的提示符，在用户原来的（`original`，没设过是 cmd 默认的 `$P$G`）外面包上标记：
+/// 上一条命令结束（D，cmd 拿不到退出码，不带）、提示符开始（A）、当前目录（ConEmu 的 OSC 9;9），最后输入开始（B）。
+/// `$E` 是 ESC。用户自己已经写了 OSC 133 的（照 Windows Terminal 的文档配过）不再包
+pub fn cmd_prompt(original: Option<&str>) -> String {
+    let original = original
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .unwrap_or("$P$G");
+    if original.contains("133;") {
+        return original.to_string();
+    }
+    format!("$E]133;D$E\\$E]133;A$E\\$E]9;9;$P$E\\{original}$E]133;B$E\\")
 }
 
 /// 起 `program` 时要接在最后的参数。只有 Windows 上的 PowerShell 有：`-NoExit -Command 加载脚本`，
@@ -148,6 +168,27 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// 命令提示符的提示符：用户原来的外面包上 D、A、当前目录、B；没设过用 cmd 默认的；自己配过标记的原样
+    #[test]
+    fn the_cmd_prompt_wraps_the_users_own() {
+        let marks =
+            |inner: &str| format!("$E]133;D$E\\$E]133;A$E\\$E]9;9;$P$E\\{inner}$E]133;B$E\\");
+        assert_eq!(cmd_prompt(Some("$P$G")), marks("$P$G"));
+        assert_eq!(cmd_prompt(Some("[$T] $P$_$G")), marks("[$T] $P$_$G"));
+        assert_eq!(cmd_prompt(None), marks("$P$G"));
+        assert_eq!(cmd_prompt(Some("  ")), marks("$P$G"));
+        let configured = "$e]133;A$e\\$P$G$e]133;B$e\\";
+        assert_eq!(cmd_prompt(Some(configured)), configured);
+        let environment = environment(Path::new("unused"), r"C:\Windows\System32\cmd.exe");
+        if cfg!(windows) {
+            assert_eq!(environment.len(), 1);
+            assert_eq!(environment[0].0, "PROMPT");
+            assert!(environment[0].1.contains("133;B"));
+        } else {
+            assert!(environment.is_empty());
+        }
+    }
+
     /// bash、zsh 的脚本也在 Linux（WSL）里跑：不管在哪个平台检出、编译，都不能带回车（见 `.gitattributes`）
     #[test]
     fn posix_scripts_have_unix_line_endings() {
@@ -203,7 +244,18 @@ mod tests {
             let before = config.arguments.clone();
             integrate(directory, &mut config);
             assert_eq!(config.arguments, before, "{program}");
-            assert!(config.environment.is_empty(), "{program}");
+            // 命令提示符只多一个包了标记的 PROMPT（见 `cmd_prompt`）
+            let names: Vec<&str> = config
+                .environment
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let expected: &[&str] = if program.ends_with("cmd.exe") {
+                &["PROMPT"]
+            } else {
+                &[]
+            };
+            assert_eq!(names, expected, "{program}");
         }
     }
 

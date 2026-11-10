@@ -151,3 +151,28 @@ fn copies_the_last_commands_output() {
     let (plain, _alerts) = session_with_alerts();
     assert!(!plain.copy_last_output());
 }
+
+/// 命令提示符（Windows）：它发不出「命令开始」，在提示符上按回车时终端替它记下，上一条的输出复制得到；
+/// PowerShell 自己会发，不替它记
+#[cfg(windows)]
+#[test]
+fn enter_marks_commands_for_cmd_only() {
+    let (harness, recorder, _grid, _cell, session) =
+        mounted_with("", crate::settings::Settings::default());
+    session.set_local(true);
+    session.set_shell_program(Some(r"C:\Windows\system32\cmd.exe".into()));
+    session.feed_for_test("\x1b]133;A\x07C:\\> \x1b]133;B\x07dir");
+    harness.key_down_with(Key::Named(NamedKey::Enter), Modifiers::default());
+    assert_eq!(recorder.take(), "\r", "回车照常给 shell");
+    session.feed_for_test("\r\nout\r\n\x1b]133;D\x07\x1b]133;A\x07C:\\> \x1b]133;B\x07");
+    assert_eq!(session.last_command_output().as_deref(), Some("out"));
+    session.set_shell_program(Some("powershell.exe".into()));
+    session.feed_for_test("ls");
+    harness.key_down_with(Key::Named(NamedKey::Enter), Modifiers::default());
+    session.feed_for_test("\r\nfiles\r\n\x1b]133;D;0\x07\x1b]133;A\x07PS> \x1b]133;B\x07");
+    assert_eq!(
+        session.last_command_output().as_deref(),
+        Some("out"),
+        "PowerShell 没发 C 就不算一条命令"
+    );
+}
