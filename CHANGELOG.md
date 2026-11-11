@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+## [0.2.2-beta] - 2026-11-12
+
 ### 新增
 
 - Windows 上的 WSL：装了的发行版自动列在侧栏「目标」下的「WSL」里（和「容器」一样：点了就开、已有会话就切过去，右键再开一个，
@@ -25,6 +27,9 @@
 
 - 用 Windows PowerShell 5.1 跑 `scripts\bundle-windows.ps1` 时读不了 `cargo metadata`（按本地编码读 UTF-8 的中文描述，JSON 坏了）
 - Windows 上打开卸载程序又关掉（没卸），`uninstall.exe` 也被删掉、之后卸载不了：界面框架更新到 `ec788ee`（修在 `22600fc`）
+- 淡色文字（SGR 2）以前画得和普通文字一样亮：现在前景色向底色靠近一半，显示成灰色
+- 改窗口宽度时终端内容不重排：现在自动折行的内容会按新宽度重新折，拉宽后合回一行，历史记录一起重排，光标跟着字走
+  （全屏程序的备用屏不重排，由程序自己重画）
 - bash 的 shell 集成：`PROMPT_COMMAND` 里别的命令（比如 Ubuntu 的 systemd 加的那条）会被当成用户敲的命令，命令标记全乱
 - 在 Windows 上检出时 bash、zsh 的集成脚本变成 CRLF：加了 `.gitattributes`，一直用 LF
 

@@ -44,6 +44,9 @@ pub struct Attributes {
     /// OSC 8 超链接：`Terminal` 里链接表的编号（从 1 起），0 是没有链接。它不是 SGR 的一部分，
     /// 写字的时候才从终端当前的链接贴上去
     pub link: u32,
+    /// 这一格是被自动换行折下去的那一行的最后一格：下一行是它的续行。
+    /// 只贴在格子上（笔上永远是 false），改列数重排时靠它把折开的行接回去
+    pub wrapped: bool,
 }
 
 impl Attributes {
@@ -82,6 +85,7 @@ impl Cell {
             hidden: false,
             strikethrough: false,
             link: 0,
+            wrapped: false,
         },
     };
 
@@ -246,21 +250,33 @@ impl Screen {
         self.trim_history();
     }
 
+    /// 把第 `row` 行记成「折到下一行」
+    fn mark_wrapped(&mut self, row: usize) {
+        if let Some(cell) = self.lines.get_mut(row).and_then(|line| line.last_mut()) {
+            cell.attrs.wrapped = true;
+        }
+    }
+
     /// 改大小。行数变少时，光标下面的行先扔（光标要留在看得见的地方），再从顶上挤进历史；
-    /// 行数变多时先把历史里的行拉回来。列数的变化只做截断和补空，不重排
+    /// 行数变多时先把历史里的行拉回来。主屏换列数时把折行的内容按新宽度重排（见 `reflow`），
+    /// 副屏（全屏程序自己会重画）只做截断和补空
     pub fn resize(&mut self, columns: usize, rows: usize) {
         let (columns, rows) = (columns.max(1), rows.max(1));
         if columns == self.columns && rows == self.rows {
             return;
         }
         if columns != self.columns {
-            for line in &mut self.lines {
-                line.resize(columns, Cell::PLAIN);
-                // 切在宽字中间：左半留不住，补成空格
-                if let Some(cell) = line.last_mut()
-                    && cell.width == 2
-                {
-                    *cell = Cell::PLAIN;
+            if self.records_history {
+                self.reflow(columns);
+            } else {
+                for line in &mut self.lines {
+                    line.resize(columns, Cell::PLAIN);
+                    // 切在宽字中间：左半留不住，补成空格
+                    if let Some(cell) = line.last_mut()
+                        && cell.width == 2
+                    {
+                        *cell = Cell::PLAIN;
+                    }
                 }
             }
             self.columns = columns;
@@ -294,6 +310,121 @@ impl Screen {
         self.pending_wrap = false;
         self.clamp_cursor();
         self.repaint_everything();
+    }
+
+    /// 换列数时重排：历史加屏幕上的行先按「折行标记」接成逻辑行，再按新宽度重新折。
+    /// 光标跟着它所在的那个字走。重排完行数可能变多变少，多出来的顶部进历史，
+    /// 之后 `resize` 再按行数收尾。滚动区域、待换行状态之后会被重置，这里不管
+    fn reflow(&mut self, columns: usize) {
+        let old_columns = self.columns;
+        let history_len = self.history.len();
+        let dropped = self.archived_total.saturating_sub(history_len as u64);
+        let cursor_row = history_len + self.cursor.row;
+        let cursor_column = self.cursor.column;
+
+        // 1. 接成逻辑行。cursor 记在哪一条逻辑行的第几个格子
+        let mut logical: Vec<Line> = Vec::new();
+        let mut cursor_at = (0usize, 0usize);
+        let mut open = false;
+        let all = self.history.drain(..).chain(self.lines.drain(..));
+        for (index, mut row) in all.enumerate() {
+            if !open {
+                logical.push(Vec::new());
+            }
+            let current = logical.len() - 1;
+            if index == cursor_row {
+                cursor_at = (current, logical[current].len() + cursor_column);
+            }
+            let joined = row.len() == old_columns && row.last().is_some_and(|c| c.attrs.wrapped);
+            if let Some(last) = row.last_mut() {
+                last.attrs.wrapped = false;
+            }
+            if !joined {
+                // 一条逻辑行的最后一段：去掉行尾的默认空格
+                while row.last() == Some(&Cell::PLAIN) {
+                    row.pop();
+                }
+            }
+            logical[current].extend(row);
+            open = joined;
+        }
+        // 光标所在行至少要盖到光标那一格
+        if let Some(line) = logical.get_mut(cursor_at.0)
+            && line.len() <= cursor_at.1
+        {
+            line.resize(cursor_at.1 + 1, Cell::PLAIN);
+        }
+        // 光标后面屏幕底下的空行（逻辑行是空的）不用留
+        while logical.len() > cursor_at.0 + 1 && logical.last().is_some_and(|line| line.is_empty())
+        {
+            logical.pop();
+        }
+
+        // 2. 按新宽度折
+        let mut rewrapped: Vec<Line> = Vec::new();
+        let mut new_cursor = (0usize, 0usize);
+        for (number, line) in logical.iter().enumerate() {
+            let mut row: Line = Vec::with_capacity(columns);
+            for (offset, cell) in line.iter().enumerate() {
+                if number == cursor_at.0 && offset == cursor_at.1 {
+                    // 这一格放进去之后在哪，下面放的时候再定；先标记
+                    new_cursor = (usize::MAX, 0);
+                }
+                // 宽字的右半跟着头走：头放不下整个挪到下一行
+                if cell.width == 0 {
+                    row.push(*cell);
+                    continue;
+                }
+                let need = cell.width.max(1) as usize;
+                if row.len() + need > columns {
+                    if row.len() < columns {
+                        row.resize(columns, Cell::PLAIN);
+                    }
+                    if let Some(last) = row.last_mut() {
+                        last.attrs.wrapped = true;
+                    }
+                    rewrapped.push(std::mem::take(&mut row));
+                }
+                if new_cursor.0 == usize::MAX {
+                    new_cursor = (rewrapped.len(), row.len());
+                }
+                row.push(*cell);
+            }
+            row.resize(columns, Cell::PLAIN);
+            rewrapped.push(row);
+            if number == cursor_at.0 && new_cursor.0 == usize::MAX {
+                new_cursor = (rewrapped.len() - 1, 0);
+            }
+        }
+        if rewrapped.is_empty() {
+            rewrapped.push(vec![Cell::PLAIN; columns]);
+        }
+        // 3. 切回历史和屏幕：屏幕按现有行数取最底下那段，光标一定在里面
+        let screen_rows = self.rows;
+        let top = rewrapped.len().saturating_sub(screen_rows);
+        let screen: Vec<Line> = rewrapped.split_off(top);
+        self.history.clear();
+        for mut line in rewrapped {
+            // 历史里的行和屏幕上不同：行尾去空格，但折行的行最后一格带标记，不会被去掉
+            while line.last() == Some(&Cell::PLAIN) {
+                line.pop();
+            }
+            self.history.push_back(line);
+        }
+        while self.history.len() > self.history_limit {
+            self.history.pop_front();
+        }
+        self.lines = screen.into();
+        while self.lines.len() < screen_rows {
+            self.lines.push_back(vec![Cell::PLAIN; columns]);
+        }
+        self.cursor = Point::new(
+            new_cursor.0.saturating_sub(top),
+            new_cursor.1.min(columns - 1),
+        );
+        // 「挤掉了多少行」保持不变，回看和标记按它换算
+        self.archived_total = dropped + self.history.len() as u64;
+        self.saved = None;
     }
 
     fn clamp_cursor(&mut self) {
@@ -359,6 +490,7 @@ impl Screen {
     pub fn put(&mut self, ch: char, width: u8, attrs: Attributes, wrap: bool) {
         let width = width.clamp(1, 2) as usize;
         if wrap && self.pending_wrap {
+            self.mark_wrapped(self.cursor.row);
             self.line_feed(1);
             self.cursor.column = 0;
         }

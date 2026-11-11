@@ -478,3 +478,56 @@ fn a_transcript_replays_into_an_identical_screen() {
     term.feed(b"\x1b[?1049h\x1b[Hvim here");
     assert!(!term.transcript(100).contains("vim here"));
 }
+
+#[test]
+fn narrowing_wraps_a_long_line_and_widening_joins_it_back() {
+    let mut term = Terminal::new(20, 6);
+    term.feed(b"$ npm run build-all");
+    term.resize(10, 6);
+    assert_eq!(text(&term, 0), "$ npm run");
+    assert_eq!(text(&term, 1), "build-all");
+    assert_eq!(term.screen().cursor, Point::new(1, 9));
+    term.resize(30, 6);
+    assert_eq!(text(&term, 0), "$ npm run build-all");
+    assert_eq!(text(&term, 1), "");
+    assert_eq!(term.screen().cursor, Point::new(0, 19));
+}
+
+#[test]
+fn reflow_does_not_join_lines_that_ended_with_a_newline() {
+    let mut term = Terminal::new(10, 6);
+    term.feed(b"abc\r\ndef");
+    term.resize(20, 6);
+    assert_eq!(text(&term, 0), "abc");
+    assert_eq!(text(&term, 1), "def");
+}
+
+#[test]
+fn reflow_carries_history_along() {
+    let mut term = Terminal::new(10, 3);
+    term.feed(b"0123456789abc\r\nx\r\ny\r\nz");
+    term.resize(20, 3);
+    let screen = term.screen();
+    let mut all: Vec<String> = (0..screen.history_len())
+        .rev()
+        .map(|i| {
+            screen
+                .history_line(i)
+                .unwrap()
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    all.extend((0..3).map(|row| screen.line_text(row)));
+    assert_eq!(all, ["0123456789abc", "x", "y", "z"]);
+}
+
+#[test]
+fn dim_attribute_is_kept_on_cells() {
+    let mut term = Terminal::new(20, 2);
+    term.feed(b"\x1b[2mgrey\x1b[0m");
+    assert!(term.screen().lines[0][0].attrs.dim);
+}

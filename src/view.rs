@@ -380,14 +380,32 @@ fn style(colors: &Colors, attrs: Attributes) -> CharCellStyle {
         .underline(attrs.underline)
         .strikethrough(attrs.strikethrough)
         .inverse(attrs.inverse);
-    if let Some(color) = attrs.foreground {
-        style = style.foreground(color_of(colors, color, attrs.bold));
+    let background = attrs.background.map(|color| color_of(colors, color, false));
+    let foreground = attrs
+        .foreground
+        .map(|color| color_of(colors, color, attrs.bold));
+    if attrs.dim {
+        // SGR 2（淡色）：前景往底色靠一半。没写前景色就拿默认字色来淡
+        let ink = foreground.unwrap_or(colors.foreground);
+        style = style.foreground(mix(ink, background.unwrap_or(colors.background), 0.5));
+    } else if let Some(color) = foreground {
+        style = style.foreground(color);
     }
-    if let Some(color) = attrs.background {
+    if let Some(color) = background {
         // 背景色不吃「粗体变亮色」那条规则
-        style = style.background(color_of(colors, color, false));
+        style = style.background(color);
     }
     style
+}
+
+/// `from` 往 `to` 靠 `amount`（0..1）
+fn mix(from: Color, to: Color, amount: f32) -> Color {
+    let f = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
+    Color::rgb(
+        f(from.0[0], to.0[0]),
+        f(from.0[1], to.0[1]),
+        f(from.0[2], to.0[2]),
+    )
 }
 
 fn color_of(colors: &Colors, color: ColorSpec, bold: bool) -> Color {
