@@ -381,6 +381,18 @@ pub fn download(
     }
 }
 
+/// 删容器里的 `remote`（绝对路径）。文件夹连里面的东西一起删
+pub fn delete(container: &str, remote: &str, directory: bool) -> Result<(), Failure> {
+    let script = files::delete_script(remote, directory)
+        .ok_or_else(|| Failure::Failed("这个路径不能删".into()))?;
+    let ran = run_in_container(container, &script, Duration::from_secs(60))?;
+    if ran.success {
+        Ok(())
+    } else {
+        Err(Failure::Failed(first_reason(&ran.stderr)))
+    }
+}
+
 /// 把本地的文件或目录上传到容器里的目录 `remote_dir`（绝对路径）里，名字不变
 pub fn upload(container: &str, local: &Path, remote_dir: &str) -> Result<(), Failure> {
     let name = local

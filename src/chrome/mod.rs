@@ -110,6 +110,8 @@ fn frame(workspace: Rc<Workspace>) -> Element {
         workspace.clone(),
         workspace.clone(),
     );
+    let delete_owner = workspace.clone();
+    let pending_delete = workspace.pending_delete;
     let paste_owner = workspace.clone();
     let pending_paste = workspace.pending_paste;
     let connect_owner = workspace.clone();
@@ -213,6 +215,15 @@ fn frame(workspace: Rc<Workspace>) -> Element {
                 .backdrop(scrim())
                 .backdrop_transition(Tween::new(ms(160)).ease_out())
                 .on_dismiss(move |_| pending_paste.set(None)),
+        )
+        .overlay(
+            move || pending_delete.get().is_some(),
+            Overlay::new(move || menu::delete_dialog(delete_owner.clone()))
+                .centered(true)
+                .modal(true)
+                .backdrop(scrim())
+                .backdrop_transition(Tween::new(ms(160)).ease_out())
+                .on_dismiss(move |_| pending_delete.set(None)),
         )
         .overlay(
             move || closing.get().is_some(),

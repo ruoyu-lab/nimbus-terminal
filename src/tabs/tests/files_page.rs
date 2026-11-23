@@ -771,3 +771,75 @@ fn a_long_file_name_does_not_cover_the_size_and_download_button() {
     assert!(name.x + name.width <= size.x + 0.5, "名字盖到大小");
     assert!(size.x + size.width <= button.x + 0.5, "大小盖到下载按钮");
 }
+
+/// 右键「删除」先弹确认框：取消不删；点「删除」才在远端删，然后重新读目录
+#[test]
+fn deleting_asks_first_and_only_deletes_on_confirm() {
+    let (harness, workspace, remote) = mounted_files();
+    settle(&harness, || {
+        files_of(&workspace).status == crate::files::Status::Ready
+    });
+    harness.advance(secs(1.0));
+    right_click_named(&harness, "file-readme.txt");
+    click_menu(&harness, "menu-file-delete-readme.txt");
+    assert!(harness.window_bounds("delete-dialog").is_some(), "先问");
+    click_menu(&harness, "delete-cancel");
+    assert!(harness.window_bounds("delete-dialog").is_none());
+    assert!(
+        remote
+            .calls()
+            .iter()
+            .all(|call| !call.starts_with("delete")),
+        "取消了就没有删"
+    );
+    right_click_named(&harness, "file-src");
+    click_menu(&harness, "menu-file-delete-src");
+    click_menu(&harness, "delete-confirm");
+    settle(&harness, || {
+        remote.calls().iter().any(|call| call.starts_with("delete"))
+    });
+    assert!(
+        remote
+            .calls()
+            .contains(&"delete /home/deploy/src dir=true".to_string()),
+        "文件夹按文件夹删：{:?}",
+        remote.calls()
+    );
+    settle(&harness, || {
+        remote
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("list"))
+            .count()
+            >= 2
+    });
+}
+
+/// 删失败了（没权限之类）：不装作成功，传输记录里写原因
+#[test]
+fn a_failed_delete_is_reported() {
+    let (harness, workspace, remote) = mounted_files();
+    settle(&harness, || {
+        files_of(&workspace).status == crate::files::Status::Ready
+    });
+    harness.advance(secs(1.0));
+    right_click_named(&harness, "file-readme.txt");
+    click_menu(&harness, "menu-file-delete-readme.txt");
+    remote.fail_with(Some(Failure::Failed("rm: Permission denied".into())));
+    click_menu(&harness, "delete-confirm");
+    settle(&harness, || {
+        files_of(&workspace)
+            .transfers
+            .iter()
+            .any(|transfer| matches!(&transfer.state, TransferState::Failed(_)))
+    });
+    let failed = files_of(&workspace)
+        .transfers
+        .iter()
+        .find_map(|transfer| match &transfer.state {
+            TransferState::Failed(reason) => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("有失败记录");
+    assert!(failed.contains("Permission denied"), "{failed}");
+}

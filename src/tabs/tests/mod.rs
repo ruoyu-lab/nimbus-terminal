@@ -425,6 +425,24 @@ impl Remote for FakeRemote {
             .push(format!("upload {} -> {remote_dir}", local.display()));
         Ok(())
     }
+
+    fn delete(
+        &self,
+        target: &Target,
+        _: Option<&Path>,
+        remote: &str,
+        directory: bool,
+    ) -> Result<(), Failure> {
+        self.targets.lock().expect("锁").push(target.clone());
+        self.log
+            .lock()
+            .expect("锁")
+            .push(format!("delete {remote} dir={directory}"));
+        if let Some(failure) = self.failure.lock().expect("锁").clone() {
+            return Err(failure);
+        }
+        Ok(())
+    }
 }
 
 /// 挂一个服务器标签、文件页，并把远端换成假的。返回的 `harness` 已经开着文件页

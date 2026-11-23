@@ -756,6 +756,23 @@ pub fn download_via(
     }
 }
 
+/// 删远端的 `remote`（绝对路径）。文件夹连里面的东西一起删，不进回收站
+pub fn delete_via(
+    transport: &Transport,
+    remote: &str,
+    directory: bool,
+) -> Result<(), crate::monitor::Failure> {
+    use crate::monitor::Failure;
+    let script = crate::files::delete_script(remote, directory)
+        .ok_or_else(|| Failure::Failed("这个路径不能删".into()))?;
+    let ran = transport.script(&script, std::time::Duration::from_secs(60))?;
+    if ran.success {
+        Ok(())
+    } else {
+        Err(Failure::Failed(sftp_reason(&ran)))
+    }
+}
+
 /// 把本地的文件或目录上传到远端目录 `remote_dir`（绝对路径）里，名字不变
 pub fn upload_via(
     transport: &Transport,
@@ -1539,6 +1556,38 @@ mod sftp {
         );
         for directory in [remote, local, target] {
             std::fs::remove_dir_all(directory).ok();
+        }
+    }
+
+    /// 删除：怪名字、通配符、以 `-` 开头的名字只删它自己，文件夹连里面的一起删，不合规的路径不动手
+    #[test]
+    fn delete_removes_exactly_the_named_entry() {
+        let directory = scratch("delete");
+        let path = |name: &str| directory.join(name);
+        let text = |name: &str| path(name).to_str().expect("UTF-8").to_string();
+        for name in ["a \"q\" b.txt", "star*.txt", "-rf", "keep.txt", "starX.txt"] {
+            std::fs::write(path(name), name).expect("写得了");
+        }
+        std::fs::create_dir_all(path("dir/inner")).expect("建得了");
+        std::fs::write(path("dir/inner/f"), "x").expect("写得了");
+        for name in ["a \"q\" b.txt", "star*.txt", "-rf"] {
+            delete_via(&Transport::Local, &text(name), false)
+                .unwrap_or_else(|error| panic!("{name}：{error:?}"));
+            assert!(!path(name).exists(), "{name} 该没了");
+        }
+        assert!(path("starX.txt").exists(), "通配符没有展开");
+        assert!(path("keep.txt").exists());
+        delete_via(&Transport::Local, &text("dir"), true).expect("删得掉");
+        assert!(!path("dir").exists());
+        // 链接只删链接，不动指向的东西
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(path("keep.txt"), path("link")).expect("建得了链接");
+            delete_via(&Transport::Local, &text("link"), false).expect("删得掉");
+            assert!(!path("link").exists() && path("keep.txt").exists());
+        }
+        for bad in ["relative/x", "/", "/tmp/..", "/tmp/a\nb"] {
+            assert!(delete_via(&Transport::Local, bad, true).is_err(), "{bad:?}");
         }
     }
 

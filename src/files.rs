@@ -55,6 +55,17 @@ pub fn list_script(dir: Option<&str>) -> String {
     )
 }
 
+/// 删一个条目的脚本。`path` 必须是绝对路径、名字合规、不是根目录：`rm` 不跟着符号链接走（删的是链接本身），
+/// 文件夹整个递归删。不合规的返回 `None`
+pub fn delete_script(path: &str, directory: bool) -> Option<String> {
+    let name = path.rsplit('/').next().unwrap_or_default();
+    if !path.starts_with('/') || !is_safe_name(name) {
+        return None;
+    }
+    let flags = if directory { "-rf" } else { "-f" };
+    Some(format!("rm {flags} -- {}\n", quote_sh(path)))
+}
+
 /// 解析列目录脚本的输出。没有 `@@` 开头的记录算 [`Failure::Failed`]
 pub fn parse_listing(output: &[u8]) -> Result<Listing, Failure> {
     let mut records = output

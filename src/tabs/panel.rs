@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// 等用户确认的一次删除
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingDelete {
+    pub tab: u64,
+    pub name: String,
+    pub directory: bool,
+}
+
 /// 失败的原因，写给人看
 pub(super) fn failure_text(failure: monitor::Failure) -> String {
     match failure {
@@ -320,6 +328,73 @@ impl Workspace {
                     Err(failure) => TransferState::Failed(failure_text(failure)),
                 };
                 workspace.update_files(tab, |files| files.finish_transfer(id, state));
+            })
+        });
+    }
+
+    /// 右键「删除」：先记下是哪一项，弹确认框；点了「删除」才真的删（见 [`Self::confirm_delete`]）
+    pub fn files_request_delete(&self, name: &str) {
+        let Some((tab, ..)) = self.monitor_plan() else {
+            return;
+        };
+        let Some(entry) = self.files.get_untracked().get(&tab).and_then(|state| {
+            state
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .cloned()
+        }) else {
+            return;
+        };
+        self.pending_delete.set(Some(PendingDelete {
+            tab,
+            name: entry.name,
+            directory: entry.kind == files::Kind::Dir,
+        }));
+    }
+
+    /// 确认框里点了「删除」：在远端删掉，成功了重新读目录；失败记一条在传输记录里
+    pub fn confirm_delete(self: &Rc<Self>) {
+        let Some(pending) = self.pending_delete.get_untracked() else {
+            return;
+        };
+        self.pending_delete.set(None);
+        let Some((tab, target, control)) = self.monitor_plan() else {
+            return;
+        };
+        // 确认框开着的时候切了标签或者换了目录：不删（删的该是问的那一项）
+        let Some((_, path)) = self.files_path() else {
+            return;
+        };
+        if tab != pending.tab {
+            return;
+        }
+        let id = self.next_transfer_id();
+        let name = pending.name;
+        if !files::is_safe_name(&name) {
+            self.update_files(tab, |state| {
+                state.fail_transfer(id, &name, false, "这个文件名不能删（带控制字符）")
+            });
+            return;
+        }
+        let (this, remote) = (Rc::downgrade(self), self.remote.borrow().clone());
+        let remote_path = files::join(&path, &name);
+        let directory = pending.directory;
+        aureole::detached(|| {
+            aureole::spawn_blocking(move || {
+                remote.delete(&target, control.as_deref(), &remote_path, directory)
+            })
+            .then(move |result| {
+                let Some(workspace) = this.upgrade() else {
+                    return;
+                };
+                if let Err(failure) = result {
+                    let reason = format!("删除失败：{}", failure_text(failure));
+                    workspace
+                        .update_files(tab, |state| state.fail_transfer(id, &name, false, &reason));
+                }
+                // 成功失败都重新读一次：失败时可能已经删了一半
+                workspace.files_refresh();
             })
         });
     }

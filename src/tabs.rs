@@ -38,6 +38,7 @@ mod shortcuts;
 
 use alerts::PendingPaste;
 use history::HISTORY_FILE;
+pub use panel::PendingDelete;
 use panes::{PaneSpec, Restoring};
 pub use persistence::save_on_exit;
 use persistence::{STATE_FILE, Saved, SavedPane, SavedTab, keep_for_exit, output_file};
@@ -268,6 +269,8 @@ pub struct Workspace {
     pub closing: Signal<Option<u64>>,
     /// 要不要把这段多行文字粘贴进去（程序没开括号粘贴时先问）：哪个标签、哪个终端、什么文字
     pub pending_paste: Signal<Option<PendingPaste>>,
+    /// 文件页上要不要删这一项（右键「删除」后先问）：哪个标签、名字、是不是文件夹
+    pub pending_delete: Signal<Option<PendingDelete>>,
     /// 跑过的命令（有命令标记才有），从老到新，去重，存在配置目录里
     history: RefCell<Vec<String>>,
     /// 确认关闭框是只关这个标签里的某个终端（拆分出来的）时，是哪个；`None` 是关整个标签
@@ -385,6 +388,7 @@ impl Workspace {
             renaming: signal(None),
             closing: signal(None),
             pending_paste: signal(None),
+            pending_delete: signal(None),
             history: RefCell::new(store.load(HISTORY_FILE)),
             closing_pane: Cell::new(None),
             custom_titles: RefCell::new(HashMap::new()),

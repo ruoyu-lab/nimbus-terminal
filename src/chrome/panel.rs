@@ -877,7 +877,7 @@ fn entry_row(workspace: &Rc<Workspace>, entry: Entry) -> Element {
 }
 
 /// 一行的右键菜单：文件夹可以「在这里新建终端」（进那个目录），文件是在它所在的目录；
-/// 能下载的有「下载」；还有「复制路径」
+/// 能下载的有「下载」；还有「复制路径」「删除」
 fn entry_actions(workspace: &Rc<Workspace>, entry: &Entry) -> Vec<Action> {
     let name = entry.name.clone();
     let terminal = Rc::clone(workspace);
@@ -908,6 +908,13 @@ fn entry_actions(workspace: &Rc<Workspace>, entry: &Entry) -> Vec<Action> {
                 aureole::clipboard::write_text(path);
             }
         }),
+    });
+    // 删除：等菜单卸掉再弹确认框（框开在菜单的作用域上，菜单一关就跟着没了）
+    let (delete, delete_name) = (Rc::clone(workspace), name.clone());
+    actions.push(Action {
+        id: format!("file-delete-{name}"),
+        label: "删除…".to_string(),
+        run: later(move || delete.files_request_delete(&delete_name)),
     });
     actions
 }

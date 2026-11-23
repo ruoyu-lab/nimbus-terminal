@@ -622,6 +622,62 @@ pub(super) fn close_dialog(workspace: Rc<Workspace>) -> Element {
         ))
 }
 
+/// 删远端的文件或文件夹之前问一下。不进回收站，所以写明白；点「删除」才删，Esc、点外面、点「取消」都不删
+pub(super) fn delete_dialog(workspace: Rc<Workspace>) -> Element {
+    let Some(pending) = workspace.pending_delete.get_untracked() else {
+        return column();
+    };
+    let (confirm, cancel) = (workspace.clone(), workspace.clone());
+    let button = |label: &'static str, id: &'static str| {
+        row()
+            .name(id)
+            .style(&dialog_button_style())
+            .align(Align::Center)
+            .justify(Justify::Center)
+            .accessibility_role(Role::Button)
+            .focusable(true)
+            .focus_ring(FocusRing::NONE)
+            .child(text(label))
+    };
+    let note = if pending.directory {
+        "文件夹和里面的所有东西都会从服务器上删掉，不能恢复。"
+    } else {
+        "会从服务器上直接删掉，不能恢复。"
+    };
+    pop(column()
+        .name("delete-dialog")
+        .width(380)
+        .radius(10)
+        .background(card_bg())
+        .shadow(popup_shadow())
+        .padding(16)
+        .gap(6)
+        .child(
+            text(format!("删除「{}」？", pending.name))
+                .font_size(15)
+                .max_lines(2),
+        )
+        .child(text(note).font_size(12).color(text_3()))
+        .child(
+            row()
+                .justify(Justify::End)
+                .gap(8)
+                .margin_top(10)
+                .child(button("取消", "delete-cancel").on_click(move || {
+                    cancel.pending_delete.set(None);
+                }))
+                .child(
+                    button("删除", "delete-confirm")
+                        .style(
+                            &dialog_button_style()
+                                .background(Color::hex(0xd1383d))
+                                .color(Color::WHITE),
+                        )
+                        .on_click(move || confirm.confirm_delete()),
+                ),
+        ))
+}
+
 /// 粘贴多行文字之前问一下：给出前几行、一共几行。回车或点「粘贴」才粘贴，Esc、点外面、点「取消」都不粘贴
 pub(super) fn paste_dialog(workspace: Rc<Workspace>) -> Element {
     let Some(pending) = workspace.pending_paste.get_untracked() else {

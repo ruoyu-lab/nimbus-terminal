@@ -120,6 +120,13 @@ pub trait Remote: Send + Sync {
         local: &Path,
         remote_dir: &str,
     ) -> Result<(), Failure>;
+    fn delete(
+        &self,
+        target: &Target,
+        control: Option<&Path>,
+        remote: &str,
+        directory: bool,
+    ) -> Result<(), Failure>;
 }
 
 /// 真的远端：SSH 走这个标签的连接（终端没连着就是没连上），Docker 用本机的 `docker` 命令
@@ -179,6 +186,22 @@ impl Remote for OverRemote {
                 crate::ssh::upload_via(&Self::ssh(host, control)?, local, remote_dir)
             }
             Target::Docker { container } => crate::docker::upload(container, local, remote_dir),
+            Target::Local => Err(Failure::NotConnected),
+        }
+    }
+
+    fn delete(
+        &self,
+        target: &Target,
+        control: Option<&Path>,
+        remote: &str,
+        directory: bool,
+    ) -> Result<(), Failure> {
+        match target {
+            Target::Ssh { host } => {
+                crate::ssh::delete_via(&Self::ssh(host, control)?, remote, directory)
+            }
+            Target::Docker { container } => crate::docker::delete(container, remote, directory),
             Target::Local => Err(Failure::NotConnected),
         }
     }
