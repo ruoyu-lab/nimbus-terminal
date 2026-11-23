@@ -809,6 +809,19 @@ fn notice(state: &FilesState) -> Option<String> {
     }
 }
 
+/// 一个字之间都放一个零宽空格：框架的文字对没有空格的长词不断行，也就不会截断加省略号，
+/// 超出的部分会直接画到旁边的大小和下载按钮上。有了断点，`max_lines(1)` 才能把放不下的截成「…」
+fn breakable(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() * 4);
+    for (index, ch) in name.chars().enumerate() {
+        if index > 0 {
+            out.push('\u{200b}');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn entry_row(workspace: &Rc<Workspace>, entry: Entry) -> Element {
     let (open, download, dragged) = (workspace.clone(), workspace.clone(), workspace.clone());
     let (name, download_name, drag_name) =
@@ -824,7 +837,8 @@ fn entry_row(workspace: &Rc<Workspace>, entry: Entry) -> Element {
         .draggable(move || RemotePath(dragged.files_full_path(&drag_name).unwrap_or_default()))
         .child(icon(glyph, 15.0).color(text_2()).shrink(0))
         .child(
-            text(entry.name.clone())
+            text(breakable(&entry.name))
+                .name(format!("file-name-{}", entry.name))
                 .font_size(12)
                 .grow(1)
                 .min_width(0)
@@ -833,6 +847,7 @@ fn entry_row(workspace: &Rc<Workspace>, entry: Entry) -> Element {
     if entry.kind == Kind::File {
         line = line.child(
             text(files::size(entry.size))
+                .name(format!("file-size-{}", entry.name))
                 .font_size(11)
                 .color(text_3())
                 .tabular_numbers(true)

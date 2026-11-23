@@ -747,3 +747,27 @@ fn revisiting_a_directory_shows_the_cached_listing_while_it_refreshes() {
     // 用 ~ 回主目录也走缓存（读过一次 ~ 就知道主目录是哪个）
     assert_eq!(files_of(&workspace).home.as_deref(), Some("/home/deploy"));
 }
+
+/// 名字很长、面板很窄时，名字要截断（省略号），不能盖到大小和下载按钮上
+#[test]
+fn a_long_file_name_does_not_cover_the_size_and_download_button() {
+    let (harness, workspace, remote) = mounted_files();
+    let long = "README.md.bak-20261123-151140";
+    *remote.home_override.lock().expect("锁") = Some(vec![
+        FakeRemote::entry(long, Kind::File, 4096),
+        FakeRemote::entry("a.txt", Kind::File, 10),
+    ]);
+    workspace.panel_width.set(220.0);
+    workspace.files_refresh();
+    settle(&harness, || {
+        files_of(&workspace).status == crate::files::Status::Ready
+    });
+    harness.advance(secs(1.0));
+    let name = harness.bounds(&format!("file-name-{long}")).expect("名字");
+    let size = harness.bounds(&format!("file-size-{long}")).expect("大小");
+    let button = harness
+        .bounds(&format!("download-{long}"))
+        .expect("下载按钮");
+    assert!(name.x + name.width <= size.x + 0.5, "名字盖到大小");
+    assert!(size.x + size.width <= button.x + 0.5, "大小盖到下载按钮");
+}
